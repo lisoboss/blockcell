@@ -124,6 +124,7 @@ struct EventBody {
 
 #[derive(Debug, Deserialize)]
 struct MessageEvent {
+    parent_id: Option<String>,
     message_id: String,
     chat_id: String,
     message_type: String,
@@ -547,7 +548,7 @@ impl FeishuChannel {
             return Ok(());
         }
 
-        let (content_text, media_paths) = match message.message_type.as_str() {
+        let (mut content_text, media_paths) = match message.message_type.as_str() {
             "text" => {
                 let mc: MessageContent = serde_json::from_str(&message.content)
                     .map_err(|e| Error::Channel(format!("Failed to parse text content: {}", e)))?;
@@ -620,6 +621,13 @@ impl FeishuChannel {
                 return Ok(());
             }
         };
+        
+        if let Some(parent_id) = message.parent_id {
+            if parent_id != message.message_id && !parent_id.is_empty() {
+                debug!(parent_id = %parent_id, "Message is a reply, adding parent_id to message");
+                content_text = format!("[parent_message_id: {}]\n\n{}", parent_id, content_text);
+            }
+        }
 
         let inbound = InboundMessage {
             channel: "feishu".to_string(),
