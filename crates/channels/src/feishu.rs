@@ -10,6 +10,8 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tracing::{debug, error, info, warn};
 
+use crate::utils::strer::SafeSplitExt;
+
 /// Feishu WebSocket Protobuf frame (matches pbbp2.proto)
 #[derive(Clone, prost::Message)]
 struct Frame {
@@ -255,19 +257,19 @@ impl FeishuChannel {
         }
 
         let endpoint_resp: WsEndpointResponse = serde_json::from_str(&body)
-            .map_err(|e| Error::Channel(format!("Failed to parse endpoint response: {} | body: {}", e, &body[..body.len().min(500)])))?;
+            .map_err(|e| Error::Channel(format!("Failed to parse endpoint response: {} | body: {}", e, &body.truncate_chars_ref(500))))?;
 
         if endpoint_resp.code != 0 {
             return Err(Error::Channel(format!(
                 "Feishu endpoint error code={} msg={} | body: {}",
-                endpoint_resp.code, endpoint_resp.msg, &body[..body.len().min(500)]
+                endpoint_resp.code, endpoint_resp.msg, &body.truncate_chars_ref(500)
             )));
         }
 
         endpoint_resp
             .data
             .map(|d| d.url)
-            .ok_or_else(|| Error::Channel(format!("No endpoint URL in response | body: {}", &body[..body.len().min(500)])))
+            .ok_or_else(|| Error::Channel(format!("No endpoint URL in response | body: {}", &body.truncate_chars_ref(500))))
     }
 
     pub async fn run_loop(self: Arc<Self>, mut shutdown: tokio::sync::broadcast::Receiver<()>) {
@@ -366,7 +368,7 @@ impl FeishuChannel {
                                 debug!(method = frame.method, msg_type = %msg_type, payload_len = frame.payload.len(), "Feishu data frame");
                                 match std::str::from_utf8(&frame.payload) {
                                     Ok(text) => {
-                                        info!(payload = %text.chars().take(500).collect::<String>(), "Feishu raw event payload");
+                                        info!(payload = %text.truncate_chars_ref(500), "Feishu raw event payload");
                                         // Send ACK frame
                                         let ack = Frame {
                                             seq_id: frame.seq_id,
@@ -489,7 +491,7 @@ impl FeishuChannel {
 
     async fn handle_message(&self, text: &str) -> Result<()> {
         let event: FeishuEvent = serde_json::from_str(text).map_err(|e| {
-            warn!(error = %e, raw = %&text[..text.len().min(500)], "Failed to parse Feishu event");
+            warn!(error = %e, raw = %text.truncate_chars_ref(500), "Failed to parse Feishu event");
             Error::Channel(format!("Failed to parse Feishu event: {}", e))
         })?;
 

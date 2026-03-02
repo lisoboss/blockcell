@@ -139,17 +139,48 @@ pub async fn run() -> anyhow::Result<()> {
     check_command("ffmpeg", &["-version"], "ffmpeg", "Required for audio/video processing", &mut ok_count, &mut warn_count);
 
     // Chrome
-    let chrome_paths = [
-        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        "/Applications/Chromium.app/Contents/MacOS/Chromium",
-    ];
-    let chrome_found = chrome_paths.iter().any(|p| std::path::Path::new(p).exists());
-    if chrome_found {
-        print_ok("Chrome/Chromium", "browse tool available");
-        ok_count += 1;
-    } else {
-        print_warn("Chrome/Chromium not found", "browse tool features limited");
-        warn_count += 1;
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        #[cfg(target_os = "macos")]
+        let chrome_paths = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        ];
+        #[cfg(target_os = "windows")]
+        let chrome_paths = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files\Chromium\Application\chrome.exe",
+            r"C:\Program Files (x86)\Chromium\Application\chrome.exe",
+        ];
+
+        let chrome_found = chrome_paths
+            .iter()
+            .any(|p| std::path::Path::new(p).exists());
+        if chrome_found {
+            print_ok("Chrome/Chromium", "browse tool available");
+            ok_count += 1;
+        } else {
+            print_warn("Chrome/Chromium not found", "browse tool features limited");
+            warn_count += 1;
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let browsers = [
+            ("chromium", &["--version"][..]),
+            ("chromium-browser", &["--version"][..]),
+            ("google-chrome", &["--version"][..]),
+            ("google-chrome-stable", &["--version"][..]),
+        ];
+
+        if check_any(&browsers) {
+            print_ok("Chrome/Chromium", "browse tool available");
+            ok_count += 1;
+        } else {
+            print_warn("Chrome/Chromium not found", "browse tool features limited");
+            warn_count += 1;
+        }
     }
 
     // Docker
@@ -230,6 +261,13 @@ fn print_err(label: &str, hint: &str) {
     } else {
         println!("  ❌ {} — {}", label, hint);
     }
+}
+
+#[cfg(target_os = "linux")]
+fn check_any(cmds: &[(&str, &[&str])]) -> bool {
+    cmds.iter()
+        .copied()
+        .any(|(cmd, args)| std::process::Command::new(cmd).args(args).output().is_ok())
 }
 
 fn check_command(cmd: &str, args: &[&str], label: &str, purpose: &str, ok: &mut u32, warn: &mut u32) {

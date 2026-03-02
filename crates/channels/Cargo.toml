@@ -32,3 +32,6 @@ discord = []
 dingtalk = []
 wecom = []
 lark = []
+
+[dev-dependencies]
+proptest = "1.10.0"
