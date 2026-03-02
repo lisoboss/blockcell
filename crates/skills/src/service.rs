@@ -1,6 +1,6 @@
 use crate::evolution::{
     EvolutionContext, EvolutionRecord, EvolutionStatus, FeedbackEntry,
-    LLMProvider, SkillEvolution, TriggerReason,
+    LLMProvider, SkillEvolution, SkillType, TriggerReason,
 };
 use blockcell_core::{Error, Result};
 use std::collections::{HashMap, HashSet};
@@ -427,6 +427,18 @@ impl EvolutionService {
             .get_current_version(skill_name)
             .unwrap_or_else(|_| "unknown".to_string());
 
+        // 检测技能类型
+        let skill_dir = self.evolution.skills_dir().join(skill_name);
+        let skill_type = if skill_dir.join("SKILL.rhai").exists() {
+            SkillType::Rhai
+        } else if skill_dir.join("SKILL.py").exists() {
+            SkillType::Python
+        } else if skill_dir.join("SKILL.md").exists() {
+            SkillType::PromptOnly
+        } else {
+            SkillType::Rhai
+        };
+
         let context = EvolutionContext {
             skill_name: skill_name.to_string(),
             current_version,
@@ -435,6 +447,9 @@ impl EvolutionService {
             source_snippet,
             tool_schemas,
             timestamp: chrono::Utc::now().timestamp(),
+            skill_type,
+            staged: false,
+            staging_skills_dir: None,
         };
 
         let evolution_id = self.evolution.trigger_evolution(context).await?;
@@ -697,12 +712,20 @@ impl EvolutionService {
     ///    - 如果观察窗口到期且错误率正常 → 标记完成，清理资源
     pub async fn tick(&self) -> Result<()> {
         // Phase 1: Process pending evolutions (Triggered → run pipeline)
+        let has_llm = self.llm_provider.is_some();
+        debug!(
+            has_llm = has_llm,
+            records_dir = %self.records_dir().display(),
+            "🧠 [自进化] tick() 开始 (LLM provider: {})",
+            if has_llm { "已配置" } else { "未配置" }
+        );
         let pending = self.list_pending_ids().await;
         if !pending.is_empty() {
             info!(
                 count = pending.len(),
-                "🧠 [自进化] 发现 {} 个待处理的进化任务",
-                pending.len()
+                has_llm = has_llm,
+                "🧠 [自进化] 发现 {} 个待处理的进化任务 (LLM: {})",
+                pending.len(), if has_llm { "ready" } else { "none" }
             );
         }
         for (skill_name, evolution_id) in &pending {
@@ -964,6 +987,32 @@ impl EvolutionService {
         self.active_evolutions.lock().await.clone()
     }
 
+    /// 触发外部技能（如 OpenClaw 兼容格式）的自进化任务。
+    ///
+    /// 与 report_error 不同，本方法直接注入一个 ManualRequest 触发器，
+    /// 绕过错误计数阈值，立即将技能入队进化。
+    /// 返回 evolution_id，可用于日志追踪。
+    pub async fn trigger_external_evolution(
+        &self,
+        context: EvolutionContext,
+    ) -> blockcell_core::Result<String> {
+        let skill_name = context.skill_name.clone();
+        let evolution_id = self.evolution.trigger_evolution(context).await?;
+
+        {
+            let mut active = self.active_evolutions.lock().await;
+            active.insert(skill_name.clone(), evolution_id.clone());
+        }
+
+        info!(
+            skill = %skill_name,
+            evolution_id = %evolution_id,
+            "🧠 [外部技能] 已触发自进化任务"
+        );
+
+        Ok(evolution_id)
+    }
+
     /// 清理已完成/失败的进化（成功时清除错误计数器）
     async fn cleanup_evolution(&self, skill_name: &str, evolution_id: &str) {
         self.cleanup_evolution_inner(skill_name, evolution_id, false).await;
@@ -975,6 +1024,42 @@ impl EvolutionService {
     }
 
     async fn cleanup_evolution_inner(&self, skill_name: &str, evolution_id: &str, is_rollback: bool) {
+        // 将磁盘上处于中间状态的记录标记为 Failed，防止孤尻记录被无限重新接管
+        if let Ok(mut record) = self.evolution.load_record(evolution_id) {
+            let is_terminal = matches!(
+                record.status,
+                EvolutionStatus::Completed
+                    | EvolutionStatus::RolledBack
+                    | EvolutionStatus::Failed
+                    | EvolutionStatus::Observing
+            );
+            if !is_terminal {
+                record.status = EvolutionStatus::Failed;
+                record.updated_at = chrono::Utc::now().timestamp();
+                let _ = self.evolution.save_record_public(&record);
+                info!(
+                    skill = %skill_name,
+                    evolution_id = %evolution_id,
+                    "🧠 [自进化] 清理时将进化记录标记为 Failed，防止孤尻重来 ({})",
+                    evolution_id
+                );
+            }
+
+            if record.context.staged {
+                if let Some(staging_dir) = record.context.staging_skills_dir.as_ref() {
+                    let root = std::path::PathBuf::from(staging_dir);
+                    let staged_skill_dir = root.join(skill_name);
+                    if let (Ok(r), Ok(p)) = (root.canonicalize(), staged_skill_dir.canonicalize()) {
+                        if p.starts_with(&r) {
+                            std::fs::remove_dir_all(p).ok();
+                        }
+                    } else if staged_skill_dir.starts_with(&root) {
+                        std::fs::remove_dir_all(staged_skill_dir).ok();
+                    }
+                }
+            }
+        }
+
         let mut active = self.active_evolutions.lock().await;
         active.remove(skill_name);
         drop(active);
@@ -1007,7 +1092,14 @@ impl EvolutionService {
     }
 
     /// 列出所有待处理的进化 ID（状态为 Triggered 但尚未开始 pipeline 的）
+    ///
+    /// Also scans disk records for orphaned Triggered records that aren't in
+    /// active_evolutions (e.g. created by the gateway's separate EvolutionService
+    /// instance or surviving a restart) and adopts them.
     pub async fn list_pending_ids(&self) -> Vec<(String, String)> {
+        // First, adopt orphaned disk records into active_evolutions
+        self.adopt_orphaned_records().await;
+
         let active = self.active_evolutions.lock().await;
         let mut pending = Vec::new();
         for (skill_name, evolution_id) in active.iter() {
@@ -1019,6 +1111,81 @@ impl EvolutionService {
             }
         }
         pending
+    }
+
+    /// Scan disk evolution_records for Triggered/Generating records that are NOT
+    /// already tracked in active_evolutions. This handles the case where another
+    /// EvolutionService instance (e.g. the gateway HTTP handler) created the record
+    /// on disk but this instance's in-memory state doesn't know about it.
+    async fn adopt_orphaned_records(&self) {
+        let records_dir = self.records_dir();
+        if !records_dir.exists() {
+            debug!("🧠 [adopt] records_dir does not exist: {}", records_dir.display());
+            return;
+        }
+
+        let entries = match std::fs::read_dir(&records_dir) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!("🧠 [adopt] Failed to read records_dir: {}", e);
+                return;
+            }
+        };
+
+        let mut active = self.active_evolutions.lock().await;
+        let active_count_before = active.len();
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.extension().is_some_and(|e| e == "json") {
+                continue;
+            }
+
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            let record: EvolutionRecord = match serde_json::from_str(&content) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+
+            // Only adopt records that are in an active pipeline state
+            let dominated = matches!(
+                record.status,
+                EvolutionStatus::Triggered
+                    | EvolutionStatus::Generating
+                    | EvolutionStatus::Generated
+                    | EvolutionStatus::Auditing
+                    | EvolutionStatus::AuditPassed
+                    | EvolutionStatus::CompilePassed
+                    | EvolutionStatus::Observing
+                    | EvolutionStatus::RollingOut
+            );
+            if !dominated {
+                continue;
+            }
+
+            // Skip if already tracked
+            if active.contains_key(&record.skill_name) {
+                continue;
+            }
+
+            info!(
+                skill = %record.skill_name,
+                evolution_id = %record.id,
+                status = ?record.status,
+                "🧠 [自进化] 从磁盘发现孤立的进化记录，已接管: {} ({:?})",
+                record.id, record.status
+            );
+            active.insert(record.skill_name.clone(), record.id.clone());
+        }
+
+        let adopted = active.len() - active_count_before;
+        if adopted > 0 {
+            info!("🧠 [adopt] Adopted {} orphaned record(s), total active: {}", adopted, active.len());
+        }
     }
 
     /// 手动触发进化（用户通过 CLI 输入描述）
@@ -1045,12 +1212,20 @@ impl EvolutionService {
             .get_current_version(skill_name)
             .unwrap_or_else(|_| "0.0.0".to_string());
 
-        // Try to load existing SKILL.rhai source for context
-        let skill_path = self.evolution.skills_dir().join(skill_name).join("SKILL.rhai");
-        let source_snippet = if skill_path.exists() {
-            std::fs::read_to_string(&skill_path).ok()
+        // 检测技能类型：有 SKILL.rhai 就是 Rhai，有 SKILL.py 就是 Python，只有 SKILL.md 就是 PromptOnly
+        let skill_dir = self.evolution.skills_dir().join(skill_name);
+        let rhai_path = skill_dir.join("SKILL.rhai");
+        let py_path = skill_dir.join("SKILL.py");
+        let md_path = skill_dir.join("SKILL.md");
+        let (source_snippet, skill_type) = if rhai_path.exists() {
+            (std::fs::read_to_string(&rhai_path).ok(), SkillType::Rhai)
+        } else if py_path.exists() {
+            (std::fs::read_to_string(&py_path).ok(), SkillType::Python)
+        } else if md_path.exists() {
+            (std::fs::read_to_string(&md_path).ok(), SkillType::PromptOnly)
         } else {
-            None
+            // 新技能，无现有文件 — 默认为 PromptOnly（无脚本框架）
+            (None, SkillType::PromptOnly)
         };
 
         let context = EvolutionContext {
@@ -1063,6 +1238,9 @@ impl EvolutionService {
             source_snippet,
             tool_schemas: vec![],
             timestamp: chrono::Utc::now().timestamp(),
+            skill_type,
+            staged: false,
+            staging_skills_dir: None,
         };
 
         let evolution_id = self.evolution.trigger_evolution(context).await?;

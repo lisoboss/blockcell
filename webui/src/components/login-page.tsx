@@ -1,9 +1,9 @@
 import { useState } from 'react';
 import { Loader2, AlertCircle, Eye, EyeOff } from 'lucide-react';
 import { BlockcellLogo } from './blockcell-logo';
-import { useT } from '@/lib/i18n';
-
-const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:18790';
+import { cn } from '@/lib/utils';
+import { useI18nStore, useT, type Locale } from '@/lib/i18n';
+import { API_BASE } from '@/lib/api';
 
 interface LoginPageProps {
   onLogin: () => void;
@@ -11,10 +11,16 @@ interface LoginPageProps {
 
 export function LoginPage({ onLogin }: LoginPageProps) {
   const t = useT();
+  const { locale, setLocale } = useI18nStore();
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
+
+  const languages: { value: Locale; label: string }[] = [
+    { value: 'zh', label: '中文' },
+    { value: 'en', label: 'English' },
+  ];
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -46,7 +52,25 @@ export function LoginPage({ onLogin }: LoginPageProps) {
   }
 
   return (
-    <div className="flex items-center justify-center min-h-screen bg-background">
+    <div className="relative flex items-center justify-center min-h-screen bg-background">
+      <div className="absolute top-4 right-4">
+        <div className="flex items-center gap-1 bg-accent/50 rounded-lg p-0.5">
+          {languages.map((lang) => (
+            <button
+              key={lang.value}
+              onClick={() => setLocale(lang.value)}
+              className={cn(
+                'px-3 py-1.5 text-xs rounded-md transition-colors',
+                locale === lang.value
+                  ? 'bg-primary text-primary-foreground shadow-sm'
+                  : 'text-muted-foreground hover:text-foreground hover:bg-accent'
+              )}
+            >
+              {lang.label}
+            </button>
+          ))}
+        </div>
+      </div>
       <div className="w-full max-w-sm mx-4">
         <div className="text-center mb-8">
           <div className="inline-flex items-center justify-center mb-4">

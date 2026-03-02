@@ -11,11 +11,15 @@ use tokio::sync::Mutex;
 /// Bridge: wraps a `Provider` (providers crate) to implement `LLMProvider` (skills crate).
 /// This allows CoreEvolution to use the same LLM as the rest of the agent.
 pub struct ProviderLLMBridge {
-    provider: Box<dyn Provider>,
+    provider: Arc<dyn Provider>,
 }
 
 impl ProviderLLMBridge {
     pub fn new(provider: Box<dyn Provider>) -> Self {
+        Self { provider: Arc::from(provider) }
+    }
+
+    pub fn new_arc(provider: Arc<dyn Provider>) -> Self {
         Self { provider }
     }
 }

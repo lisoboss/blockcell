@@ -326,12 +326,12 @@ pub async fn learn(description: &str) -> anyhow::Result<()> {
     let paths = Paths::new();
     let config = Config::load_or_default(&paths)?;
 
-    // Create provider using shared multi-provider dispatch
-    let provider = super::provider::create_provider(&config)?;
+    // Create provider pool using shared multi-provider dispatch
+    let provider_pool = blockcell_providers::ProviderPool::from_config(&config)?;
 
     // Create runtime
     let tool_registry = ToolRegistry::with_defaults();
-    let mut runtime = AgentRuntime::new(config, paths.clone(), provider, tool_registry)?;
+    let mut runtime = AgentRuntime::new(config, paths.clone(), provider_pool, tool_registry)?;
     runtime.mount_mcp_servers().await;
 
     // Optionally wire up memory store

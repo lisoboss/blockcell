@@ -65,44 +65,65 @@ impl Tool for WebSearchTool {
             match brave_search(api_key, query, count, freshness.as_deref()).await {
                 Ok(results) => return Ok(json!({ "query": query, "results": results, "source": "brave" })),
                 Err(e) => {
-                    tracing::warn!(error = %e, "Brave search failed, falling back to Bing");
+                    tracing::warn!(error = %e, "Brave search failed, falling back to scrape");
                 }
             }
         }
 
-        // Detect if query is primarily Chinese — use Baidu first for better results
+        // Detect if query is primarily Chinese
         let is_chinese_query = query.chars().any(|c| {
             let cp = c as u32;
             (0x4E00..=0x9FFF).contains(&cp)  // CJK Unified Ideographs
         });
 
+        let workspace = Some(ctx.workspace.as_path());
+
         if is_chinese_query {
-            // Baidu: best quality for Chinese queries, especially from overseas servers
+            // CDP-first strategy for Chinese: Baidu CDP → Bing CDP → HTTP scrape fallbacks
+            // CDP is far more reliable — search engines actively block headless HTTP requests.
+
+            // 1. Baidu via CDP (most relevant for Chinese content)
+            match baidu_search_cdp(query, count, &ctx.workspace).await {
+                Ok(results) if !results.is_empty() => {
+                    return Ok(json!({ "query": query, "results": results, "source": "baidu_cdp" }));
+                }
+                Ok(_) => tracing::warn!("Baidu CDP returned empty results, trying Bing CDP"),
+                Err(e) => tracing::warn!(error = %e, "Baidu CDP failed, trying Bing CDP"),
+            }
+
+            // 2. Bing via CDP
+            match bing_search_cdp(query, count, &ctx.workspace).await {
+                Ok(results) if !results.is_empty() => {
+                    return Ok(json!({ "query": query, "results": results, "source": "bing_cdp" }));
+                }
+                Ok(_) => tracing::warn!("Bing CDP returned empty results, trying HTTP scrape"),
+                Err(e) => tracing::warn!(error = %e, "Bing CDP failed, trying HTTP scrape"),
+            }
+
+            // 3. HTTP scrape fallback: Baidu
             match baidu_search(query, count).await {
                 Ok(results) if !results.is_empty() => {
                     return Ok(json!({ "query": query, "results": results, "source": "baidu" }));
                 }
-                Ok(_) => {
-                    tracing::warn!("Baidu returned empty results, trying Bing");
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Baidu search failed, trying Bing");
-                }
+                Ok(_) => tracing::warn!("Baidu HTTP scrape returned empty results"),
+                Err(e) => tracing::warn!(error = %e, "Baidu HTTP scrape failed"),
+            }
+
+            // 4. HTTP scrape fallback: Bing
+            match bing_search(query, count, workspace).await {
+                Ok(results) => return Ok(json!({ "query": query, "results": results, "source": "bing" })),
+                Err(e) => return Err(Error::Tool(format!("All search methods failed for query '{}': {}", query, e))),
             }
         }
 
-        // Bing with Chinese locale (works globally, zh-CN results)
-        match bing_search(query, count, Some(&ctx.workspace)).await {
+        // Non-Chinese: try Bing HTTP scrape first (fast), then CDP fallback
+        match bing_search(query, count, workspace).await {
             Ok(results) => return Ok(json!({ "query": query, "results": results, "source": "bing" })),
             Err(e) => {
-                tracing::warn!(error = %e, "Bing search failed");
-                // Last resort for Chinese queries: try Baidu if not already tried
-                if !is_chinese_query {
-                    return Err(e);
-                }
-                match baidu_search(query, count).await {
+                tracing::warn!(error = %e, "Bing HTTP search failed, trying Bing CDP");
+                match bing_search_cdp(query, count, &ctx.workspace).await {
                     Ok(results) if !results.is_empty() => {
-                        return Ok(json!({ "query": query, "results": results, "source": "baidu" }));
+                        return Ok(json!({ "query": query, "results": results, "source": "bing_cdp" }));
                     }
                     _ => return Err(e),
                 }
@@ -409,7 +430,119 @@ async fn bing_search_cdp(query: &str, count: usize, workspace: &std::path::Path)
     Ok(results)
 }
 
-/// Baidu search scraper — best for Chinese queries, especially from overseas servers.
+// ─────────────────────────────────────────────────────────────────────────────
+// Baidu CDP (primary path for Chinese queries)
+// ─────────────────────────────────────────────────────────────────────────────
+
+static BAIDU_CDP_MANAGER: once_cell::sync::Lazy<Arc<Mutex<Option<crate::browser::session::SessionManager>>>> =
+    once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(None)));
+
+async fn ensure_baidu_manager(
+    workspace: &std::path::Path,
+) -> Arc<Mutex<Option<crate::browser::session::SessionManager>>> {
+    let mgr = BAIDU_CDP_MANAGER.clone();
+    {
+        let mut guard = mgr.lock().await;
+        if guard.is_none() {
+            let base_dir = workspace.join("browser");
+            *guard = Some(crate::browser::session::SessionManager::new(base_dir));
+        }
+    }
+    mgr
+}
+
+async fn baidu_search_cdp(query: &str, count: usize, workspace: &std::path::PathBuf) -> Result<Vec<Value>> {
+    use crate::browser::session::BrowserEngine;
+
+    let encoded = urlencoding::encode(query);
+    let url = format!("https://www.baidu.com/s?wd={}&rn={}", encoded, count.min(50));
+
+    let mgr_arc = ensure_baidu_manager(workspace).await;
+    let mut mgr_guard = mgr_arc.lock().await;
+    let mgr = mgr_guard
+        .as_mut()
+        .ok_or_else(|| Error::Tool("CDP session manager not initialized".to_string()))?;
+
+    let session = mgr
+        .get_or_create_with_engine("web_search_baidu", false, None, BrowserEngine::Chrome)
+        .await
+        .map_err(|e| Error::Tool(format!("CDP launch failed: {}", e)))?;
+
+    let headers = json!({
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    });
+    let _ = session.cdp.set_extra_headers(headers).await;
+
+    session
+        .cdp
+        .navigate(&url)
+        .await
+        .map_err(|e| Error::Tool(format!("CDP navigate failed: {}", e)))?;
+
+    // Wait for search results to render
+    tokio::time::sleep(std::time::Duration::from_millis(1800)).await;
+
+    // Extract results from desktop Baidu SERP
+    // Baidu result containers: #content_left > div.result, div.c-container
+    let js = format!(
+        "(() => {{\n\
+  const max = {};\n\
+  const out = [];\n\
+  const containers = Array.from(\n\
+    document.querySelectorAll('#content_left .result, #content_left .c-container, #content_left [tpl]')\n\
+  ).filter(el => {{\n\
+    if (el.getAttribute('data-tuiguang')) return false;\n\
+    if ((el.className || '').includes('ec_tuiguang')) return false;\n\
+    return true;\n\
+  }});\n\
+  for (const el of containers) {{\n\
+    if (out.length >= max) break;\n\
+    const a = el.querySelector('h3 a, .t a, [class*=title] a');\n\
+    if (!a) continue;\n\
+    const title = (a.textContent || '').trim();\n\
+    const href = (a.getAttribute('href') || '').trim();\n\
+    if (!title || !href || !href.startsWith('http')) continue;\n\
+    const sn = el.querySelector('.c-abstract, .content-right_8Zs40, [class*=abstract], [class*=content]');\n\
+    const snippet = sn ? (sn.textContent || '').trim() : '';\n\
+    out.push({{ title, url: href, snippet }});\n\
+  }}\n\
+  return out;\n\
+}})()",
+        count
+    );
+
+    let eval = session
+        .cdp
+        .evaluate_js(&js)
+        .await
+        .map_err(|e| Error::Tool(format!("CDP evaluate failed: {}", e)))?;
+
+    let arr = eval
+        .get("result")
+        .and_then(|v| v.get("value"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let results: Vec<Value> = arr
+        .into_iter()
+        .filter_map(|v| {
+            let title = v.get("title").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let url = v.get("url").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let snippet = v.get("snippet").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            if title.is_empty() || url.is_empty() {
+                return None;
+            }
+            Some(json!({"title": title, "url": url, "snippet": snippet}))
+        })
+        .collect();
+
+    tracing::debug!(count = results.len(), query, "Baidu CDP results");
+    Ok(results)
+}
+
+/// Baidu search HTTP scraper — fallback when CDP is unavailable.
 async fn baidu_search(query: &str, count: usize) -> Result<Vec<Value>> {
     use scraper::{Html, Selector};
 
@@ -450,14 +583,14 @@ async fn baidu_search(query: &str, count: usize) -> Result<Vec<Value>> {
         "div.c-result",
         "div[data-log]",
         "div.result",
-        "#page-bd > div",
+        "#page-bd > div ",  // trailing space avoids Rust 2021 raw-string prefix conflict
     ];
 
     // Mobile Baidu title link patterns
-    let title_sel = Selector::parse("h3 a, .c-title a, .c-result-title a").unwrap();
+    let title_sel = Selector::parse("h3 a, .c-title a, .c-result-title a ").unwrap();
     // Mobile Baidu snippet patterns
     let snippet_sel = Selector::parse(
-        ".c-abstract, .c-summary, .c-gap-top-small, p[class], [class*='abstract'], [class*='summary']"
+        ".c-abstract, .c-summary, .c-gap-top-small, p[class], [class*=abstract], [class*=summary]"
     ).unwrap();
 
     let mut results: Vec<Value> = Vec::new();
@@ -497,7 +630,7 @@ async fn baidu_search(query: &str, count: usize) -> Result<Vec<Value>> {
 
             let display_url = if url.starts_with("http") {
                 url.clone()
-            } else if url.starts_with("/link") || url.starts_with("/s?") {
+            } else if url.starts_with("/link?") || url.starts_with("/s?") {
                 format!("https://www.baidu.com{}", url)
             } else {
                 continue;

@@ -17,6 +17,14 @@ pub struct ProviderConfig {
     /// 格式："http://host:port" 或 "socks5://host:port"
     #[serde(default)]
     pub proxy: Option<String>,
+    /// API 接口类型："openai" | "anthropic" | "gemini" | "ollama"
+    /// 用于前端显示和接口兼容性标识，默认 "openai"
+    #[serde(default = "default_api_type")]
+    pub api_type: String,
+}
+
+fn default_api_type() -> String {
+    "openai".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +54,31 @@ impl Default for CommunityHubConfig {
         }
     }
 }
+
+/// 一个可用的"模型+供应商"条目，用于 model_pool 多模型高可用配置。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelEntry {
+    /// 模型名称，例如 "deepseek-chat"、"claude-3-5-sonnet"
+    pub model: String,
+    /// 对应 providers 表中的 key，例如 "deepseek"、"anthropic"
+    pub provider: String,
+    /// 负载均衡权重（正整数，越大越优先被选中），默认 1
+    #[serde(default = "default_entry_weight")]
+    pub weight: u32,
+    /// 优先级（小数字 = 高优先级），同优先级内按 weight 加权随机，默认 1
+    #[serde(default = "default_entry_priority")]
+    pub priority: u32,
+    /// 输入价格（USD/1M tokens），可选
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_price: Option<f64>,
+    /// 输出价格（USD/1M tokens），可选
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_price: Option<f64>,
+}
+
+fn default_entry_weight() -> u32 { 1 }
+fn default_entry_priority() -> u32 { 1 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -78,6 +111,11 @@ pub struct AgentDefaults {
     /// 如果不指定，将从 evolution_model 推断，或使用主 provider
     #[serde(default)]
     pub evolution_provider: Option<String>,
+    /// 多模型高可用池（可选）。
+    /// 配置后，系统将从池中按优先级+权重选取 provider，失败自动降级。
+    /// 若留空，则沿用旧的单 model + provider 配置（向后兼容）。
+    #[serde(default)]
+    pub model_pool: Vec<ModelEntry>,
 }
 
 fn default_workspace() -> String {
@@ -126,6 +164,7 @@ impl Default for AgentDefaults {
             provider: None,
             evolution_model: None,
             evolution_provider: None,
+            model_pool: Vec::new(),
         }
     }
 }
@@ -409,6 +448,11 @@ pub struct GatewayConfig {
     pub webui_host: String,
     #[serde(default = "default_webui_port")]
     pub webui_port: u16,
+    /// Optional public API base URL injected into WebUI at runtime.
+    /// Example: "https://your-domain.example.com" or "https://your-domain.example.com/api".
+    /// If not set, WebUI will default to current hostname + gateway.port.
+    #[serde(default)]
+    pub public_api_base: Option<String>,
     #[serde(default)]
     pub api_token: Option<String>,
     #[serde(default)]
@@ -441,6 +485,7 @@ impl Default for GatewayConfig {
             port: default_gateway_port(),
             webui_host: default_webui_host(),
             webui_port: default_webui_port(),
+            public_api_base: None,
             api_token: None,
             allowed_origins: vec![],
             webui_pass: None,
@@ -624,27 +669,77 @@ impl Default for Config {
             api_key: String::new(),
             api_base: Some("https://openrouter.ai/api/v1".to_string()),
             proxy: None,
+            api_type: "openai".to_string(),
         });
         providers.insert("anthropic".to_string(), ProviderConfig::default());
         providers.insert("openai".to_string(), ProviderConfig::default());
         providers.insert("deepseek".to_string(), ProviderConfig::default());
-        providers.insert("groq".to_string(), ProviderConfig::default());
+        providers.insert("groq".to_string(), ProviderConfig {
+            api_key: String::new(),
+            api_base: Some("https://api.groq.com/openai/v1".to_string()),
+            proxy: None,
+            api_type: "openai".to_string(),
+        });
         providers.insert("zhipu".to_string(), ProviderConfig::default());
         providers.insert("vllm".to_string(), ProviderConfig {
             api_key: "dummy".to_string(),
             api_base: Some("http://localhost:8000/v1".to_string()),
             proxy: None,
+            api_type: "openai".to_string(),
         });
-        providers.insert("gemini".to_string(), ProviderConfig::default());
+        providers.insert("gemini".to_string(), ProviderConfig {
+            api_key: String::new(),
+            api_base: Some("https://generativelanguage.googleapis.com/v1beta/openai".to_string()),
+            proxy: None,
+            api_type: "openai".to_string(),
+        });
         providers.insert("kimi".to_string(), ProviderConfig {
             api_key: String::new(),
-            api_base: Some("https://api.moonshot.cn/v1".to_string()),
+            api_base: Some("https://api.moonshot.ai/v1".to_string()),
             proxy: None,
+            api_type: "openai".to_string(),
+        });
+        providers.insert("xai".to_string(), ProviderConfig {
+            api_key: String::new(),
+            api_base: Some("https://api.x.ai/v1".to_string()),
+            proxy: None,
+            api_type: "openai".to_string(),
+        });
+        providers.insert("mistral".to_string(), ProviderConfig {
+            api_key: String::new(),
+            api_base: Some("https://api.mistral.ai/v1".to_string()),
+            proxy: None,
+            api_type: "openai".to_string(),
+        });
+        providers.insert("minimax".to_string(), ProviderConfig {
+            api_key: String::new(),
+            api_base: Some("https://api.minimax.chat/v1".to_string()),
+            proxy: None,
+            api_type: "anthropic".to_string(),
+        });
+        providers.insert("qwen".to_string(), ProviderConfig {
+            api_key: String::new(),
+            api_base: Some("https://api.qwen.ai/v1".to_string()),
+            proxy: None,
+            api_type: "openai".to_string(),
+        });
+        providers.insert("glm".to_string(), ProviderConfig {
+            api_key: String::new(),
+            api_base: Some("https://api.z.ai/v1".to_string()),
+            proxy: None,
+            api_type: "openai".to_string(),
+        });
+        providers.insert("siliconflow".to_string(), ProviderConfig {
+            api_key: String::new(),
+            api_base: Some("https://api.siliconflow.cn/v1".to_string()),
+            proxy: None,
+            api_type: "openai".to_string(),
         });
         providers.insert("ollama".to_string(), ProviderConfig {
             api_key: "ollama".to_string(),
             api_base: Some("http://localhost:11434".to_string()),
             proxy: None,
+            api_type: "ollama".to_string(),
         });
 
         Self {

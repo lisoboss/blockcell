@@ -2,28 +2,29 @@ import { useEffect, useState, useCallback, useRef } from 'react';
 import {
   GitBranch, RefreshCw, Dna, Zap, CheckCircle, XCircle, Clock,
   Plus, Trash2, ChevronDown, ChevronRight, AlertTriangle, FlaskConical,
-  ArrowUpCircle, RotateCcw, Send, Loader2, Eye, EyeOff, Cpu, Code2,
-  History, FileCode, Tag, Search, ThumbsUp, ThumbsDown, Sparkles, Wrench,
+  ArrowUpCircle, RotateCcw, Send, Loader2, Eye, EyeOff, Code2,
+  History, Search, ThumbsUp, ThumbsDown, Sparkles,
 } from 'lucide-react';
 import {
-  getEvolution, getEvolutionToolEvolutions, getSkills, getTools,
+  getEvolution, getSkills, getTools,
   triggerEvolution, deleteEvolution, testSkill, getTestSuggestion, getEvolutionSummary,
-  getToolEvolutionVersions, searchSkills,
-  type EvolutionRecord, type CoreEvolutionRecord, type EvolutionSummary,
+  searchSkills,
+  type EvolutionRecord, type EvolutionSummary,
 } from '@/lib/api';
 import { useT } from '@/lib/i18n';
 import { wsManager } from '@/lib/ws';
 
-type Tab = 'overview' | 'skills' | 'tool-evolutions' | 'test';
+type Tab = 'overview' | 'skills' | 'test';
 
 // ── Status helpers ──
 
 function statusColor(status: string): string {
   switch (status) {
-    case 'Completed': case 'Active': case 'TestPassed': return 'text-cyber';
+    case 'Completed': case 'Active': case 'TestPassed': case 'Observing': case 'Deployed': return 'text-cyber';
     case 'Triggered': case 'Requested': return 'text-blue-400';
     case 'Generating': case 'Compiling': case 'Auditing': case 'Validating':
-    case 'RollingOut': return 'text-yellow-400';
+    case 'RollingOut': case 'Generated': case 'AuditPassed': case 'CompilePassed':
+      return 'text-yellow-400';
     case 'Failed': case 'AuditFailed': case 'DryRunFailed':
     case 'TestFailed': case 'RolledBack': case 'Blocked': return 'text-red-400';
     default: return 'text-muted-foreground';
@@ -32,12 +33,12 @@ function statusColor(status: string): string {
 
 function statusIcon(status: string) {
   switch (status) {
-    case 'Completed': case 'Active': case 'TestPassed':
+    case 'Completed': case 'Active': case 'TestPassed': case 'Observing': case 'Deployed':
       return <CheckCircle size={14} className="text-cyber" />;
     case 'Triggered': case 'Requested':
       return <Zap size={14} className="text-blue-400" />;
     case 'Generating': case 'Compiling': case 'Auditing': case 'Validating':
-    case 'RollingOut':
+    case 'RollingOut': case 'Generated': case 'AuditPassed': case 'CompilePassed':
       return <Loader2 size={14} className="text-yellow-400 animate-spin" />;
     case 'Failed': case 'AuditFailed': case 'DryRunFailed':
     case 'TestFailed': case 'RolledBack': case 'Blocked':
@@ -74,7 +75,15 @@ function triggerLabel(trigger: any): string {
 // ── Pipeline stage visualization ──
 
 const SKILL_STAGES = [
-  'Triggered', 'Generating', 'Auditing', 'TestPassed', 'RollingOut', 'Completed',
+  'Triggered',
+  'Generating',
+  'Generated',
+  'Auditing',
+  'AuditPassed',
+  'CompilePassed',
+  'RollingOut',
+  'Observing',
+  'Completed',
 ];
 
 const CAP_STAGES = [
@@ -90,7 +99,7 @@ function PipelineStages({ status, stages }: { status: string; stages: string[] }
       {stages.map((stage, i) => {
         const isActive = stage === status;
         const isPast = currentIdx >= 0 && i < currentIdx;
-        const isCompleted = status === 'Completed' || status === 'Active';
+        const isCompleted = status === 'Completed' || status === 'Active' || status === 'Observing' || status === 'Deployed';
 
         let dotClass = 'w-2 h-2 rounded-full transition-all ';
         if (isCompleted && i <= stages.length - 1) {
@@ -125,7 +134,6 @@ export function EvolutionPage() {
   const [tab, setTab] = useState<Tab>('overview');
   const [summary, setSummary] = useState<EvolutionSummary | null>(null);
   const [skillRecords, setSkillRecords] = useState<EvolutionRecord[]>([]);
-  const [capRecords, setCapRecords] = useState<CoreEvolutionRecord[]>([]);
   const [skills, setSkills] = useState<any[]>([]);
   const [toolCount, setToolCount] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -167,9 +175,8 @@ export function EvolutionPage() {
 
   async function fetchAll() {
     try {
-      const [evo, cap, sk, sum, tls] = await Promise.allSettled([
+      const [evo, sk, sum, tls] = await Promise.allSettled([
         getEvolution(),
-        getEvolutionToolEvolutions(),
         getSkills(),
         getEvolutionSummary(),
         getTools(),
@@ -178,9 +185,6 @@ export function EvolutionPage() {
         const recs = (evo.value.records || []) as EvolutionRecord[];
         recs.sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0));
         setSkillRecords(recs);
-      }
-      if (cap.status === 'fulfilled') {
-        setCapRecords(cap.value.records || []);
       }
       if (sk.status === 'fulfilled') {
         setSkills(sk.value.skills || []);
@@ -301,29 +305,19 @@ export function EvolutionPage() {
   const filteredSkillRecords = statusFilter === 'all'
     ? skillRecords
     : statusFilter === 'active'
-      ? skillRecords.filter(r => !['Completed', 'Failed', 'RolledBack', 'AuditFailed', 'DryRunFailed', 'TestFailed'].includes(r.status))
+      ? skillRecords.filter(r => !['Completed', 'Observing', 'Deployed', 'Failed', 'RolledBack', 'AuditFailed', 'DryRunFailed', 'TestFailed'].includes(r.status))
       : statusFilter === 'completed'
-        ? skillRecords.filter(r => r.status === 'Completed')
+        ? skillRecords.filter(r => ['Completed', 'Observing', 'Deployed'].includes(r.status))
         : skillRecords.filter(r => ['Failed', 'RolledBack', 'AuditFailed', 'DryRunFailed', 'TestFailed'].includes(r.status));
 
-  const filteredCapRecords = statusFilter === 'all'
-    ? capRecords
-    : statusFilter === 'active'
-      ? capRecords.filter(r => !['Active', 'Failed', 'Blocked'].includes(r.status))
-      : statusFilter === 'completed'
-        ? capRecords.filter(r => r.status === 'Active')
-        : capRecords.filter(r => ['Failed', 'Blocked'].includes(r.status));
-
   // Stats
-  const activeSkills = skillRecords.filter(r => !['Completed', 'Failed', 'RolledBack', 'AuditFailed', 'DryRunFailed', 'TestFailed'].includes(r.status)).length;
-  const completedSkills = skillRecords.filter(r => r.status === 'Completed').length;
+  const activeSkills = skillRecords.filter(r => !['Completed', 'Observing', 'Deployed', 'Failed', 'RolledBack', 'AuditFailed', 'DryRunFailed', 'TestFailed'].includes(r.status)).length;
+  const completedSkills = skillRecords.filter(r => ['Completed', 'Observing', 'Deployed'].includes(r.status)).length;
   const failedSkills = skillRecords.filter(r => ['Failed', 'RolledBack', 'AuditFailed', 'DryRunFailed', 'TestFailed'].includes(r.status)).length;
-  const activeCaps = capRecords.filter(r => !['Active', 'Failed', 'Blocked'].includes(r.status)).length;
-  const completedCaps = capRecords.filter(r => r.status === 'Active').length;
 
   // All skills for test dropdown
   const allSkillNames = [
-    ...new Set(skillRecords.filter(r => r.status === 'Completed').map(r => r.skill_name)),
+    ...new Set(skillRecords.filter(r => ['Completed', 'Observing', 'Deployed'].includes(r.status)).map(r => r.skill_name)),
     ...skills.map(s => s.name),
   ].filter((v, i, a) => a.indexOf(v) === i);
 
@@ -355,12 +349,12 @@ export function EvolutionPage() {
       <div className="p-6 space-y-6 w-full">
         {/* Stats cards */}
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
-          <MiniStat label={t('evolution.totalRecords')} value={String(skillRecords.length + capRecords.length)} icon={<GitBranch size={16} />} />
-          <MiniStat label={t('evolution.evolving')} value={String(activeSkills + activeCaps)} icon={<Loader2 size={16} className="animate-spin" />} color="text-yellow-400" />
-          <MiniStat label={t('evolution.completed')} value={String(completedSkills + completedCaps)} icon={<CheckCircle size={16} />} color="text-cyber" />
+          <MiniStat label={t('evolution.totalRecords')} value={String(skillRecords.length)} icon={<GitBranch size={16} />} />
+          <MiniStat label={t('evolution.evolving')} value={String(activeSkills)} icon={<Loader2 size={16} className="animate-spin" />} color="text-yellow-400" />
+          <MiniStat label={t('evolution.completed')} value={String(completedSkills)} icon={<CheckCircle size={16} />} color="text-cyber" />
           <MiniStat label={t('evolution.failed')} value={String(failedSkills)} icon={<XCircle size={16} />} color="text-red-400" />
           <MiniStat label={t('evolution.skills')} value={String(skills.length)} icon={<Code2 size={16} />} />
-          <MiniStat label={t('evolution.tools')} value={String(toolCount)} icon={<Wrench size={16} />} color="text-purple-400" />
+          <MiniStat label={t('evolution.tools')} value={String(toolCount)} icon={<Code2 size={16} />} color="text-purple-400" />
         </div>
 
         {/* New Skill creation form */}
@@ -491,7 +485,6 @@ export function EvolutionPage() {
           {([
             { id: 'overview' as Tab, label: t('evolution.overview'), count: 0 },
             { id: 'skills' as Tab, label: t('evolution.skillEvolution'), count: skillRecords.length },
-            { id: 'tool-evolutions' as Tab, label: t('evolution.capEvolution'), count: capRecords.length },
             { id: 'test' as Tab, label: t('evolution.testAndEvolve'), count: 0 },
           ]).map(item => (
             <button
@@ -510,8 +503,8 @@ export function EvolutionPage() {
             </button>
           ))}
 
-          {/* Status filter (for skills/tool-evolutions tabs) */}
-          {(tab === 'skills' || tab === 'tool-evolutions') && (
+          {/* Status filter (for skills tab) */}
+          {tab === 'skills' && (
             <div className="ml-auto flex items-center gap-1">
               {['all', 'active', 'completed', 'failed'].map(f => (
                 <button
@@ -535,7 +528,6 @@ export function EvolutionPage() {
           <OverviewTab
             summary={summary}
             skillRecords={skillRecords}
-            capRecords={capRecords}
             t={t}
           />
         )}
@@ -559,24 +551,6 @@ export function EvolutionPage() {
           </div>
         )}
 
-        {tab === 'tool-evolutions' && (
-          <div className="space-y-2">
-            {filteredCapRecords.length === 0 ? (
-              <EmptyState message={t('evolution.noCapRecords')} />
-            ) : (
-              filteredCapRecords.map(rec => (
-                <CapRecordCard
-                  key={rec.id}
-                  record={rec}
-                  expanded={expandedId === rec.id}
-                  onToggle={() => setExpandedId(expandedId === rec.id ? null : rec.id)}
-                  onDelete={() => handleDelete(rec.id)}
-                  t={t}
-                />
-              ))
-            )}
-          </div>
-        )}
 
         {/* Test & Evolve tab — merged test + manual evolution */}
         {tab === 'test' && (
@@ -753,21 +727,18 @@ export function EvolutionPage() {
 // ── Sub-components ──
 
 function OverviewTab({
-  summary, skillRecords, capRecords, t,
+  summary, skillRecords, t,
 }: {
   summary: EvolutionSummary | null;
   skillRecords: EvolutionRecord[];
-  capRecords: CoreEvolutionRecord[];
   t: (key: string, params?: Record<string, string | number>) => string;
 }) {
   const se = summary?.skill_evolution || { total: 0, active: 0, completed: 0, failed: 0 };
-  const ce = summary?.tool_evolution || { total: 0, active: 0, completed: 0, failed: 0 };
   const inv = summary?.inventory || { user_skills: 0, builtin_skills: 0, registered_tools: 0 };
 
-  // Recent activity: merge both record types, sort by updated_at, take top 8
+  // Recent activity: skill records only, sort by updated_at, take top 8
   const recentActivity = [
     ...skillRecords.slice(0, 20).map(r => ({ kind: 'skill' as const, name: r.skill_name, status: r.status, time: r.updated_at, id: r.id })),
-    ...capRecords.slice(0, 20).map(r => ({ kind: 'tool_evolution' as const, name: r.capability_id, status: r.status, time: r.updated_at, id: r.id })),
   ].sort((a, b) => (b.time || 0) - (a.time || 0)).slice(0, 8);
 
   return (
@@ -801,15 +772,6 @@ function OverviewTab({
             color="text-blue-400"
             borderColor="border-blue-400/40"
             bgColor="bg-blue-400/5"
-          />
-          <div className="flex justify-center text-muted-foreground">▼</div>
-          <ArchLayer
-            label={t('evolution.layerCapability')}
-            desc={`bash / python / rust — ${t('evolution.dynamicTools')}`}
-            color="text-purple-400"
-            borderColor="border-purple-400/40"
-            bgColor="bg-purple-400/5"
-            badge={ce.active > 0 ? `${ce.active} ${t('evolution.evolving').toLowerCase()}` : undefined}
           />
         </div>
       </div>
@@ -849,35 +811,34 @@ function OverviewTab({
           </div>
         </div>
 
-        {/* Tool Evolution */}
+        {/* Inventory */}
         <div className="border border-border rounded-xl p-4 bg-card">
           <div className="flex items-center gap-2 mb-3">
-            <Cpu size={14} className="text-purple-400" />
-            <h3 className="text-sm font-semibold">{t('evolution.capEvolution')}</h3>
+            <Code2 size={14} className="text-blue-400" />
+            <h3 className="text-sm font-semibold">{t('evolution.skills')}</h3>
           </div>
-          <p className="text-[10px] text-muted-foreground mb-3">{t('evolution.capDesc')}</p>
           <div className="grid grid-cols-3 gap-2 mb-3">
             <div className="text-center p-2 rounded-lg bg-muted/30">
-              <p className="text-lg font-bold text-cyber">{ce.completed}</p>
-              <p className="text-[9px] text-muted-foreground uppercase">{t('evolution.completed')}</p>
+              <p className="text-lg font-bold text-cyber">{inv.user_skills}</p>
+              <p className="text-[9px] text-muted-foreground uppercase">{t('evolution.userSkills')}</p>
             </div>
             <div className="text-center p-2 rounded-lg bg-muted/30">
-              <p className="text-lg font-bold text-yellow-400">{ce.active}</p>
-              <p className="text-[9px] text-muted-foreground uppercase">{t('evolution.evolving')}</p>
+              <p className="text-lg font-bold text-blue-400">{inv.builtin_skills}</p>
+              <p className="text-[9px] text-muted-foreground uppercase">{t('evolution.builtinSkills')}</p>
             </div>
             <div className="text-center p-2 rounded-lg bg-muted/30">
-              <p className="text-lg font-bold text-red-400">{ce.failed}</p>
-              <p className="text-[9px] text-muted-foreground uppercase">{t('evolution.failed')}</p>
+              <p className="text-lg font-bold text-purple-400">{inv.registered_tools}</p>
+              <p className="text-[9px] text-muted-foreground uppercase">{t('evolution.tools')}</p>
             </div>
           </div>
           <div className="text-[10px] text-muted-foreground space-y-0.5">
             <div className="flex items-center gap-1.5">
-              <span className="w-1.5 h-1.5 rounded-full bg-purple-400 inline-block" />
-              {t('evolution.capPipeline')}
+              <span className="w-1.5 h-1.5 rounded-full bg-cyber inline-block" />
+              {t('evolution.registered')}
             </div>
             <div className="flex items-center gap-1.5">
               <span className="w-1.5 h-1.5 rounded-full bg-muted-foreground inline-block" />
-              {t('evolution.capProduct')}
+              {t('evolution.tools')}
             </div>
           </div>
         </div>
@@ -1195,250 +1156,6 @@ function SkillRecordCard({
   );
 }
 
-function CapRecordCard({
-  record, expanded, onToggle, onDelete, t,
-}: {
-  record: CoreEvolutionRecord;
-  expanded: boolean;
-  onToggle: () => void;
-  onDelete: () => void;
-  t: (key: string, params?: Record<string, string | number>) => string;
-}) {
-  const [deleteConfirm, setDeleteConfirm] = useState(false);
-  const [showCode, setShowCode] = useState(false);
-  const [versions, setVersions] = useState<any[]>([]);
-  const [showVersions, setShowVersions] = useState(false);
-  const [showSchema, setShowSchema] = useState(false);
-
-  useEffect(() => {
-    if (expanded && showVersions && versions.length === 0) {
-      getToolEvolutionVersions(record.capability_id).then(res => {
-        setVersions(res.versions || []);
-      }).catch(() => {});
-    }
-  }, [expanded, showVersions, record.capability_id]);
-
-  const providerBadgeColor = {
-    Process: 'bg-blue-400/10 text-blue-400',
-    RhaiScript: 'bg-cyber/10 text-cyber',
-    ExternalApi: 'bg-purple-400/10 text-purple-400',
-    DynamicLibrary: 'bg-orange-400/10 text-orange-400',
-    BuiltIn: 'bg-muted text-muted-foreground',
-  }[record.provider_kind] || 'bg-muted text-muted-foreground';
-
-  return (
-    <div className="border border-border rounded-xl bg-card overflow-hidden transition-all">
-      <div
-        className="flex items-center gap-3 px-4 py-3 cursor-pointer hover:bg-accent/30 transition-colors"
-        onClick={onToggle}
-      >
-        {expanded ? <ChevronDown size={14} className="text-muted-foreground shrink-0" /> : <ChevronRight size={14} className="text-muted-foreground shrink-0" />}
-        {statusIcon(record.status)}
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2">
-            <Cpu size={12} className="text-purple-400" />
-            <span className="font-medium text-sm truncate">{record.capability_id}</span>
-            <span className={`text-[10px] font-bold uppercase tracking-wider ${statusColor(record.status)}`}>
-              {record.status}
-            </span>
-            <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${providerBadgeColor}`}>
-              {record.provider_kind}
-            </span>
-            {record.attempt > 1 && (
-              <span className="text-[10px] px-1.5 py-0.5 rounded bg-muted text-muted-foreground">
-                {t('evolution.attempt', { n: record.attempt })}
-              </span>
-            )}
-          </div>
-          <div className="flex items-center gap-3 mt-0.5">
-            <span className="text-[10px] text-muted-foreground truncate max-w-[300px]">
-              {record.description}
-            </span>
-            <span className="text-[10px] text-muted-foreground">
-              {formatTime(record.updated_at)}
-            </span>
-            <PipelineStages status={record.status} stages={CAP_STAGES} />
-          </div>
-        </div>
-        <button
-          onClick={e => { e.stopPropagation(); setDeleteConfirm(true); }}
-          className="p-1.5 rounded-md hover:bg-destructive/20 text-muted-foreground hover:text-destructive shrink-0"
-        >
-          <Trash2 size={12} />
-        </button>
-      </div>
-
-      {expanded && (
-        <div className="border-t border-border px-4 py-3 space-y-3 text-xs">
-          <DetailSection title={t('evolution.detail')}>
-            <div className="grid grid-cols-2 gap-2">
-              <KV label={t('evolution.id')} value={record.id} />
-              <KV label={t('evolution.provider')} value={record.provider_kind} />
-              <KV label={t('evolution.created')} value={formatTime(record.created_at)} />
-              <KV label={t('evolution.updated')} value={formatTime(record.updated_at)} />
-            </div>
-            <div className="mt-2">
-              <span className="text-muted-foreground">{t('evolution.description')}:</span>
-              <p className="mt-1 text-foreground">{record.description}</p>
-            </div>
-            {record.artifact_path && (
-              <div className="mt-1">
-                <KV label={t('evolution.artifactPath')} value={record.artifact_path} />
-              </div>
-            )}
-          </DetailSection>
-
-          {/* Input/Output Schema */}
-          {(record.input_schema || record.output_schema) && (
-            <DetailSection title={t('evolution.schemas')}>
-              <button
-                onClick={() => setShowSchema(!showSchema)}
-                className="flex items-center gap-1 text-[10px] text-purple-400 hover:underline mb-1"
-              >
-                <FileCode size={10} />
-                {showSchema ? t('evolution.hideCode') : t('evolution.showCode')}
-              </button>
-              {showSchema && (
-                <div className="space-y-2">
-                  {record.input_schema && (
-                    <div>
-                      <span className="text-muted-foreground font-medium">Input:</span>
-                      <pre className="mt-0.5 p-2 rounded bg-muted/50 text-[10px] font-mono whitespace-pre-wrap max-h-32 overflow-y-auto">
-                        {JSON.stringify(record.input_schema, null, 2)}
-                      </pre>
-                    </div>
-                  )}
-                  {record.output_schema && (
-                    <div>
-                      <span className="text-muted-foreground font-medium">Output:</span>
-                      <pre className="mt-0.5 p-2 rounded bg-muted/50 text-[10px] font-mono whitespace-pre-wrap max-h-32 overflow-y-auto">
-                        {JSON.stringify(record.output_schema, null, 2)}
-                      </pre>
-                    </div>
-                  )}
-                </div>
-              )}
-            </DetailSection>
-          )}
-
-          {record.source_code && (
-            <DetailSection title={t('evolution.sourceCode')}>
-              <button
-                onClick={() => setShowCode(!showCode)}
-                className="flex items-center gap-1 text-[10px] text-rust hover:underline mb-1"
-              >
-                {showCode ? <EyeOff size={10} /> : <Eye size={10} />}
-                {showCode ? t('evolution.hideCode') : t('evolution.showCode')}
-              </button>
-              {showCode && (
-                <pre className="p-2 rounded bg-muted/50 text-[10px] font-mono whitespace-pre-wrap max-h-48 overflow-y-auto">
-                  {record.source_code}
-                </pre>
-              )}
-            </DetailSection>
-          )}
-
-          {record.compile_output && (
-            <DetailSection title={t('evolution.compileOutput')}>
-              <pre className="p-2 rounded bg-muted/50 text-[10px] font-mono whitespace-pre-wrap max-h-32 overflow-y-auto">
-                {record.compile_output}
-              </pre>
-            </DetailSection>
-          )}
-
-          {record.validation && (
-            <DetailSection title={t('evolution.validation')}>
-              <div className="flex items-center gap-2 mb-1">
-                {record.validation.passed
-                  ? <CheckCircle size={12} className="text-cyber" />
-                  : <XCircle size={12} className="text-red-400" />}
-                <span className={record.validation.passed ? 'text-cyber' : 'text-red-400'}>
-                  {record.validation.passed ? t('evolution.validationPassed') : t('evolution.validationFailed')}
-                </span>
-              </div>
-              {record.validation.checks?.map((check, i) => (
-                <div key={i} className="flex items-center gap-1.5 ml-4">
-                  {check.passed ? <CheckCircle size={10} className="text-cyber" /> : <XCircle size={10} className="text-red-400" />}
-                  <span className="text-muted-foreground">{check.name}: {check.message}</span>
-                </div>
-              ))}
-            </DetailSection>
-          )}
-
-          {/* Version History */}
-          <DetailSection title={t('evolution.versionHistory')}>
-            <button
-              onClick={() => setShowVersions(!showVersions)}
-              className="flex items-center gap-1 text-[10px] text-blue-400 hover:underline mb-1"
-            >
-              <History size={10} />
-              {showVersions ? t('evolution.hideVersions') : t('evolution.showVersions')}
-            </button>
-            {showVersions && (
-              <div className="space-y-1 mt-1">
-                {versions.length === 0 ? (
-                  <span className="text-muted-foreground">{t('evolution.noVersions')}</span>
-                ) : (
-                  versions.map((v, i) => (
-                    <div key={i} className="flex items-center gap-2 py-1 border-b border-border/50 last:border-0">
-                      <Tag size={10} className="text-blue-400 shrink-0" />
-                      <span className="font-mono font-medium">{v.version}</span>
-                      <span className="text-[9px] px-1 py-0.5 rounded bg-muted text-muted-foreground">{v.source}</span>
-                      <span className="text-muted-foreground flex-1 truncate text-[10px]">{v.changelog || '—'}</span>
-                      <span className="text-[10px] text-muted-foreground">{formatTime(v.created_at)}</span>
-                    </div>
-                  ))
-                )}
-              </div>
-            )}
-          </DetailSection>
-
-          {record.feedback_history?.length > 0 && (
-            <DetailSection title={t('evolution.feedbackHistory')}>
-              <div className="space-y-2">
-                {record.feedback_history.map((fb, i) => (
-                  <div key={i} className="border border-border rounded-lg p-2 bg-muted/30">
-                    <div className="flex items-center gap-2 mb-1">
-                      <RotateCcw size={10} className="text-muted-foreground" />
-                      <span className="font-medium">{t('evolution.attempt', { n: fb.attempt })}</span>
-                      <span className="text-muted-foreground">— {fb.stage}</span>
-                    </div>
-                    <p className="text-muted-foreground">{fb.feedback}</p>
-                  </div>
-                ))}
-              </div>
-            </DetailSection>
-          )}
-        </div>
-      )}
-
-      {deleteConfirm && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={() => setDeleteConfirm(false)}>
-          <div className="bg-card border border-border rounded-xl p-6 max-w-sm w-full mx-4 shadow-xl" onClick={e => e.stopPropagation()}>
-            <div className="flex items-center gap-3 mb-4">
-              <div className="p-2 rounded-full bg-destructive/10">
-                <Trash2 size={20} className="text-destructive" />
-              </div>
-              <h3 className="font-semibold">{t('evolution.deleteRecord')}</h3>
-            </div>
-            <p className="text-sm text-muted-foreground mb-6">{t('evolution.deleteConfirm')}</p>
-            <div className="flex justify-end gap-2">
-              <button onClick={() => setDeleteConfirm(false)} className="px-4 py-1.5 text-sm rounded-lg border border-border hover:bg-accent">
-                {t('common.cancel')}
-              </button>
-              <button
-                onClick={() => { setDeleteConfirm(false); onDelete(); }}
-                className="px-4 py-1.5 text-sm rounded-lg bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              >
-                {t('common.delete')}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
 
 function DetailSection({ title, children }: { title: string; children: React.ReactNode }) {
   return (

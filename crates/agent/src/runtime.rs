@@ -1,6 +1,6 @@
 use blockcell_core::{Config, InboundMessage, OutboundMessage, Paths, Result};
 use blockcell_core::types::{ChatMessage, ToolCallRequest};
-use blockcell_providers::Provider;
+use blockcell_providers::{Provider, ProviderPool, CallResult};
 use blockcell_storage::{SessionStore, AuditLogger};
 use blockcell_tools::{ToolRegistry, TaskManagerHandle, MemoryStoreHandle, SpawnHandle, CapabilityRegistryHandle, CoreEvolutionHandle};
 use std::collections::{HashMap, HashSet};
@@ -40,6 +40,7 @@ pub struct RuntimeSpawnHandle {
     paths: Paths,
     task_manager: TaskManager,
     outbound_tx: Option<mpsc::Sender<OutboundMessage>>,
+    provider_pool: Arc<ProviderPool>,
 }
 
 impl SpawnHandle for RuntimeSpawnHandle {
@@ -58,9 +59,8 @@ impl SpawnHandle for RuntimeSpawnHandle {
             "Spawning subagent via SpawnHandle"
         );
 
-        // Create isolated provider for the subagent
-        let provider = AgentRuntime::create_subagent_provider(&self.config)
-            .ok_or_else(|| blockcell_core::Error::Config("No provider configured".to_string()))?;
+        // Reuse the shared pool for the subagent (pool is Arc, cheap to clone)
+        let provider_pool = Arc::clone(&self.provider_pool);
 
         // Gather everything the background task needs
         let config = self.config.clone();
@@ -78,7 +78,7 @@ impl SpawnHandle for RuntimeSpawnHandle {
         tokio::spawn(run_subagent_task(
             config,
             paths,
-            provider,
+            provider_pool,
             task_manager,
             outbound_tx,
             task_str,
@@ -435,7 +435,7 @@ pub struct AgentRuntime {
     config: Config,
     paths: Paths,
     context_builder: ContextBuilder,
-    provider: Arc<dyn Provider>,
+    provider_pool: Arc<ProviderPool>,
     tool_registry: ToolRegistry,
     session_store: SessionStore,
     audit_logger: AuditLogger,
@@ -464,18 +464,20 @@ impl AgentRuntime {
     pub fn new(
         config: Config,
         paths: Paths,
-        provider: Box<dyn Provider>,
+        provider_pool: Arc<ProviderPool>,
         tool_registry: ToolRegistry,
     ) -> Result<Self> {
         let mut context_builder = ContextBuilder::new(paths.clone(), config.clone());
 
-        // 默认使用主 provider 作为 evolution provider
+        // 默认使用 pool 中第一个可用 provider 作为 evolution provider
         // 可以通过 set_evolution_provider() 方法覆盖
-        let provider_arc: Arc<dyn Provider> = Arc::from(provider);
-        let llm_adapter = Arc::new(ProviderLLMAdapter {
-            provider: provider_arc.clone(),
-        });
-        context_builder.set_evolution_llm_provider(llm_adapter);
+        if let Some((_, p)) = provider_pool.acquire() {
+            let llm_adapter = Arc::new(ProviderLLMAdapter { provider: p });
+            context_builder.set_evolution_llm_provider(llm_adapter);
+            info!("🧠 [自进化] Evolution LLM provider wired from provider pool");
+        } else {
+            warn!("🧠 [自进化] Failed to acquire provider from pool for evolution — evolution pipeline will not auto-drive");
+        }
 
         let session_store = SessionStore::new(paths.clone());
         let audit_logger = AuditLogger::new(paths.clone());
@@ -484,7 +486,7 @@ impl AgentRuntime {
             config,
             paths,
             context_builder,
-            provider: provider_arc,
+            provider_pool,
             tool_registry,
             session_store,
             audit_logger,
@@ -528,13 +530,10 @@ impl AgentRuntime {
         self.event_tx = Some(tx);
     }
 
-    /// 设置独立的自进化 LLM provider
-    /// 用于避免自进化与对话抢占并发
+    /// 设置独立的自进化 LLM provider（可选覆盖，不影响主 pool）
     pub fn set_evolution_provider(&mut self, provider: Box<dyn Provider>) {
         let provider_arc: Arc<dyn Provider> = Arc::from(provider);
-        let llm_adapter = Arc::new(ProviderLLMAdapter {
-            provider: provider_arc,
-        });
+        let llm_adapter = Arc::new(ProviderLLMAdapter { provider: provider_arc });
         self.context_builder.set_evolution_llm_provider(llm_adapter);
     }
 
@@ -693,10 +692,9 @@ impl AgentRuntime {
         registry
     }
 
-    /// Create a new provider instance for a subagent.
-    /// Delegates to the unified factory in blockcell_providers::factory.
-    pub fn create_subagent_provider(config: &Config) -> Option<Box<dyn Provider>> {
-        blockcell_providers::create_main_provider(config).ok()
+    /// 返回当前 provider pool（供外部检查状态）
+    pub fn provider_pool(&self) -> &Arc<ProviderPool> {
+        &self.provider_pool
     }
 
     /// Build an extractive summary from session history (no LLM call).
@@ -1073,16 +1071,29 @@ impl AgentRuntime {
                     warn!(attempt, max_retries, delay_ms, iteration, "Retrying LLM call after transient error");
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                 }
-                match self.provider.chat(&current_messages, &tools).await {
+                // 从 pool 中选取一个可用 provider（每次可能不同）
+                let (pool_idx, provider) = match self.provider_pool.acquire() {
+                    Some(p) => p,
+                    None => {
+                        last_error = Some(blockcell_core::Error::Config(
+                            "ProviderPool: no healthy providers available".to_string()
+                        ));
+                        break;
+                    }
+                };
+                match provider.chat(&current_messages, &tools).await {
                     Ok(r) => {
                         if attempt > 0 {
-                            info!(attempt, iteration, "LLM call succeeded after retry");
+                            info!(attempt, iteration, pool_idx, "LLM call succeeded after retry");
                         }
+                        self.provider_pool.report(pool_idx, CallResult::Success);
                         response_opt = Some(r);
                         break;
                     }
                     Err(e) => {
-                        warn!(error = %e, attempt, max_retries, iteration, "LLM call failed");
+                        let err_str = format!("{}", e);
+                        warn!(error = %err_str, attempt, max_retries, iteration, pool_idx, "LLM call failed");
+                        self.provider_pool.report(pool_idx, ProviderPool::classify_error(&err_str));
                         last_error = Some(e);
                     }
                 }
@@ -1331,7 +1342,17 @@ impl AgentRuntime {
                         "请基于以上工具调用的结果，直接给出最终答案。不要再调用任何工具，也不要输出类似[Called: ...]的过程信息。",
                     ));
 
-                    match self.provider.chat(&final_messages, &[]).await {
+                    let chat_result = if let Some((pidx, p)) = self.provider_pool.acquire() {
+                        let r = p.chat(&final_messages, &[]).await;
+                        match &r {
+                            Ok(_) => self.provider_pool.report(pidx, CallResult::Success),
+                            Err(e) => self.provider_pool.report(pidx, ProviderPool::classify_error(&format!("{}", e))),
+                        }
+                        r
+                    } else {
+                        Err(blockcell_core::Error::Config("ProviderPool: no healthy providers".to_string()))
+                    };
+                    match chat_result {
                         Ok(r) => {
                             final_response = r.content.unwrap_or_default();
                             history.push(ChatMessage::assistant(&final_response));
@@ -1706,6 +1727,7 @@ impl AgentRuntime {
             paths: self.paths.clone(),
             task_manager: self.task_manager.clone(),
             outbound_tx: self.outbound_tx.clone(),
+            provider_pool: Arc::clone(&self.provider_pool),
         });
 
         let ctx = blockcell_tools::ToolContext {
@@ -1820,7 +1842,13 @@ impl AgentRuntime {
         }
         // 报告调用结果给灰度统计
         if let Some(evo_service) = self.context_builder.evolution_service() {
-            evo_service.report_skill_call(&tool_call.name, is_error).await;
+            let mut reported_name = tool_call.name.clone();
+            if let Some(sm) = self.context_builder.skill_manager() {
+                if let Some(skill) = sm.match_skill(&msg.content) {
+                    reported_name = skill.name.clone();
+                }
+            }
+            evo_service.report_skill_call(&reported_name, is_error).await;
         }
 
         // Emit tool_call_result event to WebSocket clients
@@ -2021,6 +2049,7 @@ impl AgentRuntime {
                             let core_evolution = self.core_evolution.clone();
                             let event_tx = self.event_tx.clone();
                             let task_id_clone = task_id.clone();
+                            let provider_pool = Arc::clone(&self.provider_pool);
 
                             // Register task
                             task_manager.create_task(
@@ -2034,6 +2063,7 @@ impl AgentRuntime {
                             tokio::spawn(run_message_task(
                                 config,
                                 paths,
+                                provider_pool,
                                 task_manager,
                                 outbound_tx,
                                 confirm_tx,
@@ -2161,6 +2191,7 @@ impl AgentRuntime {
 async fn run_message_task(
     config: Config,
     paths: Paths,
+    provider_pool: Arc<ProviderPool>,
     task_manager: TaskManager,
     outbound_tx: Option<mpsc::Sender<OutboundMessage>>,
     confirm_tx: Option<mpsc::Sender<ConfirmRequest>>,
@@ -2173,21 +2204,8 @@ async fn run_message_task(
 ) {
     task_manager.set_running(&task_id).await;
 
-    // Create a fresh provider for this task
-    let provider = match AgentRuntime::create_subagent_provider(&config) {
-        Some(p) => p,
-        None => {
-            let err = "No provider configured";
-            task_manager.set_failed(&task_id, err).await;
-            if let Some(tx) = &outbound_tx {
-                let _ = tx.send(OutboundMessage::new(&msg.channel, &msg.chat_id, &format!("❌ {}", err))).await;
-            }
-            return;
-        }
-    };
-
     let tool_registry = ToolRegistry::with_defaults();
-    let mut runtime = match AgentRuntime::new(config, paths, provider, tool_registry) {
+    let mut runtime = match AgentRuntime::new(config, paths, provider_pool, tool_registry) {
         Ok(r) => r,
         Err(e) => {
             task_manager.set_failed(&task_id, &format!("{}", e)).await;
@@ -2241,7 +2259,7 @@ async fn run_message_task(
 async fn run_subagent_task(
     config: Config,
     paths: Paths,
-    provider: Box<dyn Provider>,
+    provider_pool: Arc<ProviderPool>,
     task_manager: TaskManager,
     outbound_tx: Option<mpsc::Sender<OutboundMessage>>,
     task_str: String,
@@ -2258,7 +2276,7 @@ async fn run_subagent_task(
 
     // Create isolated runtime with restricted tools
     let tool_registry = AgentRuntime::subagent_tool_registry();
-    let mut sub_runtime = match AgentRuntime::new(config, paths, provider, tool_registry) {
+    let mut sub_runtime = match AgentRuntime::new(config, paths, provider_pool, tool_registry) {
         Ok(r) => r,
         Err(e) => {
             task_manager.set_failed(&task_id, &format!("{}", e)).await;
