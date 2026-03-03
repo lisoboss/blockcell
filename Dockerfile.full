@@ -1,5 +1,6 @@
 # syntax=docker/dockerfile:1.6
 
+# Build web UI
 FROM node:20-alpine AS webui-builder
 
 WORKDIR /webui
@@ -11,6 +12,7 @@ RUN --mount=type=cache,target=/root/.npm \
 COPY webui ./
 RUN npm run build
 
+# The builder stage compiles the Rust application and runs tests
 FROM rust:1-slim-bookworm AS builder
 
 RUN apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update \
@@ -38,6 +40,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cargo build -p blockcell --bin blockcell --release --locked \
     && cp /app/target/release/blockcell /app/blockcell
 
+# Copy the Docker CLI binary from the docker:cli image
+FROM docker:cli AS dockercli
 
 #### The full dependency runtime image
 FROM rust:1-bookworm as runtime
@@ -46,33 +50,24 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        git \
-        curl \
-        ca-certificates \
-        unzip \
-        xz-utils \
-        build-essential \
-        pkg-config \
-        python3 \
-        python3-pip \
-        ffmpeg \
-        chromium \
-        docker.io \
+        git curl ca-certificates unzip xz-utils \
+        build-essential pkg-config \
+        python3 python3-pip \
+        ffmpeg chromium \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - && \
     apt-get install -y nodejs && \
     rm -rf /var/lib/apt/lists/*
 
-RUN groupadd --system blockcell \
-    && useradd --system --gid blockcell --create-home --home-dir /home/blockcell blockcell \
-    && mkdir -p /home/blockcell/.blockcell/workspace \
-    && chown -R blockcell:blockcell /home/blockcell
+WORKDIR /root
 
-WORKDIR /home/blockcell
-
+# -v /var/run/docker.sock:/var/run/docker.sock is required for docker in docker
+COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
 COPY --from=builder /app/blockcell /usr/local/bin/blockcell
 
-USER blockcell
+# fix run docker in docker
+# -v blockcell_data:/root/.blockcell
+USER root
 
 ENTRYPOINT ["/usr/local/bin/blockcell"]

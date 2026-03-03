@@ -625,7 +625,7 @@ impl FeishuChannel {
         if let Some(parent_id) = message.parent_id {
             if parent_id != message.message_id && !parent_id.is_empty() {
                 debug!(parent_id = %parent_id, "Message is a reply, adding parent_id to message");
-                content_text = format!("[parent_message_id: {}]\n\n{}", parent_id, content_text);
+                content_text = format!("[parent_message_id: {}, chat_id: {}]\n\n{}", parent_id, message.chat_id, content_text);
             }
         }
 
