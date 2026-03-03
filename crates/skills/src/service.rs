@@ -1,10 +1,10 @@
 use crate::evolution::{
     EvolutionContext, EvolutionRecord, EvolutionStatus, FeedbackEntry,
-    LLMProvider, SkillEvolution, TriggerReason,
+    LLMProvider, SkillEvolution, SkillType, TriggerReason,
 };
 use blockcell_core::{Error, Result};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -309,6 +309,130 @@ pub struct EvolutionService {
 }
 
 impl EvolutionService {
+    fn is_in_progress_status(status: &EvolutionStatus) -> bool {
+        matches!(
+            *status.normalize(),
+            EvolutionStatus::Triggered
+                | EvolutionStatus::Generating
+                | EvolutionStatus::Generated
+                | EvolutionStatus::Auditing
+                | EvolutionStatus::AuditPassed
+                | EvolutionStatus::CompilePassed
+                | EvolutionStatus::Observing
+        )
+    }
+
+    fn find_in_progress_record_on_disk(&self, skill_name: &str) -> Option<String> {
+        let records = self.list_all_records().ok()?;
+        records
+            .into_iter()
+            .find(|r| r.skill_name == skill_name && Self::is_in_progress_status(&r.status))
+            .map(|r| r.id)
+    }
+
+    /// Reconcile in-memory `active_evolutions` with disk records and return the
+    /// canonical in-progress evolution_id (if any) for this skill.
+    async fn resolve_in_progress_evolution_id(&self, skill_name: &str) -> Option<String> {
+        let disk_id = self.find_in_progress_record_on_disk(skill_name);
+        let mut active = self.active_evolutions.lock().await;
+        match disk_id {
+            Some(id) => {
+                active.insert(skill_name.to_string(), id.clone());
+                Some(id)
+            }
+            None => {
+                active.remove(skill_name);
+                None
+            }
+        }
+    }
+
+    fn truncate_chars(s: &str, max_chars: usize) -> String {
+        if s.chars().count() <= max_chars {
+            return s.to_string();
+        }
+        s.chars().take(max_chars).collect::<String>()
+    }
+
+    fn first_legacy_python_script(skill_dir: &Path) -> Option<PathBuf> {
+        let mut candidates: Vec<PathBuf> = Vec::new();
+
+        let scripts_dir = skill_dir.join("scripts");
+        if scripts_dir.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&scripts_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() && path.extension().is_some_and(|e| e == "py") {
+                        candidates.push(path);
+                    }
+                }
+            }
+        }
+
+        if candidates.is_empty() {
+            if let Ok(entries) = std::fs::read_dir(skill_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file()
+                        && path.file_name().and_then(|n| n.to_str()) != Some("SKILL.py")
+                        && path.extension().is_some_and(|e| e == "py")
+                    {
+                        candidates.push(path);
+                    }
+                }
+            }
+        }
+
+        candidates.sort_by(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
+        candidates.into_iter().next()
+    }
+
+    fn detect_skill_layout(&self, skill_name: &str) -> (SkillType, Option<String>) {
+        let skill_dir = self.evolution.skills_dir().join(skill_name);
+
+        let rhai_path = skill_dir.join("SKILL.rhai");
+        if rhai_path.exists() {
+            return (SkillType::Rhai, std::fs::read_to_string(rhai_path).ok());
+        }
+
+        let py_path = skill_dir.join("SKILL.py");
+        if py_path.exists() {
+            return (SkillType::Python, std::fs::read_to_string(py_path).ok());
+        }
+
+        if let Some(legacy_py_path) = Self::first_legacy_python_script(&skill_dir) {
+            let rel = legacy_py_path
+                .strip_prefix(&skill_dir)
+                .ok()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| legacy_py_path.display().to_string());
+
+            let legacy_code = std::fs::read_to_string(&legacy_py_path)
+                .ok()
+                .map(|s| Self::truncate_chars(&s, 8_000))
+                .unwrap_or_default();
+
+            let skill_md = std::fs::read_to_string(skill_dir.join("SKILL.md"))
+                .ok()
+                .map(|s| Self::truncate_chars(&s, 3_000));
+
+            let mut snippet = format!("# Legacy OpenClaw script: {}\n{}", rel, legacy_code);
+            if let Some(md) = skill_md {
+                snippet.push_str("\n\n# Current SKILL.md\n");
+                snippet.push_str(&md);
+            }
+
+            return (SkillType::Python, Some(snippet));
+        }
+
+        let md_path = skill_dir.join("SKILL.md");
+        if md_path.exists() {
+            return (SkillType::PromptOnly, std::fs::read_to_string(md_path).ok());
+        }
+
+        (SkillType::PromptOnly, None)
+    }
+
     pub fn new(skills_dir: PathBuf, config: EvolutionServiceConfig) -> Self {
         let error_tracker = ErrorTracker::new(
             config.error_threshold,
@@ -370,11 +494,9 @@ impl EvolutionService {
             });
         }
 
-        // 如果该技能已有进行中的进化，不重复触发
-        let already_evolving = {
-            let active = self.active_evolutions.lock().await;
-            active.contains_key(skill_name)
-        };
+        // 以磁盘记录作为主事实来源，避免多实例内存态漂移导致误判。
+        let existing_evolution_id = self.resolve_in_progress_evolution_id(skill_name).await;
+        let already_evolving = existing_evolution_id.is_some();
 
         let track_result = {
             let mut tracker = self.error_tracker.lock().await;
@@ -384,6 +506,7 @@ impl EvolutionService {
         if already_evolving {
             info!(
                 skill = %skill_name,
+                evolution_id = ?existing_evolution_id,
                 error_count = track_result.count,
                 "🧠 [自进化] 技能 `{}` 执行出错 (第{}次)，该技能已在学习改进中",
                 skill_name, track_result.count
@@ -427,6 +550,10 @@ impl EvolutionService {
             .get_current_version(skill_name)
             .unwrap_or_else(|_| "unknown".to_string());
 
+        // 检测技能类型（支持 OpenClaw scripts/*.py 兼容布局）
+        let (skill_type, inferred_source_snippet) = self.detect_skill_layout(skill_name);
+        let source_snippet = source_snippet.or(inferred_source_snippet);
+
         let context = EvolutionContext {
             skill_name: skill_name.to_string(),
             current_version,
@@ -435,6 +562,9 @@ impl EvolutionService {
             source_snippet,
             tool_schemas,
             timestamp: chrono::Utc::now().timestamp(),
+            skill_type,
+            staged: false,
+            staging_skills_dir: None,
         };
 
         let evolution_id = self.evolution.trigger_evolution(context).await?;
@@ -697,12 +827,20 @@ impl EvolutionService {
     ///    - 如果观察窗口到期且错误率正常 → 标记完成，清理资源
     pub async fn tick(&self) -> Result<()> {
         // Phase 1: Process pending evolutions (Triggered → run pipeline)
+        let has_llm = self.llm_provider.is_some();
+        debug!(
+            has_llm = has_llm,
+            records_dir = %self.records_dir().display(),
+            "🧠 [自进化] tick() 开始 (LLM provider: {})",
+            if has_llm { "已配置" } else { "未配置" }
+        );
         let pending = self.list_pending_ids().await;
         if !pending.is_empty() {
             info!(
                 count = pending.len(),
-                "🧠 [自进化] 发现 {} 个待处理的进化任务",
-                pending.len()
+                has_llm = has_llm,
+                "🧠 [自进化] 发现 {} 个待处理的进化任务 (LLM: {})",
+                pending.len(), if has_llm { "ready" } else { "none" }
             );
         }
         for (skill_name, evolution_id) in &pending {
@@ -964,6 +1102,38 @@ impl EvolutionService {
         self.active_evolutions.lock().await.clone()
     }
 
+    /// 触发外部技能（如 OpenClaw 兼容格式）的自进化任务。
+    ///
+    /// 与 report_error 不同，本方法直接注入一个 ManualRequest 触发器，
+    /// 绕过错误计数阈值，立即将技能入队进化。
+    /// 返回 evolution_id，可用于日志追踪。
+    pub async fn trigger_external_evolution(
+        &self,
+        context: EvolutionContext,
+    ) -> blockcell_core::Result<String> {
+        let skill_name = context.skill_name.clone();
+        if let Some(existing_id) = self.resolve_in_progress_evolution_id(&skill_name).await {
+            return Err(Error::Evolution(format!(
+                "技能 `{}` 已有进行中的进化: {}",
+                skill_name, existing_id
+            )));
+        }
+        let evolution_id = self.evolution.trigger_evolution(context).await?;
+
+        {
+            let mut active = self.active_evolutions.lock().await;
+            active.insert(skill_name.clone(), evolution_id.clone());
+        }
+
+        info!(
+            skill = %skill_name,
+            evolution_id = %evolution_id,
+            "🧠 [外部技能] 已触发自进化任务"
+        );
+
+        Ok(evolution_id)
+    }
+
     /// 清理已完成/失败的进化（成功时清除错误计数器）
     async fn cleanup_evolution(&self, skill_name: &str, evolution_id: &str) {
         self.cleanup_evolution_inner(skill_name, evolution_id, false).await;
@@ -975,6 +1145,42 @@ impl EvolutionService {
     }
 
     async fn cleanup_evolution_inner(&self, skill_name: &str, evolution_id: &str, is_rollback: bool) {
+        // 将磁盘上处于中间状态的记录标记为 Failed，防止孤尻记录被无限重新接管
+        if let Ok(mut record) = self.evolution.load_record(evolution_id) {
+            let is_terminal = matches!(
+                record.status,
+                EvolutionStatus::Completed
+                    | EvolutionStatus::RolledBack
+                    | EvolutionStatus::Failed
+                    | EvolutionStatus::Observing
+            );
+            if !is_terminal {
+                record.status = EvolutionStatus::Failed;
+                record.updated_at = chrono::Utc::now().timestamp();
+                let _ = self.evolution.save_record_public(&record);
+                info!(
+                    skill = %skill_name,
+                    evolution_id = %evolution_id,
+                    "🧠 [自进化] 清理时将进化记录标记为 Failed，防止孤尻重来 ({})",
+                    evolution_id
+                );
+            }
+
+            if record.context.staged {
+                if let Some(staging_dir) = record.context.staging_skills_dir.as_ref() {
+                    let root = std::path::PathBuf::from(staging_dir);
+                    let staged_skill_dir = root.join(skill_name);
+                    if let (Ok(r), Ok(p)) = (root.canonicalize(), staged_skill_dir.canonicalize()) {
+                        if p.starts_with(&r) {
+                            std::fs::remove_dir_all(p).ok();
+                        }
+                    } else if staged_skill_dir.starts_with(&root) {
+                        std::fs::remove_dir_all(staged_skill_dir).ok();
+                    }
+                }
+            }
+        }
+
         let mut active = self.active_evolutions.lock().await;
         active.remove(skill_name);
         drop(active);
@@ -1007,7 +1213,14 @@ impl EvolutionService {
     }
 
     /// 列出所有待处理的进化 ID（状态为 Triggered 但尚未开始 pipeline 的）
+    ///
+    /// Also scans disk records for orphaned Triggered records that aren't in
+    /// active_evolutions (e.g. created by the gateway's separate EvolutionService
+    /// instance or surviving a restart) and adopts them.
     pub async fn list_pending_ids(&self) -> Vec<(String, String)> {
+        // First, adopt orphaned disk records into active_evolutions
+        self.adopt_orphaned_records().await;
+
         let active = self.active_evolutions.lock().await;
         let mut pending = Vec::new();
         for (skill_name, evolution_id) in active.iter() {
@@ -1021,6 +1234,81 @@ impl EvolutionService {
         pending
     }
 
+    /// Scan disk evolution_records for Triggered/Generating records that are NOT
+    /// already tracked in active_evolutions. This handles the case where another
+    /// EvolutionService instance (e.g. the gateway HTTP handler) created the record
+    /// on disk but this instance's in-memory state doesn't know about it.
+    async fn adopt_orphaned_records(&self) {
+        let records_dir = self.records_dir();
+        if !records_dir.exists() {
+            debug!("🧠 [adopt] records_dir does not exist: {}", records_dir.display());
+            return;
+        }
+
+        let entries = match std::fs::read_dir(&records_dir) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!("🧠 [adopt] Failed to read records_dir: {}", e);
+                return;
+            }
+        };
+
+        let mut active = self.active_evolutions.lock().await;
+        let active_count_before = active.len();
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.extension().is_some_and(|e| e == "json") {
+                continue;
+            }
+
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            let record: EvolutionRecord = match serde_json::from_str(&content) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+
+            // Only adopt records that are in an active pipeline state
+            let dominated = matches!(
+                record.status,
+                EvolutionStatus::Triggered
+                    | EvolutionStatus::Generating
+                    | EvolutionStatus::Generated
+                    | EvolutionStatus::Auditing
+                    | EvolutionStatus::AuditPassed
+                    | EvolutionStatus::CompilePassed
+                    | EvolutionStatus::Observing
+                    | EvolutionStatus::RollingOut
+            );
+            if !dominated {
+                continue;
+            }
+
+            // Skip if already tracked
+            if active.contains_key(&record.skill_name) {
+                continue;
+            }
+
+            info!(
+                skill = %record.skill_name,
+                evolution_id = %record.id,
+                status = ?record.status,
+                "🧠 [自进化] 从磁盘发现孤立的进化记录，已接管: {} ({:?})",
+                record.id, record.status
+            );
+            active.insert(record.skill_name.clone(), record.id.clone());
+        }
+
+        let adopted = active.len() - active_count_before;
+        if adopted > 0 {
+            info!("🧠 [adopt] Adopted {} orphaned record(s), total active: {}", adopted, active.len());
+        }
+    }
+
     /// 手动触发进化（用户通过 CLI 输入描述）
     ///
     /// 与 report_error 不同，这里不经过 ErrorTracker，直接创建进化记录。
@@ -1030,28 +1318,20 @@ impl EvolutionService {
         skill_name: &str,
         description: &str,
     ) -> Result<String> {
-        // 检查是否已有进行中的进化
-        {
-            let active = self.active_evolutions.lock().await;
-            if let Some(existing_id) = active.get(skill_name) {
-                return Err(Error::Evolution(format!(
-                    "技能 `{}` 已有进行中的进化: {}",
-                    skill_name, existing_id
-                )));
-            }
+        // 以磁盘记录为准检查进行中的进化，避免多实例内存状态不一致。
+        if let Some(existing_id) = self.resolve_in_progress_evolution_id(skill_name).await {
+            return Err(Error::Evolution(format!(
+                "技能 `{}` 已有进行中的进化: {}",
+                skill_name, existing_id
+            )));
         }
 
         let current_version = self.evolution.version_manager()
             .get_current_version(skill_name)
             .unwrap_or_else(|_| "0.0.0".to_string());
 
-        // Try to load existing SKILL.rhai source for context
-        let skill_path = self.evolution.skills_dir().join(skill_name).join("SKILL.rhai");
-        let source_snippet = if skill_path.exists() {
-            std::fs::read_to_string(&skill_path).ok()
-        } else {
-            None
-        };
+        // 检测技能类型：支持 SKILL.rhai / SKILL.py / SKILL.md 以及 OpenClaw scripts/*.py 布局
+        let (skill_type, source_snippet) = self.detect_skill_layout(skill_name);
 
         let context = EvolutionContext {
             skill_name: skill_name.to_string(),
@@ -1063,6 +1343,9 @@ impl EvolutionService {
             source_snippet,
             tool_schemas: vec![],
             timestamp: chrono::Utc::now().timestamp(),
+            skill_type,
+            staged: false,
+            staging_skills_dir: None,
         };
 
         let evolution_id = self.evolution.trigger_evolution(context).await?;
@@ -1251,6 +1534,42 @@ impl EvolutionService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn setup_test_dirs(tag: &str) -> (PathBuf, PathBuf) {
+        let mut root = std::env::temp_dir();
+        let now_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        root.push(format!(
+            "blockcell_evo_service_{}_{}_{}",
+            tag,
+            std::process::id(),
+            now_ns
+        ));
+        let skills_dir = root.join("skills");
+        std::fs::create_dir_all(&skills_dir).expect("create test skills dir");
+        (root, skills_dir)
+    }
+
+    fn test_context(skill_name: &str) -> EvolutionContext {
+        EvolutionContext {
+            skill_name: skill_name.to_string(),
+            current_version: "0.0.0".to_string(),
+            trigger: TriggerReason::ManualRequest {
+                description: "test evolution".to_string(),
+            },
+            error_stack: None,
+            source_snippet: None,
+            tool_schemas: vec![],
+            timestamp: chrono::Utc::now().timestamp(),
+            skill_type: SkillType::PromptOnly,
+            staged: false,
+            staging_skills_dir: None,
+        }
+    }
 
     #[test]
     fn test_error_tracker_threshold_1_triggers_immediately() {
@@ -1317,5 +1636,136 @@ mod tests {
 
         assert!((stats.error_rate("evo_1") - 1.0 / 3.0).abs() < 0.01);
         assert_eq!(stats.error_rate("evo_unknown"), 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_trigger_manual_evolution_uses_disk_record_to_dedupe() {
+        let (root, skills_dir) = setup_test_dirs("manual_dedupe");
+        let service = EvolutionService::new(skills_dir, EvolutionServiceConfig::default());
+        let existing_id = service
+            .evolution
+            .trigger_evolution(test_context("skill_a"))
+            .await
+            .expect("seed evolution record");
+
+        let err = service
+            .trigger_manual_evolution("skill_a", "retry manual trigger")
+            .await
+            .expect_err("should reject duplicate manual evolution");
+        let msg = format!("{}", err);
+        assert!(msg.contains("已有进行中的进化"));
+        assert!(msg.contains(&existing_id));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn test_trigger_external_evolution_uses_disk_record_to_dedupe() {
+        let (root, skills_dir) = setup_test_dirs("external_dedupe");
+        let service = EvolutionService::new(skills_dir, EvolutionServiceConfig::default());
+        let existing_id = service
+            .evolution
+            .trigger_evolution(test_context("skill_b"))
+            .await
+            .expect("seed evolution record");
+
+        let err = service
+            .trigger_external_evolution(test_context("skill_b"))
+            .await
+            .expect_err("should reject duplicate external evolution");
+        let msg = format!("{}", err);
+        assert!(msg.contains("已有进行中的进化"));
+        assert!(msg.contains(&existing_id));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn test_report_error_reads_disk_state_when_active_memory_is_empty() {
+        let (root, skills_dir) = setup_test_dirs("report_error_reconcile");
+        let service = EvolutionService::new(skills_dir, EvolutionServiceConfig::default());
+        let existing_id = service
+            .evolution
+            .trigger_evolution(test_context("skill_c"))
+            .await
+            .expect("seed evolution record");
+
+        let report = service
+            .report_error("skill_c", "boom", None, vec![])
+            .await
+            .expect("report error");
+        assert!(report.evolution_in_progress);
+        assert!(report.evolution_triggered.is_none());
+
+        let active = service.active_evolutions().await;
+        assert_eq!(active.get("skill_c"), Some(&existing_id));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn test_trigger_manual_evolution_infers_python_from_legacy_scripts() {
+        let (root, skills_dir) = setup_test_dirs("manual_infer_py");
+        let skill_name = "legacy_py_skill";
+        let skill_dir = skills_dir.join(skill_name);
+        std::fs::create_dir_all(skill_dir.join("scripts")).expect("create scripts dir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "# Legacy skill\nUses scripts/search.py\n",
+        )
+        .expect("write SKILL.md");
+        std::fs::write(
+            skill_dir.join("scripts").join("search.py"),
+            "print('legacy openclaw python')\n",
+        )
+        .expect("write legacy search.py");
+
+        let service = EvolutionService::new(skills_dir, EvolutionServiceConfig::default());
+        let evolution_id = service
+            .trigger_manual_evolution(skill_name, "convert to blockcell python style")
+            .await
+            .expect("trigger manual evolution");
+
+        let record = service
+            .evolution
+            .load_record(&evolution_id)
+            .expect("load evolution record");
+        assert_eq!(record.context.skill_type, SkillType::Python);
+        let snippet = record.context.source_snippet.unwrap_or_default();
+        assert!(snippet.contains("scripts/search.py"));
+        assert!(snippet.contains("legacy openclaw python"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn test_report_error_infers_python_from_legacy_scripts() {
+        let (root, skills_dir) = setup_test_dirs("report_error_infer_py");
+        let skill_name = "legacy_py_error";
+        let skill_dir = skills_dir.join(skill_name);
+        std::fs::create_dir_all(skill_dir.join("scripts")).expect("create scripts dir");
+        std::fs::write(skill_dir.join("SKILL.md"), "# Legacy skill\n").expect("write SKILL.md");
+        std::fs::write(
+            skill_dir.join("scripts").join("search.py"),
+            "print('legacy python from error path')\n",
+        )
+        .expect("write search.py");
+
+        let service = EvolutionService::new(skills_dir, EvolutionServiceConfig::default());
+        let report = service
+            .report_error(skill_name, "boom", None, vec![])
+            .await
+            .expect("report error");
+        let evo_id = report
+            .evolution_triggered
+            .expect("should trigger evolution at default threshold=1");
+
+        let record = service
+            .evolution
+            .load_record(&evo_id)
+            .expect("load evolution record");
+        assert_eq!(record.context.skill_type, SkillType::Python);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -99,6 +99,10 @@ impl Paths {
         self.workspace().join("skills")
     }
 
+    pub fn import_staging_skills_dir(&self) -> PathBuf {
+        self.workspace().join("import_staging").join("skills")
+    }
+
     pub fn evolved_tools_dir(&self) -> PathBuf {
         self.workspace().join("evolved_tools")
     }
@@ -145,6 +149,7 @@ impl Paths {
         std::fs::create_dir_all(self.whatsapp_auth_dir())?;
         std::fs::create_dir_all(self.memory_dir())?;
         std::fs::create_dir_all(self.skills_dir())?;
+        std::fs::create_dir_all(self.import_staging_skills_dir())?;
         std::fs::create_dir_all(self.evolved_tools_dir())?;
         std::fs::create_dir_all(self.tool_artifacts_dir())?;
         std::fs::create_dir_all(self.tool_evolution_records_dir())?;

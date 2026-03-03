@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react';
 import {
   Save, RefreshCw, FlaskConical, Loader2, Globe, Sun, Moon, Monitor,
-  ExternalLink, LogOut, ChevronRight, Languages, Palette, FileCode, Info, X,
+  ExternalLink, LogOut, ChevronRight, Languages, FileCode, Info, X,
+  ToggleLeft, ToggleRight,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { getConfig, updateConfig, testProvider, getHealth, logout } from '@/lib/api';
+import { getConfig, updateConfig, testProvider, getHealth, logout, reloadConfig } from '@/lib/api';
 import { useThemeStore } from '@/lib/store';
 import { useI18nStore, useT, type Locale } from '@/lib/i18n';
 
@@ -29,18 +30,16 @@ function ConfigEditor({ onBack, t }: { onBack: () => void; t: (k: string, p?: Re
       <div className="fixed inset-0 z-50 flex items-center justify-center">
         <div className="absolute inset-0 bg-black/50" onClick={onClose} />
         <div className="relative bg-card border border-border rounded-xl shadow-xl p-6 w-full max-w-sm mx-4">
-          <h3 className="text-base font-semibold mb-1">配置已保存</h3>
+          <h3 className="text-base font-semibold mb-1">{t('settings.configSaved')}</h3>
           <p className="text-sm text-muted-foreground mb-5">
-            配置文件已更新，但当前运行中的 gateway 不会自动热重载配置。
-            <br />
-            请重启 blockcell gateway 后再验证是否生效。
+            {t('settings.configSavedDesc')}
           </p>
           <div className="flex justify-end gap-2">
             <button
               onClick={onClose}
               className="px-4 py-1.5 text-sm rounded-lg bg-primary text-primary-foreground hover:bg-primary/90"
             >
-              我知道了
+              {t('common.ok')}
             </button>
           </div>
         </div>
@@ -172,6 +171,45 @@ export function ConfigPage() {
   const { locale, setLocale } = useI18nStore();
   const t = useT();
 
+  // Network proxy state
+  const [proxyEnabled, setProxyEnabled] = useState(false);
+  const [proxyUrl, setProxyUrl] = useState('');
+  const [noProxy, setNoProxy] = useState('');
+  const [proxySaving, setProxySaving] = useState(false);
+  const [proxyMsg, setProxyMsg] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+
+  useEffect(() => {
+    getConfig().then((cfg) => {
+      const net = cfg.network || {};
+      if (net.proxy) {
+        setProxyEnabled(true);
+        setProxyUrl(net.proxy);
+      }
+      if (net.noProxy && Array.isArray(net.noProxy)) {
+        setNoProxy(net.noProxy.join('\n'));
+      }
+    }).catch(() => {});
+  }, []);
+
+  async function saveProxy() {
+    setProxySaving(true);
+    setProxyMsg(null);
+    try {
+      const cfg = await getConfig();
+      const networkConfig = proxyEnabled && proxyUrl
+        ? { proxy: proxyUrl, noProxy: noProxy.split('\n').map(s => s.trim()).filter(Boolean) }
+        : {};
+      await updateConfig({ ...cfg, network: networkConfig });
+      try { await reloadConfig(); } catch (_) {}
+      setProxyMsg({ type: 'success', text: t('settings.proxySaved') });
+    } catch (e: any) {
+      setProxyMsg({ type: 'error', text: e.message });
+    } finally {
+      setProxySaving(false);
+      setTimeout(() => setProxyMsg(null), 5000);
+    }
+  }
+
   useEffect(() => {
     getHealth().then((h) => setVersion(h.version)).catch(() => {});
   }, []);
@@ -254,6 +292,83 @@ export function ConfigPage() {
                     </button>
                   ))}
                 </div>
+              </div>
+            </div>
+          </section>
+
+          {/* ── Network Proxy ── */}
+          <section>
+            <h2 className="text-sm font-semibold text-muted-foreground uppercase tracking-wider mb-4 flex items-center gap-2">
+              <Globe size={14} />
+              {t('settings.networkProxy')}
+            </h2>
+            <div className="bg-card border border-border rounded-xl overflow-hidden">
+              {/* Toggle header */}
+              <div className="flex items-center justify-between px-5 py-4 border-b border-border">
+                <div>
+                  <div className="text-sm font-medium">{t('settings.proxyToggle')}</div>
+                  <div className="text-xs text-muted-foreground mt-0.5">
+                    {t('settings.proxyToggleDesc')}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setProxyEnabled(v => !v)}
+                  className="flex items-center gap-1.5 text-sm"
+                >
+                  {proxyEnabled
+                    ? <><ToggleRight size={22} className="text-rust" /><span className="text-rust font-medium text-xs">{t('settings.proxyEnabled')}</span></>
+                    : <><ToggleLeft size={22} className="text-muted-foreground" /><span className="text-muted-foreground text-xs">{t('settings.proxyDisabled')}</span></>}
+                </button>
+              </div>
+
+              {/* Proxy fields */}
+              {proxyEnabled && (
+                <div className="px-5 py-4 space-y-4">
+                  <div>
+                    <label className="block text-xs font-medium text-muted-foreground mb-1.5">{t('settings.proxyUrl')}</label>
+                    <input
+                      type="text"
+                      value={proxyUrl}
+                      onChange={e => setProxyUrl(e.target.value)}
+                      placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:1080"
+                      className="w-full px-3 py-2 text-sm bg-muted/30 border border-border rounded-lg focus:outline-none focus:ring-1 focus:ring-rust/40 font-mono"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-muted-foreground mb-1.5">
+                      {t('settings.noProxy')} <span className="font-normal">{t('settings.noProxyDesc')}</span>
+                    </label>
+                    <textarea
+                      rows={3}
+                      value={noProxy}
+                      onChange={e => setNoProxy(e.target.value)}
+                      placeholder={"localhost\n127.0.0.1\n::1\n*.local"}
+                      className="w-full px-3 py-2 text-sm bg-muted/30 border border-border rounded-lg focus:outline-none focus:ring-1 focus:ring-rust/40 font-mono resize-none"
+                    />
+                  </div>
+                </div>
+              )}
+
+              {/* Save row */}
+              <div className="flex items-center justify-between px-5 py-3 border-t border-border bg-muted/10">
+                {proxyMsg ? (
+                  <span className={`text-xs ${proxyMsg.type === 'success' ? 'text-cyber' : 'text-destructive'}`}>{proxyMsg.text}</span>
+                ) : (
+                  <span className="text-xs text-muted-foreground">
+                    {proxyEnabled
+                      ? t('settings.proxyPriority')
+                      : t('settings.proxyOff')}
+                  </span>
+                )}
+                <button
+                  onClick={saveProxy}
+                  disabled={proxySaving}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50 transition-colors"
+                >
+                  {proxySaving ? <RefreshCw size={12} className="animate-spin" /> : <Save size={12} />}
+                  {t('settings.saveProxy')}
+                </button>
               </div>
             </div>
           </section>

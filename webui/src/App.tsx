@@ -13,6 +13,12 @@ import { EvolutionPage } from './components/evolution/evolution-page';
 import { GhostPage } from './components/ghost/ghost-page';
 import { LoginPage } from './components/login-page';
 import { ConnectionOverlay } from './components/connection-overlay';
+import { DeliverablesPage } from './components/deliverables/deliverables-page';
+import { PersonaPage } from './components/persona/persona-page';
+import { LLMPage } from './components/llm/llm-page';
+import { ChannelsPage } from './components/channels/channels-page';
+import { SkillsPage } from './components/skills/skills-page';
+import { SetupWizard } from './components/setup-wizard';
 import { ThemeProvider } from './components/theme-provider';
 import { useSidebarStore, useChatStore, useConnectionStore } from './lib/store';
 import { wsManager } from './lib/ws';
@@ -31,6 +37,9 @@ export default function App() {
   const { setConnected, handleWsEvent } = useChatStore();
   const [authenticated, setAuthenticated] = useState(() => !!localStorage.getItem('blockcell_token'));
   const [confirmDialog, setConfirmDialog] = useState<ConfirmDialog | null>(null);
+  const [showWizard, setShowWizard] = useState(() => {
+    return authenticated && !localStorage.getItem('blockcell_wizard_done');
+  });
 
   const handleLogin = useCallback(() => {
     setAuthenticated(true);
@@ -122,8 +131,22 @@ export default function App() {
           {activePage === 'alerts' && <AlertsPage />}
           {activePage === 'streams' && <StreamsPage />}
           {activePage === 'files' && <FilesPage />}
+          {activePage === 'deliverables' && <DeliverablesPage />}
+          {activePage === 'persona' && <PersonaPage />}
+          {activePage === 'llm' && <LLMPage />}
+          {activePage === 'channels' && <ChannelsPage />}
+          {activePage === 'skills' && <SkillsPage />}
         </main>
         <ConnectionOverlay />
+        {showWizard && (
+          <SetupWizard
+            onComplete={() => setShowWizard(false)}
+            onSkip={() => {
+              localStorage.setItem('blockcell_wizard_done', '1');
+              setShowWizard(false);
+            }}
+          />
+        )}
         {/* Path access confirmation dialog */}
         {confirmDialog && (
           <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">

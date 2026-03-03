@@ -45,7 +45,26 @@ export interface ConnectionState {
 type WsListener = (event: WsEvent) => void;
 type ConnectionListener = (state: ConnectionState) => void;
 
-const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:18790';
+declare global {
+  interface Window {
+    BLOCKCELL_API_BASE?: string;
+    BLOCKCELL_WS_URL?: string;
+  }
+}
+
+function resolveApiBase(): string {
+  return (typeof window !== 'undefined' && window.BLOCKCELL_API_BASE) || import.meta.env.VITE_API_BASE || 'http://localhost:18790';
+}
+
+function resolveWsUrl(): string {
+  if (typeof window !== 'undefined' && window.BLOCKCELL_WS_URL) return window.BLOCKCELL_WS_URL;
+  if (import.meta.env.VITE_WS_URL) return import.meta.env.VITE_WS_URL;
+
+  const apiBase = resolveApiBase();
+  const wsProto = apiBase.startsWith('https://') ? 'wss://' : 'ws://';
+  const host = apiBase.replace(/^https?:\/\//, '');
+  return `${wsProto}${host}/v1/ws`;
+}
 
 class WebSocketManager {
   private ws: WebSocket | null = null;
@@ -62,7 +81,7 @@ class WebSocketManager {
   private _generation = 0;
 
   constructor() {
-    this.url = import.meta.env.VITE_WS_URL || 'ws://localhost:18790/v1/ws';
+    this.url = resolveWsUrl();
   }
 
   connect() {
@@ -113,6 +132,17 @@ class WebSocketManager {
           this._reason = this._wasConnected ? 'network_error' : 'server_down';
         } else {
           this._reason = this._wasConnected ? 'network_error' : 'server_down';
+        }
+
+        // If the browser had a stored token, and the WS failed before ever being connected,
+        // this is often caused by the gateway restarting and invalidating the token.
+        // Probe /v1/health to distinguish auth failure from server down.
+        if (this._reason === 'server_down') {
+          const token = localStorage.getItem('blockcell_token');
+          if (token && !this._wasConnected) {
+            const gen = this._generation;
+            void this.probeHealthAndSetReason(gen);
+          }
         }
 
         this._wasConnected = false;
@@ -175,7 +205,7 @@ class WebSocketManager {
 
   private async probeHealthAndSetReason(gen: number) {
     try {
-      const res = await fetch(`${API_BASE}/v1/health`, { signal: AbortSignal.timeout(3000) });
+      const res = await fetch(`${resolveApiBase()}/v1/health`, { signal: AbortSignal.timeout(3000) });
       // If a newer connect() has started, discard this stale probe result
       if (gen !== this._generation) return;
       if (res.ok) {
@@ -217,6 +247,10 @@ class WebSocketManager {
 
   sendChat(content: string, chatId = 'default', media: string[] = []) {
     this.send({ type: 'chat', content, chat_id: chatId, media });
+  }
+
+  sendCancel(chatId = 'default') {
+    this.send({ type: 'cancel', chat_id: chatId });
   }
 
   sendConfirmResponse(requestId: string, approved: boolean) {

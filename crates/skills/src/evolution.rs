@@ -2,7 +2,26 @@ use crate::versioning::{VersionManager, VersionSource};
 use blockcell_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, info, warn};
+
+static RECORD_TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_all(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
 
 /// 技能自进化管理器
 pub struct SkillEvolution {
@@ -27,6 +46,18 @@ pub enum TriggerReason {
     ManualRequest { description: String },
 }
 
+/// 技能类型：决定进化 pipeline 的行为
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub enum SkillType {
+    /// Rhai 脚本技能（需要 SKILL.rhai 编译检查）
+    #[default]
+    Rhai,
+    /// 纯 prompt 技能（meta.yaml + SKILL.md，无脚本）
+    PromptOnly,
+    /// Python 脚本技能（SKILL.py，需要 Python 语法检查）
+    Python,
+}
+
 /// 进化上下文
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvolutionContext {
@@ -37,6 +68,20 @@ pub struct EvolutionContext {
     pub source_snippet: Option<String>,
     pub tool_schemas: Vec<serde_json::Value>,
     pub timestamp: i64,
+    /// 技能类型（Rhai 脚本 or 纯 Prompt），默认为 Rhai
+    #[serde(default)]
+    pub skill_type: SkillType,
+
+    /// If true, this evolution is operating on a staged external skill install.
+    /// The skill should be promoted (moved) into the main skills_dir when deployment
+    /// reaches Observing.
+    #[serde(default)]
+    pub staged: bool,
+
+    /// Workspace directory used for staged external skill installs (e.g. ~/.blockcell/workspace/import_staging/skills).
+    /// When staged=true, the pipeline writes files into this directory first.
+    #[serde(default)]
+    pub staging_skills_dir: Option<String>,
 }
 
 /// 生成的补丁
@@ -224,14 +269,29 @@ impl SkillEvolution {
         self.evolution_db.parent().unwrap().join("evolution_records")
     }
 
-    /// Load the current SKILL.rhai source for a skill (returns None if not found).
-    pub fn load_skill_source(&self, skill_name: &str) -> Result<Option<String>> {
-        let rhai_path = self.skills_dir.join(skill_name).join("SKILL.rhai");
-        if rhai_path.exists() {
-            Ok(std::fs::read_to_string(&rhai_path).ok())
-        } else {
-            Ok(None)
+    fn skill_root_dir_for_record(&self, record: &EvolutionRecord) -> PathBuf {
+        if record.context.staged {
+            if let Some(ref dir) = record.context.staging_skills_dir {
+                let p = PathBuf::from(dir);
+                if p.is_absolute() {
+                    return p;
+                }
+            }
         }
+        self.skills_dir.clone()
+    }
+
+    /// Load the current skill source for a skill (returns None if not found).
+    /// Checks SKILL.rhai, SKILL.py, and SKILL.md in that order.
+    pub fn load_skill_source(&self, skill_name: &str) -> Result<Option<String>> {
+        let skill_dir = self.skills_dir.join(skill_name);
+        for filename in &["SKILL.rhai", "SKILL.py", "SKILL.md"] {
+            let path = skill_dir.join(filename);
+            if path.exists() {
+                return Ok(std::fs::read_to_string(&path).ok());
+            }
+        }
+        Ok(None)
     }
 
     /// 触发技能进化
@@ -472,7 +532,13 @@ impl SkillEvolution {
         // P0-1: 解析最终脚本内容用于审计（而非 diff 文本）
         let final_script = self.resolve_final_script(&record.skill_name, &patch.diff)?;
 
-        let prompt = self.build_audit_prompt(&record.context, &final_script)?;
+        let prompt = if record.context.skill_type == SkillType::PromptOnly {
+            self.build_prompt_only_audit_prompt(&record.context, &final_script)?
+        } else if record.context.skill_type == SkillType::Python {
+            self.build_python_audit_prompt(&record.context, &final_script)?
+        } else {
+            self.build_audit_prompt(&record.context, &final_script)?
+        };
 
         info!(
             evolution_id = %evolution_id,
@@ -550,6 +616,58 @@ impl SkillEvolution {
 
         info!(evolution_id = %evolution_id, "Running compile check");
 
+        // PromptOnly 技能跳过 Rhai 编译，只检查内容非空
+        if record.context.skill_type == SkillType::PromptOnly {
+            info!(evolution_id = %evolution_id, "🔨 [compile] PromptOnly skill — skipping Rhai compile, checking content length");
+            let content = patch.diff.trim();
+            let (passed, error) = if content.is_empty() {
+                (false, Some("SKILL.md content is empty".to_string()))
+            } else if content.len() < 50 {
+                (false, Some(format!("SKILL.md content too short ({} chars, need >= 50)", content.len())))
+            } else {
+                (true, None)
+            };
+            let new_status = if passed { EvolutionStatus::CompilePassed } else { EvolutionStatus::CompileFailed };
+            info!(evolution_id = %evolution_id, passed = passed, "🔨 [compile] PromptOnly content check: {}", if passed { "PASSED" } else { "FAILED" });
+            record.status = new_status;
+            record.updated_at = chrono::Utc::now().timestamp();
+            self.save_record(&record)?;
+            return Ok((passed, error));
+        }
+
+        // Python 技能使用 python3 -m py_compile 进行语法检查
+        if record.context.skill_type == SkillType::Python {
+            info!(evolution_id = %evolution_id, "🔨 [compile] Python skill — running py_compile syntax check");
+            let final_script = self.resolve_final_script(&record.skill_name, &patch.diff)?;
+            let temp_path = std::env::temp_dir().join(format!("{}_compile.py", record.skill_name));
+            std::fs::write(&temp_path, &final_script)?;
+
+            let output = std::process::Command::new("python3")
+                .args(["-m", "py_compile", temp_path.to_str().unwrap_or("")])
+                .output();
+
+            let _ = std::fs::remove_file(&temp_path);
+
+            let (passed, error) = match output {
+                Ok(out) if out.status.success() => (true, None),
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                    (false, Some(format!("Python syntax error:\n{}", stderr)))
+                }
+                Err(e) => {
+                    warn!(evolution_id = %evolution_id, "🔨 [compile] python3 not found, skipping syntax check: {}", e);
+                    (true, None) // python3 not available — skip check
+                }
+            };
+
+            let new_status = if passed { EvolutionStatus::CompilePassed } else { EvolutionStatus::CompileFailed };
+            info!(evolution_id = %evolution_id, passed = passed, "🔨 [compile] Python syntax check: {}", if passed { "PASSED" } else { "FAILED" });
+            record.status = new_status;
+            record.updated_at = chrono::Utc::now().timestamp();
+            self.save_record(&record)?;
+            return Ok((passed, error));
+        }
+
         // 解析最终脚本内容
         let final_script = self.resolve_final_script(&record.skill_name, &patch.diff)?;
 
@@ -593,7 +711,10 @@ impl SkillEvolution {
 
         // 如果编译通过，还检查测试 fixtures
         if passed {
-            let tests_dir = self.skills_dir.join(&record.skill_name).join("tests");
+            let tests_dir = self
+                .skill_root_dir_for_record(&record)
+                .join(&record.skill_name)
+                .join("tests");
             if tests_dir.exists() {
                 if let Ok(entries) = std::fs::read_dir(&tests_dir) {
                     for entry in entries.flatten() {
@@ -733,6 +854,13 @@ impl SkillEvolution {
     // === 辅助方法 ===
 
     fn build_generation_prompt(&self, context: &EvolutionContext) -> Result<String> {
+        if context.skill_type == SkillType::PromptOnly {
+            return self.build_prompt_only_generation_prompt(context);
+        }
+        if context.skill_type == SkillType::Python {
+            return self.build_python_generation_prompt(context);
+        }
+
         let has_existing_source = context.source_snippet.is_some();
         let is_manual = matches!(context.trigger, TriggerReason::ManualRequest { .. });
 
@@ -792,12 +920,81 @@ impl SkillEvolution {
         Ok(prompt)
     }
 
+    fn build_prompt_only_generation_prompt(&self, context: &EvolutionContext) -> Result<String> {
+        let is_manual = matches!(context.trigger, TriggerReason::ManualRequest { .. });
+        let mut prompt = String::new();
+
+        prompt.push_str("You are a skill document writer for the blockcell agent framework.\n");
+        prompt.push_str("Your task is to write or improve a SKILL.md file — a prompt instruction document\n");
+        prompt.push_str("that tells the AI agent how to handle specific user requests for this skill.\n\n");
+
+        prompt.push_str("## What is SKILL.md?\n");
+        prompt.push_str("SKILL.md is an operation manual injected into the agent's system prompt when this skill is triggered.\n");
+        prompt.push_str("It should contain:\n");
+        prompt.push_str("- **Goal**: What the skill does and when it applies\n");
+        prompt.push_str("- **Tools to use**: Which built-in tools to call and in what order\n");
+        prompt.push_str("- **Output format**: What the final response should look like\n");
+        prompt.push_str("- **Scenarios**: 2-4 concrete usage scenarios with step-by-step guidance\n");
+        prompt.push_str("- **Fallback strategy**: What to do when tools fail\n\n");
+
+        if is_manual {
+            if let TriggerReason::ManualRequest { ref description } = context.trigger {
+                prompt.push_str(&format!("## Task\nCreate a SKILL.md for: {}\n\n", description));
+            }
+        } else {
+            prompt.push_str(&format!("## Task\nImprove the SKILL.md for skill '{}' to address the following issue:\n\n", context.skill_name));
+            if let Some(error) = &context.error_stack {
+                prompt.push_str(&format!("## Issue\n```\n{}\n```\n\n", error));
+            }
+        }
+
+        if let Some(snippet) = &context.source_snippet {
+            prompt.push_str(&format!("## Current SKILL.md Content\n```markdown\n{}\n```\n\n", snippet));
+        }
+
+        if context.staged {
+            if let Some(ref staging_dir) = context.staging_skills_dir {
+                let staged_root = std::path::PathBuf::from(staging_dir);
+                let staged_skill_dir = staged_root.join(&context.skill_name);
+                let staged_md = staged_skill_dir.join("SKILL.md");
+                if let Ok(md) = std::fs::read_to_string(&staged_md) {
+                    if !md.trim().is_empty() {
+                        prompt.push_str("## Current Staged SKILL.md (reference)\n");
+                        prompt.push_str(&format!("```markdown\n{}\n```\n\n", md));
+                    }
+                }
+                let staged_meta = staged_skill_dir.join("meta.yaml");
+                if let Ok(meta) = std::fs::read_to_string(&staged_meta) {
+                    if !meta.trim().is_empty() {
+                        prompt.push_str("## Current Staged meta.yaml (reference)\n");
+                        prompt.push_str(&format!("```yaml\n{}\n```\n\n", meta));
+                    }
+                }
+            }
+        }
+
+        prompt.push_str("## Output Format\n");
+        prompt.push_str("Generate the COMPLETE SKILL.md content.\n");
+        prompt.push_str("Output the markdown content in a ```markdown code block.\n");
+        prompt.push_str("Also output an updated meta.yaml in a ```yaml code block.\n");
+        prompt.push_str("The document must be at least 200 characters, practical, and clearly structured.\n");
+
+        Ok(prompt)
+    }
+
     fn build_fix_prompt(
         &self,
         context: &EvolutionContext,
         current_feedback: &FeedbackEntry,
         history: &[FeedbackEntry],
     ) -> Result<String> {
+        if context.skill_type == SkillType::PromptOnly {
+            return self.build_prompt_only_fix_prompt(context, current_feedback, history);
+        }
+        if context.skill_type == SkillType::Python {
+            return self.build_python_fix_prompt(context, current_feedback, history);
+        }
+
         let is_manual = matches!(context.trigger, TriggerReason::ManualRequest { .. });
 
         let mut prompt = String::new();
@@ -863,6 +1060,80 @@ impl SkillEvolution {
         Ok(prompt)
     }
 
+    fn build_prompt_only_fix_prompt(
+        &self,
+        context: &EvolutionContext,
+        current_feedback: &FeedbackEntry,
+        history: &[FeedbackEntry],
+    ) -> Result<String> {
+        let is_manual = matches!(context.trigger, TriggerReason::ManualRequest { .. });
+        let mut prompt = String::new();
+
+        prompt.push_str("You are a skill document writer for the blockcell agent framework.\n");
+        prompt.push_str("Your task is to fix issues in a SKILL.md prompt instruction document.\n\n");
+
+        if is_manual {
+            if let TriggerReason::ManualRequest { ref description } = context.trigger {
+                prompt.push_str(&format!("## Original Task\nCreate/improve SKILL.md for: {}\n\n", description));
+            }
+        } else {
+            prompt.push_str(&format!("## Original Task\nImprove SKILL.md for skill '{}'.\n\n", context.skill_name));
+        }
+
+        prompt.push_str("## Previous Content (has issues)\n");
+        prompt.push_str(&format!("```markdown\n{}\n```\n\n", current_feedback.previous_code));
+
+        prompt.push_str(&format!("## Issues Found ({})\n", current_feedback.stage));
+        prompt.push_str(&format!("{}\n\n", current_feedback.feedback));
+
+        let prev_attempts: Vec<&FeedbackEntry> = history.iter()
+            .filter(|h| h.attempt < current_feedback.attempt)
+            .collect();
+        if !prev_attempts.is_empty() {
+            prompt.push_str("## Previous Attempt History\n");
+            for entry in prev_attempts {
+                prompt.push_str(&format!("### Attempt #{} ({} failure)\n{}\n\n", entry.attempt, entry.stage, entry.feedback));
+            }
+        }
+
+        prompt.push_str("## Instructions\n");
+        prompt.push_str("Fix ALL the issues listed above and generate the COMPLETE corrected SKILL.md content.\n");
+        prompt.push_str("Output the markdown content in a ```markdown code block.\n");
+        prompt.push_str("Also output an updated meta.yaml in a ```yaml code block.\n");
+
+        Ok(prompt)
+    }
+
+    fn extract_yaml_from_response(&self, response: &str) -> Option<String> {
+        fn extract_with_marker(response: &str, marker: &str) -> Option<String> {
+            let start = response.find(marker)?;
+            let mut i = start + marker.len();
+
+            if i < response.len() {
+                let rest = &response[i..];
+                let line_end = rest.find('\n').unwrap_or(rest.len());
+                if line_end > 0 {
+                    i += line_end;
+                }
+            }
+
+            while i < response.len() && (response.as_bytes()[i] == b'\n' || response.as_bytes()[i] == b'\r') {
+                i += 1;
+            }
+
+            let end_rel = response[i..].find("```")?;
+            let yaml = &response[i..i + end_rel];
+            let trimmed = yaml.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+
+        extract_with_marker(response, "```yaml").or_else(|| extract_with_marker(response, "```yml"))
+    }
+
     fn build_audit_prompt(&self, context: &EvolutionContext, script_content: &str) -> Result<String> {
         let mut prompt = String::new();
 
@@ -889,6 +1160,139 @@ or\n\
         Ok(prompt)
     }
 
+    fn build_prompt_only_audit_prompt(&self, context: &EvolutionContext, md_content: &str) -> Result<String> {
+        let mut prompt = String::new();
+
+        prompt.push_str(&format!(
+            "You are a quality reviewer for SKILL.md documents in the blockcell agent framework.\n\
+            Review the following SKILL.md content for skill '{}'.\n\n",
+            context.skill_name
+        ));
+
+        prompt.push_str(&format!("Content:\n```markdown\n{}\n```\n\n", md_content));
+
+        prompt.push_str("\
+Check for the following issues:\n\
+1. **Completeness**: Does it describe what the skill does and how to use it?\n\
+2. **Clarity**: Are the instructions clear and actionable for an AI agent?\n\
+3. **Length**: Is the content at least 100 characters and substantive?\n\
+4. **Structure**: Does it have clear sections/headings?\n\n\
+Respond with ONLY a JSON object (no markdown code blocks, no extra text):\n\
+{\"passed\": true, \"issues\": []}\n\
+or\n\
+{\"passed\": false, \"issues\": [{\"severity\": \"error\", \"category\": \"completeness\", \"message\": \"description\"}]}\n");
+
+        Ok(prompt)
+    }
+
+    fn build_python_generation_prompt(&self, context: &EvolutionContext) -> Result<String> {
+        let is_manual = matches!(context.trigger, TriggerReason::ManualRequest { .. });
+        let mut prompt = String::new();
+
+        prompt.push_str("You are a Python skill developer for the blockcell agent framework.\n");
+        prompt.push_str("Your task is to write or improve a SKILL.py file — a Python script\n");
+        prompt.push_str("that implements the skill's logic. The script will be executed by the agent via `python3 SKILL.py`.\n\n");
+
+        prompt.push_str("## Requirements\n");
+        prompt.push_str("- Use Python 3.8+ compatible syntax\n");
+        prompt.push_str("- Read input from stdin (JSON) or command-line arguments\n");
+        prompt.push_str("- Output results to stdout (preferably JSON)\n");
+        prompt.push_str("- Handle errors gracefully with try/except\n");
+        prompt.push_str("- Only use standard library modules or widely available packages\n");
+        prompt.push_str("- Include a `if __name__ == '__main__':` block\n\n");
+
+        if is_manual {
+            if let TriggerReason::ManualRequest { ref description } = context.trigger {
+                prompt.push_str(&format!("## Task\nCreate a SKILL.py for: {}\n\n", description));
+            }
+        } else {
+            prompt.push_str(&format!("## Task\nImprove the SKILL.py for skill '{}' to address the following issue:\n\n", context.skill_name));
+            if let Some(error) = &context.error_stack {
+                prompt.push_str(&format!("## Issue\n```\n{}\n```\n\n", error));
+            }
+        }
+
+        if let Some(snippet) = &context.source_snippet {
+            prompt.push_str(&format!("## Current SKILL.py Content\n```python\n{}\n```\n\n", snippet));
+        }
+
+        prompt.push_str("## Output Format\n");
+        prompt.push_str("Generate the COMPLETE SKILL.py content.\n");
+        prompt.push_str("Output the Python code in a ```python code block.\n");
+        prompt.push_str("The script must be syntactically valid Python.\n");
+
+        Ok(prompt)
+    }
+
+    fn build_python_audit_prompt(&self, context: &EvolutionContext, script_content: &str) -> Result<String> {
+        let mut prompt = String::new();
+
+        prompt.push_str(&format!(
+            "You are a security auditor for Python scripts in the blockcell agent framework.\n\
+            Review the following complete Python script for skill '{}'.\n\n",
+            context.skill_name
+        ));
+
+        prompt.push_str(&format!("Code:\n```python\n{}\n```\n\n", script_content));
+
+        prompt.push_str("\
+Check for the following issues:\n\
+1. **Syntax errors**: Is this valid Python 3.8+ syntax?\n\
+2. **Security**: No shell injection (unsafe os.system/subprocess with user input), no eval/exec of untrusted data\n\
+3. **Infinite loops**: Unbounded loops without break conditions\n\
+4. **Resource abuse**: Operations that could consume excessive memory or CPU\n\
+5. **Data leakage**: Logging/printing sensitive information unintentionally\n\n\
+Respond with ONLY a JSON object (no markdown code blocks, no extra text):\n\
+{\"passed\": true, \"issues\": []}\n\
+or\n\
+{\"passed\": false, \"issues\": [{\"severity\": \"error\", \"category\": \"security\", \"message\": \"description\"}]}\n");
+
+        Ok(prompt)
+    }
+
+    fn build_python_fix_prompt(
+        &self,
+        context: &EvolutionContext,
+        current_feedback: &FeedbackEntry,
+        history: &[FeedbackEntry],
+    ) -> Result<String> {
+        let is_manual = matches!(context.trigger, TriggerReason::ManualRequest { .. });
+        let mut prompt = String::new();
+
+        prompt.push_str("You are a Python skill developer for the blockcell agent framework.\n");
+        prompt.push_str("Your task is to fix issues in a SKILL.py Python script.\n\n");
+
+        if is_manual {
+            if let TriggerReason::ManualRequest { ref description } = context.trigger {
+                prompt.push_str(&format!("## Original Task\nCreate/improve SKILL.py for: {}\n\n", description));
+            }
+        } else {
+            prompt.push_str(&format!("## Original Task\nImprove SKILL.py for skill '{}'.\n\n", context.skill_name));
+        }
+
+        prompt.push_str("## Previous Content (has issues)\n");
+        prompt.push_str(&format!("```python\n{}\n```\n\n", current_feedback.previous_code));
+
+        prompt.push_str(&format!("## Issues Found ({})\n", current_feedback.stage));
+        prompt.push_str(&format!("{}\n\n", current_feedback.feedback));
+
+        let prev_attempts: Vec<&FeedbackEntry> = history.iter()
+            .filter(|h| h.attempt < current_feedback.attempt)
+            .collect();
+        if !prev_attempts.is_empty() {
+            prompt.push_str("## Previous Attempt History\n");
+            for entry in prev_attempts {
+                prompt.push_str(&format!("### Attempt #{} ({} failure)\n{}\n\n", entry.attempt, entry.stage, entry.feedback));
+            }
+        }
+
+        prompt.push_str("## Instructions\n");
+        prompt.push_str("Fix ALL the issues listed above and generate the COMPLETE corrected SKILL.py content.\n");
+        prompt.push_str("Output the Python code in a ```python code block.\n");
+
+        Ok(prompt)
+    }
+
     fn extract_diff_from_response(&self, response: &str) -> Result<String> {
         // Try ```diff block first (for patching existing skills)
         if let Some(start) = response.find("```diff") {
@@ -905,6 +1309,24 @@ or\n\
             if let Some(end) = response[after_marker..].find("```") {
                 let script = &response[after_marker..after_marker + end];
                 return Ok(script.trim().to_string());
+            }
+        }
+
+        // Try ```python block (for Python skill creation)
+        if let Some(start) = response.find("```python") {
+            let after_marker = start + 9;
+            if let Some(end) = response[after_marker..].find("```") {
+                let script = &response[after_marker..after_marker + end];
+                return Ok(script.trim().to_string());
+            }
+        }
+
+        // Try ```markdown block (for prompt-only skills)
+        if let Some(start) = response.find("```markdown") {
+            let after_marker = start + 11;
+            if let Some(end) = response[after_marker..].find("```") {
+                let md = &response[after_marker..after_marker + end];
+                return Ok(md.trim().to_string());
             }
         }
 
@@ -1008,14 +1430,58 @@ or\n\
         let patch = record.patch.as_ref()
             .ok_or_else(|| Error::Evolution("No patch to deploy".to_string()))?;
 
-        let skill_dir = self.skills_dir.join(&record.skill_name);
-        let skill_path = skill_dir.join("SKILL.rhai");
+        let skill_root = self.skill_root_dir_for_record(record);
+        let staged_skill_dir = skill_root.join(&record.skill_name);
 
         // Ensure skill directory exists (for new skills)
-        std::fs::create_dir_all(&skill_dir)?;
+        std::fs::create_dir_all(&staged_skill_dir)?;
 
-        // 直接写入完整脚本（所有生成都是完整脚本）
+        // PromptOnly 写入 SKILL.md，Python 写入 SKILL.py，Rhai 技能写入 SKILL.rhai
+        let skill_path = match record.context.skill_type {
+            SkillType::PromptOnly => staged_skill_dir.join("SKILL.md"),
+            SkillType::Python => staged_skill_dir.join("SKILL.py"),
+            SkillType::Rhai => staged_skill_dir.join("SKILL.rhai"),
+        };
+
+        // 直接写入完整内容（所有生成都是完整文件）
         std::fs::write(&skill_path, &patch.diff)?;
+
+        if let Some(meta) = self.extract_yaml_from_response(&patch.explanation) {
+            let meta_path = staged_skill_dir.join("meta.yaml");
+            let _ = std::fs::write(meta_path, meta);
+        }
+
+        // If this is a staged external skill, promote it into the main skills dir now.
+        if record.context.staged {
+            let dest_skill_dir = self.skills_dir.join(&record.skill_name);
+            if dest_skill_dir.exists() {
+                std::fs::remove_dir_all(&dest_skill_dir)?;
+            }
+            std::fs::create_dir_all(&self.skills_dir)?;
+
+            // Prefer atomic rename if possible; fallback to copy+remove.
+            if let Err(e) = std::fs::rename(&staged_skill_dir, &dest_skill_dir) {
+                warn!(
+                    skill = %record.skill_name,
+                    error = %e,
+                    "Staged skill promote via rename failed, falling back to copy"
+                );
+                copy_dir_all(&staged_skill_dir, &dest_skill_dir)?;
+                std::fs::remove_dir_all(&staged_skill_dir).ok();
+            }
+
+            if let Some(meta) = self.extract_yaml_from_response(&patch.explanation) {
+                let meta_path = dest_skill_dir.join("meta.yaml");
+                let _ = std::fs::write(meta_path, meta);
+            }
+
+            info!(
+                skill = %record.skill_name,
+                from = %skill_root.display(),
+                to = %self.skills_dir.display(),
+                "🚚 [promote] External skill promoted into main skills directory"
+            );
+        }
 
         // 通过 VersionManager 创建版本快照
         let changelog = Some(format!(
@@ -1052,7 +1518,17 @@ or\n\
         std::fs::create_dir_all(&records_dir)?;
         
         let record_file = records_dir.join(format!("{}.json", record.id));
-        let temp_file = records_dir.join(format!("{}.json.tmp", record.id));
+        // Use a unique temp file name to avoid races when multiple tick loops/processes
+        // attempt to write the same record concurrently.
+        let counter = RECORD_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let temp_file = records_dir.join(format!(
+            "{}.json.tmp_{}_{}_{}",
+            record.id,
+            chrono::Utc::now().timestamp_millis(),
+            pid,
+            counter
+        ));
         let json = serde_json::to_string_pretty(record)?;
         
         // 先写入临时文件

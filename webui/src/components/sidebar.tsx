@@ -3,6 +3,7 @@ import {
   MessageSquare, ListTodo, LayoutDashboard, Settings, Brain,
   Clock, ChevronLeft, ChevronRight, Plus, Trash2, Sun, Moon,
   Wifi, WifiOff, Bell, Radio, FolderOpen, AlertTriangle, LogOut, Dna, Ghost,
+  PackageOpen, ChevronDown, User, Cpu, Plug, Puzzle,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useSidebarStore, useChatStore, useThemeStore } from '@/lib/store';
@@ -10,14 +11,22 @@ import { getSessionsPage, deleteSession, logout, type SessionInfo } from '@/lib/
 import { useT } from '@/lib/i18n';
 import { BlockcellLogo } from './blockcell-logo';
 
-const navItems = [
+const primaryNavItems = [
   { id: 'chat', key: 'nav.chat', icon: MessageSquare },
   { id: 'tasks', key: 'nav.tasks', icon: ListTodo },
+  { id: 'cron', key: 'nav.cron', icon: Clock },
   { id: 'dashboard', key: 'nav.dashboard', icon: LayoutDashboard },
   { id: 'evolution', key: 'nav.evolution', icon: Dna },
+  { id: 'channels', key: 'nav.channels', icon: Plug },
+  { id: 'skills', key: 'nav.skills', icon: Puzzle },
   { id: 'memory', key: 'nav.memory', icon: Brain },
+  { id: 'deliverables', key: 'nav.deliverables', icon: PackageOpen },
+];
+
+const advancedNavItems = [
+  { id: 'llm', key: 'nav.llm', icon: Cpu },
+  { id: 'persona', key: 'nav.persona', icon: User },
   { id: 'ghost', key: 'nav.ghost', icon: Ghost },
-  { id: 'cron', key: 'nav.cron', icon: Clock },
   { id: 'alerts', key: 'nav.alerts', icon: Bell },
   { id: 'streams', key: 'nav.streams', icon: Radio },
   { id: 'files', key: 'nav.files', icon: FolderOpen },
@@ -135,22 +144,19 @@ export function Sidebar() {
 
       {/* Navigation */}
       <nav className="flex-1 overflow-y-auto py-2">
-        {navItems.map((item) => (
-          <button
-            key={item.id}
-            onClick={() => setActivePage(item.id)}
-            className={cn(
-              'w-full flex items-center text-sm transition-colors',
-              isOpen ? 'gap-3 px-3 py-2 justify-start' : 'px-0 py-2.5 justify-center',
-              activePage === item.id
-                ? 'bg-rust/10 text-rust border-r-2 border-rust'
-                : 'text-muted-foreground hover:bg-accent/50 hover:text-foreground'
-            )}
-          >
-            <item.icon size={isOpen ? 18 : 22} className="shrink-0" />
-            {isOpen && <span>{t(item.key)}</span>}
-          </button>
+        {/* Primary nav items */}
+        {primaryNavItems.map((item) => (
+          <NavButton key={item.id} item={item} activePage={activePage} isOpen={isOpen} setActivePage={setActivePage} t={t} />
         ))}
+
+        {/* Advanced / technical items - collapsible when sidebar open */}
+        {isOpen ? (
+          <AdvancedNavGroup items={advancedNavItems} activePage={activePage} isOpen={isOpen} setActivePage={setActivePage} t={t} />
+        ) : (
+          advancedNavItems.map((item) => (
+            <NavButton key={item.id} item={item} activePage={activePage} isOpen={isOpen} setActivePage={setActivePage} t={t} />
+          ))
+        )}
 
         {/* Session list (only when chat is active and sidebar is open) */}
         {isOpen && activePage === 'chat' && (
@@ -306,5 +312,65 @@ export function Sidebar() {
         </div>
       )}
     </aside>
+  );
+}
+
+interface NavItem {
+  id: string;
+  key: string;
+  icon: React.ElementType;
+}
+
+interface NavButtonProps {
+  item: NavItem;
+  activePage: string;
+  isOpen: boolean;
+  setActivePage: (id: string) => void;
+  t: (key: string) => string;
+}
+
+function NavButton({ item, activePage, isOpen, setActivePage, t }: NavButtonProps) {
+  return (
+    <button
+      onClick={() => setActivePage(item.id)}
+      className={cn(
+        'w-full flex items-center text-sm transition-colors',
+        isOpen ? 'gap-3 px-3 py-2 justify-start' : 'px-0 py-2.5 justify-center',
+        activePage === item.id
+          ? 'bg-rust/10 text-rust border-r-2 border-rust'
+          : 'text-muted-foreground hover:bg-accent/50 hover:text-foreground'
+      )}
+    >
+      <item.icon size={isOpen ? 18 : 22} className="shrink-0" />
+      {isOpen && <span>{t(item.key)}</span>}
+    </button>
+  );
+}
+
+interface AdvancedNavGroupProps {
+  items: NavItem[];
+  activePage: string;
+  isOpen: boolean;
+  setActivePage: (id: string) => void;
+  t: (key: string) => string;
+}
+
+function AdvancedNavGroup({ items, activePage, isOpen, setActivePage, t }: AdvancedNavGroupProps) {
+  const hasActiveItem = items.some((i) => i.id === activePage);
+  const [expanded, setExpanded] = useState(hasActiveItem);
+
+  return (
+    <div className="mt-1">
+      <button
+        onClick={() => setExpanded((v) => !v)}
+        className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
+      >
+        <span className="flex-1 text-left uppercase tracking-wider font-medium">{t('sidebar.advanced')}</span>
+        <ChevronDown size={13} className={cn('transition-transform', expanded ? '' : '-rotate-90')} />
+      </button>
+      {expanded && items.map((item) => (
+        <NavButton key={item.id} item={item} activePage={activePage} isOpen={isOpen} setActivePage={setActivePage} t={t} />
+      ))}
+    </div>
   );
 }

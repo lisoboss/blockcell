@@ -18,7 +18,7 @@ use blockcell_channels::dingtalk::DingTalkChannel;
 #[cfg(feature = "wecom")]
 use blockcell_channels::wecom::WeComChannel;
 use blockcell_core::{Config, InboundMessage, Paths};
-use blockcell_providers::Provider;
+use blockcell_providers::{Provider, ProviderPool};
 use blockcell_scheduler::CronService;
 use blockcell_skills::{is_builtin_tool, new_registry_handle, CoreEvolution};
 use blockcell_storage::MemoryStore;
@@ -157,24 +157,28 @@ fn create_provider(config: &Config) -> anyhow::Result<Box<dyn Provider>> {
     super::provider::create_provider(config)
 }
 
-fn create_provider_with_overrides(
+fn build_pool_with_overrides(
     config: &mut Config,
     model_override: Option<String>,
     provider_override: Option<String>,
-) -> anyhow::Result<Box<dyn Provider>> {
+) -> anyhow::Result<std::sync::Arc<ProviderPool>> {
     if let Some(ref m) = model_override {
+        // If model_pool is already configured, clear it and use the override as a single entry
+        if !config.agents.defaults.model_pool.is_empty() {
+            config.agents.defaults.model_pool.clear();
+        }
         config.agents.defaults.model = m.clone();
     }
     if let Some(ref p) = provider_override {
         config.agents.defaults.provider = Some(p.clone());
     }
-    super::provider::create_provider(config)
+    ProviderPool::from_config(config)
 }
 
 pub async fn run(message: Option<String>, session: String, model: Option<String>, provider: Option<String>) -> anyhow::Result<()> {
     let paths = Paths::new();
     let mut config = Config::load_or_default(&paths)?;
-    let agent_provider = create_provider_with_overrides(&mut config, model, provider)?;
+    let provider_pool = build_pool_with_overrides(&mut config, model, provider)?;
 
     // Ensure builtin skills are extracted to workspace/skills/ (silent, skips existing)
     let _ = super::embedded_skills::extract_to_workspace(&paths.skills_dir());
@@ -217,8 +221,8 @@ pub async fn run(message: Option<String>, session: String, model: Option<String>
     );
 
     // Create an LLM provider bridge so CoreEvolution can generate code autonomously
-    if let Ok(evo_provider) = super::provider::create_provider(&config) {
-        let llm_bridge = Arc::new(ProviderLLMBridge::new(evo_provider));
+    if let Some((_, evo_p)) = provider_pool.acquire() {
+        let llm_bridge = Arc::new(ProviderLLMBridge::new_arc(evo_p));
         core_evo.set_llm_provider(llm_bridge);
         info!("Core evolution LLM provider configured");
     }
@@ -232,11 +236,10 @@ pub async fn run(message: Option<String>, session: String, model: Option<String>
     let core_evo_adapter = CoreEvolutionAdapter::new(core_evo_raw.clone());
     let core_evo_handle: CoreEvolutionHandle = Arc::new(Mutex::new(core_evo_adapter));
 
-    let provider = agent_provider;
     if let Some(msg) = message {
         // Single message mode — no need for CronService
         let tool_registry = ToolRegistry::with_defaults();
-        let mut runtime = AgentRuntime::new(config.clone(), paths.clone(), provider, tool_registry)?;
+        let mut runtime = AgentRuntime::new(config.clone(), paths.clone(), Arc::clone(&provider_pool), tool_registry)?;
         runtime.mount_mcp_servers().await;
         
         // 如果配置了独立的 evolution_model 或 evolution_provider，创建独立的 evolution provider
@@ -361,7 +364,7 @@ pub async fn run(message: Option<String>, session: String, model: Option<String>
 
         // Create agent runtime with outbound channel (consumes config)
         let tool_registry = ToolRegistry::with_defaults();
-        let mut runtime = AgentRuntime::new(config.clone(), paths.clone(), provider, tool_registry)?;
+        let mut runtime = AgentRuntime::new(config.clone(), paths.clone(), Arc::clone(&provider_pool), tool_registry)?;
         runtime.mount_mcp_servers().await;
         
         // 如果配置了独立的 evolution_model 或 evolution_provider，创建独立的 evolution provider

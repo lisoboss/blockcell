@@ -1,4 +1,11 @@
-const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:18790';
+declare global {
+  interface Window {
+    BLOCKCELL_API_BASE?: string;
+  }
+}
+
+export const API_BASE =
+  (typeof window !== 'undefined' && window.BLOCKCELL_API_BASE) || import.meta.env.VITE_API_BASE || 'http://localhost:18790';
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const url = `${API_BASE}/v1${path}`;
@@ -92,10 +99,16 @@ export function updateConfig(config: any) {
   });
 }
 
-export function testProvider(params: { model: string; api_key: string; api_base?: string }) {
+export function testProvider(params: { model: string; api_key: string; api_base?: string; proxy?: string }) {
   return request<{ status: string; message: string }>('/config/test-provider', {
     method: 'POST',
     body: JSON.stringify(params),
+  });
+}
+
+export function reloadConfig() {
+  return request<{ status: string; message: string }>('/config/reload', {
+    method: 'POST',
   });
 }
 
@@ -431,6 +444,48 @@ export interface FileContent {
   content: string;
 }
 
+// Pool status
+export interface PoolEntry {
+  model: string;
+  provider: string;
+  weight: number;
+  priority: number;
+}
+
+export interface PoolStatus {
+  using_pool: boolean;
+  entries: PoolEntry[];
+  evolution_model?: string;
+  evolution_provider?: string;
+}
+
+export function getPoolStatus() {
+  return request<PoolStatus>('/pool/status');
+}
+
+// Persona files
+export interface PersonaFile {
+  name: string;
+  exists: boolean;
+  content: string;
+  size: number;
+}
+
+export function getPersonaFiles() {
+  return request<{ files: PersonaFile[] }>('/persona/files');
+}
+
+export function getPersonaFile(name: string) {
+  return request<{ name: string; content: string; exists: boolean }>(`/persona/file?name=${encodeURIComponent(name)}`);
+}
+
+export function savePersonaFile(name: string, content: string) {
+  return request<{ status: string; name: string; size: number }>('/persona/file', {
+    method: 'PUT',
+    body: JSON.stringify({ name, content }),
+  });
+}
+
 // Ghost Agent
 export interface GhostConfig {
   enabled: boolean;
@@ -471,6 +526,60 @@ export function getGhostActivity(limit = 20) {
 
 export function getGhostModelOptions() {
   return request<GhostModelOptions>('/ghost/model-options');
+}
+
+// Channels
+export interface ChannelField {
+  key: string;
+  label: string;
+  secret: boolean;
+  value: string;
+}
+
+export interface ChannelInfo {
+  id: string;
+  name: string;
+  icon: string;
+  doc: string;
+  configured: boolean;
+  enabled: boolean;
+  fields: ChannelField[];
+}
+
+export function getChannels() {
+  return request<{ channels: ChannelInfo[] }>('/channels');
+}
+
+export function updateChannel(id: string, fields: Record<string, string>, enabled?: boolean) {
+  return request<{ status: string; channel: string }>(`/channels/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify({ fields, enabled }),
+  });
+}
+
+// Hub (community skills)
+export function getHubSkills() {
+  return request<any>('/hub/skills');
+}
+
+export function installHubSkill(name: string) {
+  return request<{ status: string; skill: string; size_bytes?: number }>(`/hub/skills/${encodeURIComponent(name)}/install`, {
+    method: 'POST',
+  });
+}
+
+// Skills management
+export function deleteSkill(name: string) {
+  return request<{ status: string; skill: string }>(`/skills/${encodeURIComponent(name)}`, {
+    method: 'DELETE',
+  });
+}
+
+export function installExternalSkill(url: string) {
+  return request<{ status: string; skill: string; message: string; skill_dir?: string }>('/skills/install-external', {
+    method: 'POST',
+    body: JSON.stringify({ url }),
+  });
 }
 
 export interface SessionInfo {

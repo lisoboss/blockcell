@@ -164,19 +164,61 @@ pub fn create_provider(
             )) as Box<dyn Provider>)
         }
         _ => {
-            // OpenAI 兼容：openrouter, openai, deepseek, groq, zhipu, vllm, kimi, moonshot 等
-            let api_base = resolved_cfg.api_base.as_deref()
-                .unwrap_or_else(|| default_api_base(effective_provider));
-            Ok(Box::new(OpenAIProvider::new_with_proxy(
-                &resolved_cfg.api_key,
-                Some(api_base),
-                model,
-                max_tokens,
-                temperature,
-                provider_proxy,
-                global_proxy,
-                no_proxy,
-            )) as Box<dyn Provider>)
+            // 对于自定义 provider 名（非内置），用 api_type 决定使用哪种协议实现
+            match resolved_cfg.api_type.as_str() {
+                "anthropic" => {
+                    Ok(Box::new(AnthropicProvider::new_with_proxy(
+                        &resolved_cfg.api_key,
+                        resolved_cfg.api_base.as_deref(),
+                        model,
+                        max_tokens,
+                        temperature,
+                        provider_proxy,
+                        global_proxy,
+                        no_proxy,
+                    )) as Box<dyn Provider>)
+                }
+                "gemini" => {
+                    Ok(Box::new(GeminiProvider::new_with_proxy(
+                        &resolved_cfg.api_key,
+                        resolved_cfg.api_base.as_deref(),
+                        model,
+                        max_tokens,
+                        temperature,
+                        provider_proxy,
+                        global_proxy,
+                        no_proxy,
+                    )) as Box<dyn Provider>)
+                }
+                "ollama" => {
+                    let api_base = resolved_cfg.api_base.as_deref()
+                        .or(Some("http://localhost:11434"));
+                    Ok(Box::new(OllamaProvider::new_with_proxy(
+                        api_base,
+                        model,
+                        max_tokens,
+                        temperature,
+                        provider_proxy,
+                        global_proxy,
+                        no_proxy,
+                    )) as Box<dyn Provider>)
+                }
+                _ => {
+                    // 默认：OpenAI 兼容（openrouter, openai, deepseek, groq, zhipu, vllm, kimi 等）
+                    let api_base = resolved_cfg.api_base.as_deref()
+                        .unwrap_or_else(|| default_api_base(effective_provider));
+                    Ok(Box::new(OpenAIProvider::new_with_proxy(
+                        &resolved_cfg.api_key,
+                        Some(api_base),
+                        model,
+                        max_tokens,
+                        temperature,
+                        provider_proxy,
+                        global_proxy,
+                        no_proxy,
+                    )) as Box<dyn Provider>)
+                }
+            }
         }
     }
 }

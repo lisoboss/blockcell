@@ -1,11 +1,11 @@
 'use client';
 
 import { useRef, useEffect, useState, useCallback } from 'react';
-import { Send, Loader2, Paperclip, X, Image as ImageIcon, FileAudio } from 'lucide-react';
+import { Send, Loader2, Paperclip, X, FileAudio, Upload, Square } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useChatStore } from '@/lib/store';
 import { wsManager } from '@/lib/ws';
-import { getSession, uploadFile, mediaFileUrl } from '@/lib/api';
+import { getSession, uploadFile } from '@/lib/api';
 import { MessageBubble } from './message-bubble';
 import { BlockcellLogo } from '../blockcell-logo';
 import { useT } from '@/lib/i18n';
@@ -22,8 +22,10 @@ export function ChatPage() {
   const { messages, sessions, currentSessionId, setMessages, addMessage, isLoading, setLoading } = useChatStore();
   const t = useT();
   const [input, setInput] = useState('');
+  const [isDragOver, setIsDragOver] = useState(false);
   const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
   const [uploading, setUploading] = useState(false);
+  const [isCancelling, setIsCancelling] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -48,6 +50,12 @@ export function ChatPage() {
   useEffect(() => {
     inputRef.current?.focus();
   }, [currentSessionId]);
+
+  useEffect(() => {
+    if (!isLoading) {
+      setIsCancelling(false);
+    }
+  }, [isLoading]);
 
   async function loadSessionHistory(sessionId: string) {
     try {
@@ -91,6 +99,34 @@ export function ChatPage() {
     setPendingFiles((prev) => [...prev, ...newFiles]);
     // Reset input so same file can be selected again
     e.target.value = '';
+  }
+
+  function handleDragOver(e: React.DragEvent) {
+    e.preventDefault();
+    setIsDragOver(true);
+  }
+
+  function handleDragLeave(e: React.DragEvent) {
+    if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+      setIsDragOver(false);
+    }
+  }
+
+  function handleDrop(e: React.DragEvent) {
+    e.preventDefault();
+    setIsDragOver(false);
+    const files = Array.from(e.dataTransfer.files);
+    const newFiles: PendingFile[] = [];
+    for (const file of files) {
+      const ext = file.name.split('.').pop()?.toLowerCase() || '';
+      const type = isMediaPath(`x.${ext}`);
+      if (type) {
+        newFiles.push({ file, previewUrl: URL.createObjectURL(file), type });
+      }
+    }
+    if (newFiles.length > 0) {
+      setPendingFiles((prev) => [...prev, ...newFiles]);
+    }
   }
 
   function removePendingFile(index: number) {
@@ -158,6 +194,13 @@ export function ChatPage() {
     setLoading(true);
   }
 
+  function handleCancel() {
+    if (!isLoading || isCancelling) return;
+    const chatId = currentSessionId.replace(/_/g, ':');
+    wsManager.sendCancel(chatId);
+    setIsCancelling(true);
+  }
+
   function handleKeyDown(e: React.KeyboardEvent) {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -166,17 +209,29 @@ export function ChatPage() {
   }
 
   return (
-    <div className="flex flex-col h-full">
+    <div
+      className="flex flex-col h-full relative"
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+    >
+      {/* Drag overlay */}
+      {isDragOver && (
+        <div className="absolute inset-0 z-30 flex flex-col items-center justify-center bg-primary/10 border-2 border-dashed border-primary/50 rounded-none pointer-events-none">
+          <Upload size={36} className="text-primary mb-3" />
+          <p className="text-primary font-medium">{t('chat.dropFiles')}</p>
+        </div>
+      )}
       {/* Messages area */}
       <div className="flex-1 overflow-y-auto px-4 py-6">
         <div className="max-w-3xl mx-auto space-y-4">
           {messages.length === 0 && (
-            <div className="flex flex-col items-center justify-center h-full min-h-[50vh] text-muted-foreground">
-              <div className="mb-4">
+            <div className="flex flex-col items-center pt-8 pb-4 text-muted-foreground">
+              <div className="mb-3">
                 <BlockcellLogo size="md" />
               </div>
-              <h2 className="text-lg font-medium mb-1">Blockcell Agent</h2>
-              <p className="text-sm">{t('chat.emptyHint').replace('> ', '')}</p>
+              <h2 className="text-base font-semibold mb-1 text-foreground">Blockcell</h2>
+              <p className="text-sm">{t('chat.emptyHint')}</p>
             </div>
           )}
           {messages.map((msg) => (
@@ -257,17 +312,19 @@ export function ChatPage() {
               rows={1}
             />
             <button
-              onClick={handleSend}
-              disabled={(!input.trim() && pendingFiles.length === 0) || isLoading || uploading}
+              onClick={isLoading ? handleCancel : handleSend}
+              disabled={uploading || (!isLoading && !input.trim() && pendingFiles.length === 0) || (isLoading && isCancelling)}
               className={cn(
                 'p-2 rounded-lg transition-colors',
-                (input.trim() || pendingFiles.length > 0) && !isLoading && !uploading
+                isLoading
+                  ? 'bg-destructive text-destructive-foreground hover:bg-destructive/90'
+                  : (input.trim() || pendingFiles.length > 0) && !uploading
                   ? 'bg-primary text-primary-foreground hover:bg-primary/90'
                   : 'text-muted-foreground'
               )}
             >
               {uploading ? <Loader2 size={18} className="animate-spin" /> :
-               isLoading ? <Loader2 size={18} className="animate-spin" /> : <Send size={18} />}
+               isLoading ? (isCancelling ? <Loader2 size={18} className="animate-spin" /> : <Square size={18} />) : <Send size={18} />}
             </button>
           </div>
         </div>
