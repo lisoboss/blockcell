@@ -2,6 +2,7 @@
 name = "blockcell"
 version = "0.1.2"
 edition = "2021"
+default-run = "blockcell"
 
 [[bin]]
 name = "blockcell"

@@ -10,7 +10,8 @@ members = [
     "crates/providers",
     "crates/updater",
     "crates/storage",
-    "bin/blockcell",
+    "bin/blockcell", 
+    "bin/ollama-tap",
 ]
 
 [workspace.package]
