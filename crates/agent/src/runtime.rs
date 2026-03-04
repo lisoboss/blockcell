@@ -108,6 +108,11 @@ pub struct ConfirmRequest {
     pub tool_name: String,
     pub paths: Vec<String>,
     pub response_tx: tokio::sync::oneshot::Sender<bool>,
+    /// The channel the originating message came from (e.g. "ws", "lark", "telegram").
+    pub channel: String,
+    /// The chat_id of the originating message, used to route the confirmation
+    /// prompt back to the correct conversation.
+    pub chat_id: String,
 }
 
 /// Truncate a string at a safe char boundary.
@@ -1784,7 +1789,7 @@ impl AgentRuntime {
     /// For tools that access the filesystem, check if any paths are outside the
     /// workspace. If so, send a confirmation request to the user and wait for
     /// their response. Returns Ok(true) if access is allowed, Ok(false) if denied.
-    async fn check_path_permission(&mut self, tool_name: &str, args: &serde_json::Value) -> bool {
+    async fn check_path_permission(&mut self, tool_name: &str, args: &serde_json::Value, msg: &InboundMessage) -> bool {
         let raw_paths = self.extract_paths(tool_name, args);
         if raw_paths.is_empty() {
             return true; // No filesystem paths to check
@@ -1811,6 +1816,8 @@ impl AgentRuntime {
                 tool_name: tool_name.to_string(),
                 paths: unsafe_paths.clone(),
                 response_tx,
+                channel: msg.channel.clone(),
+                chat_id: msg.chat_id.clone(),
             };
 
             if confirm_tx.send(request).await.is_err() {
@@ -1844,7 +1851,7 @@ impl AgentRuntime {
         }
     }
 
-    async fn confirm_dangerous_operation(&mut self, tool_name: &str, items: Vec<String>) -> bool {
+    async fn confirm_dangerous_operation(&mut self, tool_name: &str, items: Vec<String>, msg: &InboundMessage) -> bool {
         if items.is_empty() {
             return true;
         }
@@ -1854,6 +1861,8 @@ impl AgentRuntime {
                 tool_name: tool_name.to_string(),
                 paths: items,
                 response_tx,
+                channel: msg.channel.clone(),
+                chat_id: msg.chat_id.clone(),
             };
             if confirm_tx.send(request).await.is_err() {
                 warn!(
@@ -1919,7 +1928,7 @@ impl AgentRuntime {
                                 "hint": "This channel cannot show an interactive confirm prompt. Reply with '确认执行' (or '确认重启') to proceed, otherwise I will not run kill/pkill/killall/service-stop commands."
                             }).to_string();
                         }
-                    } else if !self.confirm_dangerous_operation("exec", items).await {
+                    } else if !self.confirm_dangerous_operation("exec", items, msg).await {
                         return serde_json::json!({
                             "error": "Permission denied: dangerous exec command requires explicit user confirmation.",
                             "tool": "exec",
@@ -1974,7 +1983,7 @@ impl AgentRuntime {
                             "hint": "This channel cannot show an interactive confirm prompt. Reply with '确认执行' to proceed with recursive delete / config file modifications."
                         }).to_string();
                     }
-                } else if !self.confirm_dangerous_operation("file_ops", items).await {
+                } else if !self.confirm_dangerous_operation("file_ops", items, msg).await {
                     return serde_json::json!({
                         "error": "Permission denied: destructive file operation requires explicit user confirmation.",
                         "tool": "file_ops",
@@ -1986,7 +1995,7 @@ impl AgentRuntime {
 
         // Check path safety before executing filesystem/exec tools
         if !self
-            .check_path_permission(&tool_call.name, &tool_call.arguments)
+            .check_path_permission(&tool_call.name, &tool_call.arguments, msg)
             .await
         {
             return serde_json::json!({

@@ -17,7 +17,7 @@ use blockcell_channels::wecom::WeComChannel;
 #[cfg(feature = "whatsapp")]
 use blockcell_channels::whatsapp::WhatsAppChannel;
 use blockcell_channels::ChannelManager;
-use blockcell_core::{Config, InboundMessage, Paths};
+use blockcell_core::{Config, InboundMessage, OutboundMessage, Paths};
 use blockcell_scheduler::{
     CronJob, CronService, GhostService, GhostServiceConfig, HeartbeatService, JobPayload,
     JobSchedule, JobState, ScheduleKind,
@@ -83,8 +83,11 @@ struct GatewayState {
     api_token: Option<String>,
     /// Broadcast channel for streaming events to WebSocket clients
     ws_broadcast: broadcast::Sender<String>,
-    /// Pending path-confirmation requests waiting for WebUI user response
+    /// Pending path-confirmation requests waiting for WebUI user response (keyed by request_id)
     pending_confirms: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>>,
+    /// Pending path-confirmation requests waiting for non-ws channel user reply (keyed by "channel:chat_id")
+    #[allow(dead_code)]
+    pending_channel_confirms: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>>,
     /// Session store for session CRUD
     session_store: Arc<SessionStore>,
     /// Cron service for cron CRUD
@@ -5655,31 +5658,69 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
         }
     }
 
-    // ── Set up WebSocket-based path confirmation channel ──
-    let pending_confirms: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>> =
+    // ── Set up path confirmation channel (channel-aware) ──
+    // pending_ws_confirms: keyed by request_id, for WebUI (ws) confirmations
+    let pending_ws_confirms: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    // pending_channel_confirms: keyed by "channel:chat_id", for non-ws channel confirmations
+    let pending_channel_confirms: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let (confirm_tx, mut confirm_rx) = mpsc::channel::<ConfirmRequest>(16);
     runtime.set_confirm(confirm_tx);
 
-    // Spawn confirm handler: broadcasts confirm_request events to WS clients
-    // and stores the oneshot sender keyed by request_id for later routing.
-    let pending_confirms_for_handler = Arc::clone(&pending_confirms);
+    // Clone outbound_tx before it is moved into the runtime, so the confirm
+    // handler can send confirmation prompts to non-ws channels.
+    let outbound_tx_for_confirm = outbound_tx.clone();
+
+    // Spawn confirm handler: routes confirmation requests to the correct channel.
+    // - ws channel → broadcast confirm_request event to WebUI
+    // - non-ws channels → send text prompt via outbound_tx to originating channel
+    let pending_ws_for_handler = Arc::clone(&pending_ws_confirms);
+    let pending_ch_for_handler = Arc::clone(&pending_channel_confirms);
     let ws_broadcast_for_confirm = ws_broadcast_tx.clone();
     tokio::spawn(async move {
         while let Some(req) = confirm_rx.recv().await {
-            let request_id = format!("confirm_{}", chrono::Utc::now().timestamp_millis());
-            {
-                let mut map = pending_confirms_for_handler.lock().await;
-                map.insert(request_id.clone(), req.response_tx);
+            if req.channel == "ws" {
+                // WebUI: broadcast structured event, wait for confirm_response WS message
+                let request_id = format!("confirm_{}", chrono::Utc::now().timestamp_millis());
+                {
+                    let mut map = pending_ws_for_handler.lock().await;
+                    map.insert(request_id.clone(), req.response_tx);
+                }
+                let event = serde_json::json!({
+                    "type": "confirm_request",
+                    "request_id": request_id,
+                    "tool": req.tool_name,
+                    "paths": req.paths,
+                });
+                let _ = ws_broadcast_for_confirm.send(event.to_string());
+                info!(request_id = %request_id, tool = %req.tool_name, "Sent confirm_request to WebUI");
+            } else {
+                // Non-ws channel (lark, telegram, etc.): send text prompt to the
+                // originating channel and wait for the user's text reply.
+                let confirm_key = format!("{}:{}", req.channel, req.chat_id);
+                let paths_display: Vec<String> = req.paths.iter().map(|p| format!("  📁 {}", p)).collect();
+                let prompt = format!(
+                    "⚠️ 安全确认: 工具 `{}` 需要访问工作区外的路径:\n{}\n\n回复 \"允许\" 或 \"y\" 授权，回复其他内容拒绝。",
+                    req.tool_name,
+                    paths_display.join("\n"),
+                );
+                {
+                    let mut map = pending_ch_for_handler.lock().await;
+                    map.insert(confirm_key.clone(), req.response_tx);
+                }
+                let outbound_msg = OutboundMessage::new(&req.channel, &req.chat_id, &prompt);
+                if let Err(e) = outbound_tx_for_confirm.send(outbound_msg).await {
+                    warn!(confirm_key = %confirm_key, error = %e, "Failed to send confirm prompt to channel");
+                    // Remove the pending entry since we couldn't send
+                    let mut map = pending_ch_for_handler.lock().await;
+                    if let Some(tx) = map.remove(&confirm_key) {
+                        let _ = tx.send(false);
+                    }
+                } else {
+                    info!(confirm_key = %confirm_key, tool = %req.tool_name, "Sent confirm_request to channel");
+                }
             }
-            let event = serde_json::json!({
-                "type": "confirm_request",
-                "request_id": request_id,
-                "tool": req.tool_name,
-                "paths": req.paths,
-            });
-            let _ = ws_broadcast_for_confirm.send(event.to_string());
-            info!(request_id = %request_id, tool = %req.tool_name, "Sent confirm_request to WebUI");
         }
     });
 
@@ -5749,11 +5790,57 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
     let ghost_config = GhostServiceConfig::from_config(&config);
     let ghost_service = GhostService::new(ghost_config, paths.clone(), inbound_tx.clone());
 
+    // ── Inbound interceptor: check for pending channel confirm replies ──
+    // Sits between channel inbound_rx and the runtime, intercepting confirm
+    // replies from non-ws channels before they reach the runtime loop.
+    let (filtered_inbound_tx, filtered_inbound_rx) = mpsc::channel::<InboundMessage>(100);
+    let pending_ch_for_interceptor = Arc::clone(&pending_channel_confirms);
+    let mut interceptor_shutdown_rx = shutdown_tx.subscribe();
+    let interceptor_handle = tokio::spawn(async move {
+        let mut inbound_rx = inbound_rx;
+        loop {
+            let msg = tokio::select! {
+                msg = inbound_rx.recv() => match msg {
+                    Some(m) => m,
+                    None => break,
+                },
+                _ = interceptor_shutdown_rx.recv() => break,
+            };
+            // Check if this message is a reply to a pending channel confirm
+            if msg.channel != "ws" && msg.channel != "cli" && msg.channel != "cron" && msg.channel != "system" {
+                let confirm_key = format!("{}:{}", msg.channel, msg.chat_id);
+                let maybe_tx = {
+                    let mut map = pending_ch_for_interceptor.lock().await;
+                    map.remove(&confirm_key)
+                };
+                if let Some(tx) = maybe_tx {
+                    // Parse the reply as a confirm response
+                    let text = msg.content.trim().to_lowercase();
+                    let approved = text == "y" || text == "yes"
+                        || text.contains("允许") || text.contains("确认")
+                        || text.contains("同意") || text.contains("ok");
+                    info!(
+                        confirm_key = %confirm_key,
+                        approved = approved,
+                        reply = %msg.content.trim(),
+                        "Channel confirm reply intercepted"
+                    );
+                    let _ = tx.send(approved);
+                    continue; // Don't forward this message to the runtime
+                }
+            }
+            // Not a confirm reply — forward to runtime
+            if filtered_inbound_tx.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
     // ── Spawn core tasks ──
     let runtime_shutdown_rx = shutdown_tx.subscribe();
     let runtime_handle = tokio::spawn(async move {
         runtime
-            .run_loop(inbound_rx, Some(runtime_shutdown_rx))
+            .run_loop(filtered_inbound_rx, Some(runtime_shutdown_rx))
             .await;
     });
 
@@ -5911,7 +5998,8 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
         paths: paths.clone(),
         api_token: api_token.clone(),
         ws_broadcast: ws_broadcast_tx.clone(),
-        pending_confirms: Arc::clone(&pending_confirms),
+        pending_confirms: Arc::clone(&pending_ws_confirms),
+        pending_channel_confirms: Arc::clone(&pending_channel_confirms),
         session_store,
         cron_service: cron_service.clone(),
         memory_store: memory_store_handle.clone(),
@@ -6123,6 +6211,7 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
         ("webui_server", webui_handle),
         ("runtime", runtime_handle),
         ("outbound", outbound_handle),
+        ("interceptor", interceptor_handle),
         ("cron", cron_handle),
         ("heartbeat", heartbeat_handle),
         ("ghost", ghost_handle),
