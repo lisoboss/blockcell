@@ -3063,8 +3063,12 @@ fn extract_reply_metadata(msg: &InboundMessage) -> serde_json::Value {
             serde_json::Value::Null
         }
         "feishu" | "lark" => {
-            // Feishu/Lark open-chat (group) IDs start with "oc_"
-            if msg.chat_id.starts_with("oc_") {
+            // Use chat_type from metadata: "group" = group chat, "p2p" = direct message
+            let is_group = msg.metadata
+                .get("chat_type")
+                .and_then(|v| v.as_str())
+                == Some("group");
+            if is_group {
                 if let Some(mid) = msg.metadata.get("message_id").and_then(|v| v.as_str()) {
                     return serde_json::json!({ "reply_to_message_id": mid });
                 }
@@ -3086,9 +3090,12 @@ fn extract_reply_metadata(msg: &InboundMessage) -> serde_json::Value {
             serde_json::Value::Null
         }
         "slack" => {
-            // Slack channels: reply in-thread using the original message ts
-            if let Some(ts) = msg.metadata.get("ts").and_then(|v| v.as_str()) {
-                return serde_json::json!({ "thread_ts": ts });
+            // Slack DM channel IDs start with 'D'; public/private channels start with 'C'/'G'
+            let is_dm = msg.chat_id.starts_with('D');
+            if !is_dm {
+                if let Some(ts) = msg.metadata.get("ts").and_then(|v| v.as_str()) {
+                    return serde_json::json!({ "thread_ts": ts });
+                }
             }
             serde_json::Value::Null
         }

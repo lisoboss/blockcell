@@ -124,6 +124,7 @@ struct EventBody {
 struct MessageEvent {
     message_id: String,
     chat_id: String,
+    chat_type: Option<String>,
     message_type: String,
     content: String,
 }
@@ -629,6 +630,7 @@ impl FeishuChannel {
                 "message_id": message.message_id,
                 "event_id": header.event_id,
                 "message_type": message.message_type,
+                "chat_type": message.chat_type.as_deref().unwrap_or("p2p"),
             }),
             timestamp_ms: chrono::Utc::now().timestamp_millis(),
         };

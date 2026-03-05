@@ -89,6 +89,7 @@ pub struct EventBody {
 pub struct MessageEvent {
     pub message_id: String,
     pub chat_id: String,
+    pub chat_type: Option<String>,
     pub message_type: String,
     pub content: String,
 }
@@ -443,6 +444,7 @@ pub async fn process_webhook(
             metadata: serde_json::json!({
                 "message_id": message.message_id,
                 "message_type": message.message_type,
+                "chat_type": message.chat_type.as_deref().unwrap_or("p2p"),
             }),
             timestamp_ms: chrono::Utc::now().timestamp_millis(),
         };
