@@ -11,7 +11,7 @@ pub struct CronTool;
 
 fn resolve_skill_payload_kind(paths: &Paths, skill_name: Option<&str>) -> &'static str {
     let Some(skill_name) = skill_name else {
-        return "agent_turn";
+        return "rhai";
     };
 
     let user_dir = paths.skills_dir().join(skill_name);
@@ -21,12 +21,11 @@ fn resolve_skill_payload_kind(paths: &Paths, skill_name: Option<&str>) -> &'stat
     let has_py = user_dir.join("SKILL.py").exists() || builtin_dir.join("SKILL.py").exists();
 
     if has_rhai {
-        "skill_rhai"
+        "rhai"
     } else if has_py {
-        "skill_python"
+        "python"
     } else {
-        // Backward compatibility: keep legacy behavior when skill script type is unknown.
-        "skill_rhai"
+        "rhai"
     }
 }
 
@@ -99,7 +98,8 @@ fn execute_cron_action_with_paths(
             let job_id = Uuid::new_v4().to_string();
 
             let skill_name = params.get("skill_name").and_then(|v| v.as_str());
-            let payload_kind = resolve_skill_payload_kind(paths, skill_name);
+            let payload_kind = if skill_name.is_some() { "script" } else { "reminder" };
+            let script_kind = skill_name.map(|sn| resolve_skill_payload_kind(paths, Some(sn)));
 
             let deliver = !matches!(origin_channel, "cli" | "cron" | "ghost" | "");
             let mut payload = json!({
@@ -109,6 +109,9 @@ fn execute_cron_action_with_paths(
                 "channel": origin_channel,
                 "to": origin_chat_id
             });
+            if let Some(kind) = script_kind {
+                payload["scriptKind"] = json!(kind);
+            }
             if let Some(sn) = skill_name {
                 payload["skillName"] = json!(sn);
             }
@@ -292,7 +295,7 @@ impl Tool for CronTool {
                     },
                     "skill_name": {
                         "type": "string",
-                        "description": "(add) If set, the cron job will directly execute the named skill script (SKILL.rhai or SKILL.py) instead of going through the LLM. E.g. 'stock_monitor', 'daily_finance_report'."
+                        "description": "(add) Optional. If set, the cron job will directly execute the named skill script (SKILL.rhai or SKILL.py). If omitted, the job is treated as a plain reminder and will be delivered directly without going through the LLM. E.g. 'stock_monitor', 'daily_finance_report'."
                     }
                 },
                 "required": ["action"]
@@ -301,7 +304,7 @@ impl Tool for CronTool {
     }
 
     fn prompt_rule(&self, _ctx: &crate::PromptContext) -> Option<String> {
-        Some("- **定时任务 (cron)**: 用户要求定时执行某项任务时，**优先**检查是否有对应技能：先调用 `list_skills` 查看可用技能列表，若有名称匹配的技能（如用户说 AI新闻 -> 技能名 `ai_news`），则在 `cron` 工具中设置 `skill_name='ai_news'`，触发时直接执行技能脚本，无需 LLM 介入，最可靠。若无匹配技能，则用 `message` 参数描述任务指令。 [TIMEZONE] `cron_expr` 使用 UTC 时间，中国用户（UTC+8）说每天 9 点应填 `cron_expr='0 0 1 * * *'`（UTC 1:00 = 北京时间 9:00）。一次性任务设 `delete_after_run=true`；周期任务用 `cron_expr` 或 `every_seconds`。".to_string())
+        Some("- **定时任务 (cron)**: 用户要求定时执行某项任务时，先判断是不是**纯提醒**。如果只是到点发送一句固定提醒（如起床提醒、喝水提醒），直接用 `message` 写最终要发给用户的内容，不要把它写成需要再次分析或执行的任务；这种情况不要设置 `skill_name`，触发时会直接发送给用户，不经过 LLM。若任务需要真正执行脚本/技能，再先调用 `list_skills` 查看可用技能列表，找到匹配技能后在 `cron` 工具中设置 `skill_name='...'`，触发时直接执行技能脚本。 [TIMEZONE] `cron_expr` 使用 UTC 时间，中国用户（UTC+8）说每天 9 点应填 `cron_expr='0 0 1 * * *'`（UTC 1:00 = 北京时间 9:00）。一次性任务设 `delete_after_run=true`；周期任务用 `cron_expr` 或 `every_seconds`。".to_string())
     }
 
     fn validate(&self, params: &Value) -> Result<()> {

@@ -25,7 +25,7 @@ const scenarios: Scenario[] = [
     titleKey: 'scenario.report.title',
     descKey: 'scenario.report.desc',
     examplesKey: ['scenario.report.ex1', 'scenario.report.ex2', 'scenario.report.ex3'],
-    color: 'text-green-400 bg-green-400/10 border-green-400/20',
+    color: 'text-[hsl(var(--brand-green))] bg-[hsl(var(--brand-green)/0.10)] border-[hsl(var(--brand-green)/0.20)]',
   },
   {
     id: 'ppt',

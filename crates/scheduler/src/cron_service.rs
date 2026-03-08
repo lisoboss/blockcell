@@ -345,76 +345,51 @@ impl CronService {
             DeliveryPolicy::default(),
         );
 
-        let script_kind = match job.payload.kind.as_str() {
-            "skill_rhai" => Some("rhai"),
-            "skill_python" => Some("python"),
-            _ => None,
-        };
-
-        let (content, metadata) = if let Some(kind) = script_kind {
-            // Direct skill script execution — send metadata so AgentRuntime dispatches
-            // to script runtime instead of going through the full LLM loop.
-            let skill_name = job.payload.skill_name.as_deref().unwrap_or("unknown");
-            let content = format!(
-                "[系统定时任务] 执行技能脚本 {} — {}",
-                skill_name, job.payload.message
-            );
-            let mut metadata = serde_json::json!({
-                "job_id": job.id,
-                "job_name": job.name,
-                "skill_script": true,
-                "skill_script_kind": kind,
-                "skill_name": skill_name,
-                "deliver": job.payload.deliver,
-                "deliver_channel": job.payload.channel,
-                "deliver_to": job.payload.to,
-            });
-            if kind == "python" {
-                metadata["skill_python"] = serde_json::json!(true);
-            } else {
-                metadata["skill_rhai"] = serde_json::json!(true);
+        let (content, metadata) = match job.payload.kind.as_str() {
+            "reminder" => {
+                let content = job.payload.message.clone();
+                let metadata = serde_json::json!({
+                    "job_id": job.id,
+                    "job_name": job.name,
+                    "reminder": true,
+                    "reminder_message": job.payload.message,
+                    "deliver": job.payload.deliver,
+                    "deliver_channel": job.payload.channel,
+                    "deliver_to": job.payload.to,
+                });
+                (content, metadata)
             }
-            (content, metadata)
-        } else {
-            // Standard agent_turn — let the LLM handle it (search, execute skill, etc.)
-            // Do NOT set reminder:true here — that bypasses the LLM entirely.
-            let content = format!(
-                "[系统定时任务] 你之前为用户设置的任务「{}」现在到时间了。请立即执行该任务并将结果发送给用户。",
-                job.payload.message
-            );
-            let metadata = serde_json::json!({
-                "job_id": job.id,
-                "job_name": job.name,
-                "agent_task": true,
-                "deliver": job.payload.deliver,
-                "deliver_channel": job.payload.channel,
-                "deliver_to": job.payload.to,
-            });
-            (content, metadata)
+            "script" => {
+                let kind = job.payload.script_kind.as_deref().unwrap_or("rhai");
+                let skill_name = job.payload.skill_name.as_deref().unwrap_or("unknown");
+                let content = format!(
+                    "[系统定时任务] 执行技能脚本 {} — {}",
+                    skill_name, job.payload.message
+                );
+                let mut metadata = serde_json::json!({
+                    "job_id": job.id,
+                    "job_name": job.name,
+                    "skill_script": true,
+                    "skill_script_kind": kind,
+                    "skill_name": skill_name,
+                    "deliver": job.payload.deliver,
+                    "deliver_channel": job.payload.channel,
+                    "deliver_to": job.payload.to,
+                });
+                if kind == "python" {
+                    metadata["skill_python"] = serde_json::json!(true);
+                } else {
+                    metadata["skill_rhai"] = serde_json::json!(true);
+                }
+                (content, metadata)
+            }
+            _ => {
+                error!(job_id = %job.id, kind = %job.payload.kind, "Unknown cron payload kind");
+                return;
+            }
         };
 
-        // For agent_turn jobs, use the deliver target as channel/chat_id so that
-        // ToolContext gets the real user channel — the message tool can then send
-        // to the correct target without the LLM needing to specify channel/chat_id.
-        // For direct skill-script jobs and simple reminder jobs, keep "cron" as the channel.
-        let (msg_channel, msg_chat_id) = if job.payload.kind == "agent_turn" && job.payload.deliver
-        {
-            let ch = job
-                .payload
-                .channel
-                .clone()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "cron".to_string());
-            let to = job
-                .payload
-                .to
-                .clone()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| job.id.clone());
-            (ch, to)
-        } else {
-            ("cron".to_string(), job.id.clone())
-        };
+        let (msg_channel, msg_chat_id) = ("cron".to_string(), job.id.clone());
 
         let mut metadata = metadata;
         apply_route_agent_id(&mut metadata, self.agent_id.as_deref());
@@ -529,11 +504,12 @@ mod tests {
                 tz: None,
             },
             payload: crate::job::JobPayload {
-                kind: "agent_turn".to_string(),
+                kind: "reminder".to_string(),
                 message: "sync status".to_string(),
                 deliver: false,
                 channel: None,
                 to: None,
+                script_kind: None,
                 skill_name: None,
             },
             state: crate::job::JobState::default(),

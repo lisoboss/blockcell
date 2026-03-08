@@ -19,6 +19,10 @@ export function BlockcellLogo({ size = 'md', className = '' }: BlockcellLogoProp
     lg: 1.25 
   }[size];
 
+  const isDark = typeof document !== 'undefined' && document.documentElement.classList.contains('dark');
+  const coreFill = isDark ? '#00ff9d' : '#1f7a55';
+  const coreShadow = isDark ? 'rgba(0,255,157,0.8)' : 'rgba(31,122,85,0.45)';
+
   return (
     <div className={`relative ${dims} flex items-center justify-center ${className}`}>
       <div className="relative w-full h-full animate-[spin_20s_linear_infinite] will-change-transform">
@@ -39,7 +43,7 @@ export function BlockcellLogo({ size = 'md', className = '' }: BlockcellLogoProp
         {/* Inner Core (Cyberpunk Green - AI Cell) */}
         <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 animate-pulse">
           <svg width={40 * scale} height={46 * scale} viewBox="0 0 100 116" fill="none">
-            <path d="M50 0L93.3013 25V75L50 100L6.69873 75V25L50 0Z" fill="#00ff9d" className="drop-shadow-[0_0_15px_rgba(0,255,157,0.8)]"/>
+            <path d="M50 0L93.3013 25V75L50 100L6.69873 75V25L50 0Z" fill={coreFill} style={{ filter: `drop-shadow(0 0 15px ${coreShadow})` }} />
           </svg>
         </div>
 

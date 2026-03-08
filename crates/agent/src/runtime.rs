@@ -128,13 +128,13 @@ pub struct ConfirmRequest {
 }
 
 /// Truncate a string at a safe char boundary.
-fn truncate_str(s: &str, max_chars: usize) -> &str {
-    if s.len() <= max_chars {
-        return s;
+fn truncate_str(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
     }
     match s.char_indices().nth(max_chars) {
-        Some((idx, _)) => &s[..idx],
-        None => s,
+        Some((idx, _)) => s[..idx].to_string(),
+        None => s.to_string(),
     }
 }
 
@@ -146,6 +146,171 @@ fn summarize_result(result: &str) -> String {
         result.to_string()
     } else {
         format!("{}... (truncated)", truncate_str(result, max_chars))
+    }
+}
+
+/// Compact JSON value for presentation.
+fn compact_json_value(value: &serde_json::Value, depth: usize) -> serde_json::Value {
+    const MAX_DEPTH: usize = 4;
+    const MAX_ARRAY_ITEMS: usize = 8;
+    const MAX_STRING_CHARS: usize = 400;
+
+    if depth >= MAX_DEPTH {
+        return match value {
+            serde_json::Value::String(s) => serde_json::Value::String(truncate_str(s, 160)),
+            serde_json::Value::Array(arr) => serde_json::json!({
+                "kind": "array",
+                "len": arr.len()
+            }),
+            serde_json::Value::Object(map) => serde_json::json!({
+                "kind": "object",
+                "keys": map.keys().take(12).cloned().collect::<Vec<_>>()
+            }),
+            other => other.clone(),
+        };
+    }
+
+    match value {
+        serde_json::Value::Null => serde_json::Value::Null,
+        serde_json::Value::Bool(v) => serde_json::Value::Bool(*v),
+        serde_json::Value::Number(v) => serde_json::Value::Number(v.clone()),
+        serde_json::Value::String(s) => serde_json::Value::String(truncate_str(s, MAX_STRING_CHARS)),
+        serde_json::Value::Array(arr) => {
+            let items = arr
+                .iter()
+                .take(MAX_ARRAY_ITEMS)
+                .map(|item| compact_json_value(item, depth + 1))
+                .collect::<Vec<_>>();
+            if arr.len() > MAX_ARRAY_ITEMS {
+                serde_json::json!({
+                    "items": items,
+                    "truncated": true,
+                    "total": arr.len()
+                })
+            } else {
+                serde_json::Value::Array(items)
+            }
+        }
+        serde_json::Value::Object(map) => {
+            let heavy_keys = ["content", "body", "html", "markdown", "raw", "text", "full_text"];
+            let mut result = serde_json::Map::new();
+
+            for (key, value) in map.iter() {
+                if heavy_keys.contains(&key.as_str()) {
+                    match value {
+                        serde_json::Value::String(s) => {
+                            result.insert(
+                                key.clone(),
+                                serde_json::json!({
+                                    "preview": truncate_str(s, 240),
+                                    "truncated": s.chars().count() > 240,
+                                    "length": s.chars().count()
+                                }),
+                            );
+                        }
+                        other => {
+                            result.insert(key.clone(), compact_json_value(other, depth + 1));
+                        }
+                    }
+                } else {
+                    result.insert(key.clone(), compact_json_value(value, depth + 1));
+                }
+            }
+
+            serde_json::Value::Object(result)
+        }
+    }
+}
+
+/// Prepare skill result for presentation.
+struct SkillResultPresentation {
+    direct_text: Option<String>,
+    llm_payload: Option<String>,
+    fallback_text: String,
+}
+
+fn prepare_skill_result_for_presentation(
+    skill_name: &str,
+    output: &str,
+) -> SkillResultPresentation {
+    let raw_fallback = format!(
+        "[{}] 定时任务执行完成:\n\n{}",
+        skill_name,
+        truncate_str(output, 4000)
+    );
+
+    let parsed: serde_json::Value = match serde_json::from_str(output) {
+        Ok(value) => value,
+        Err(_) => {
+            return SkillResultPresentation {
+                direct_text: None,
+                llm_payload: Some(truncate_str(output, 4000)),
+                fallback_text: raw_fallback,
+            };
+        }
+    };
+
+    let Some(obj) = parsed.as_object() else {
+        return SkillResultPresentation {
+            direct_text: None,
+            llm_payload: Some(truncate_str(output, 4000)),
+            fallback_text: raw_fallback,
+        };
+    };
+
+    if let Some(display_text) = obj.get("display_text").and_then(|v| v.as_str()) {
+        let text = display_text.trim();
+        if !text.is_empty() {
+            return SkillResultPresentation {
+                direct_text: Some(text.to_string()),
+                llm_payload: None,
+                fallback_text: text.to_string(),
+            };
+        }
+    }
+
+    let instruction = obj
+        .get("instruction")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("请把结果整理成清晰、简洁、用户可读的回复，不要编造未提供的信息。");
+
+    let llm_source = if let Some(summary) = obj.get("summary_data") {
+        serde_json::json!({
+            "instruction": instruction,
+            "summary_data": compact_json_value(summary, 0)
+        })
+    } else {
+        let mut compact = serde_json::Map::new();
+        for (key, value) in obj {
+            if key == "raw_data" {
+                continue;
+            }
+            compact.insert(key.clone(), compact_json_value(value, 0));
+        }
+        serde_json::Value::Object(compact)
+    };
+
+    let llm_payload = serde_json::to_string_pretty(&llm_source)
+        .unwrap_or_else(|_| truncate_str(output, 4000));
+
+    let fallback_text = if let Some(summary) = obj.get("summary_data") {
+        let compact = serde_json::to_string_pretty(&compact_json_value(summary, 0))
+            .unwrap_or_else(|_| "{}".to_string());
+        format!(
+            "[{}] 定时任务执行完成（摘要整理失败，以下为结构化摘要）:\n\n{}",
+            skill_name,
+            truncate_str(&compact, 4000)
+        )
+    } else {
+        raw_fallback
+    };
+
+    SkillResultPresentation {
+        direct_text: None,
+        llm_payload: Some(truncate_str(&llm_payload, 16000)),
+        fallback_text,
     }
 }
 
@@ -1395,30 +1560,143 @@ impl AgentRuntime {
             let result = self
                 .execute_skill_script(&skill_name, &msg, script_kind)
                 .await;
-            let final_response = match &result {
-                Ok(output) => format!("[{}] 定时任务执行完成:\n\n{}", skill_name, output),
-                Err(e) => format!("[{}] 定时任务执行失败: {}", skill_name, e),
+
+            let final_response = match result {
+                Ok(output) => {
+                    let presentation = prepare_skill_result_for_presentation(&skill_name, &output);
+                    if let Some(direct_text) = presentation.direct_text {
+                        info!(
+                            skill = %skill_name,
+                            "Skill script returned display_text, skipping LLM summarization"
+                        );
+                        direct_text
+                    } else {
+                        // Script succeeded — make a dedicated LLM call to polish the compact
+                        // result into a user-friendly format. We bypass intent classification,
+                        // skill matching and the full tool loop entirely to avoid the script
+                        // data being misrouted to an unrelated skill.
+                        let skill_markdown = self
+                            .resolve_skill_script_path(&skill_name, "SKILL.md")
+                            .ok()
+                            .and_then(|path| std::fs::read_to_string(path).ok())
+                            .unwrap_or_default();
+                        let summarize_input = presentation
+                            .llm_payload
+                            .clone()
+                            .unwrap_or_else(|| truncate_str(&output, 4000));
+                        info!(
+                            skill = %skill_name,
+                            output_len = output.len(),
+                            summarize_input_len = summarize_input.len(),
+                            "Cron skill script succeeded, calling LLM to summarize"
+                        );
+
+                        let summarize_messages = vec![
+                            ChatMessage::system(
+                                "你是一个定时任务结果整理助手。技能脚本已经执行完成。\
+                                请优先依据输入中的技能说明、instruction 和 summary_data 整理结果。\
+                                如果已经是轻量结构化摘要，就直接整理成清晰友好的最终回复。\
+                                不要再调用任何工具，不要编造未提供的信息。"
+                            ),
+                            ChatMessage::user(&format!(
+                                "[定时任务·{}] 技能脚本执行完成。以下是该技能的 SKILL.md 指导：\n\n{}\n\n以下是脚本产出的待整理数据：\n\n{}",
+                                skill_name, skill_markdown, summarize_input
+                            )),
+                        ];
+
+                        let llm_result = if let Some((pidx, provider)) = self.provider_pool.acquire() {
+                            let r = provider.chat(&summarize_messages, &[]).await;
+                            match &r {
+                                Ok(_) => self.provider_pool.report(pidx, CallResult::Success),
+                                Err(e) => self.provider_pool.report(
+                                    pidx,
+                                    ProviderPool::classify_error(&format!("{}", e)),
+                                ),
+                            }
+                            r
+                        } else {
+                            Err(blockcell_core::Error::Config(
+                                "ProviderPool: no healthy providers".to_string(),
+                            ))
+                        };
+
+                        match llm_result {
+                            Ok(resp) => resp.content.unwrap_or_else(|| {
+                                format!("[{}] 定时任务执行完成（LLM 未返回内容）", skill_name)
+                            }),
+                            Err(e) => {
+                                warn!(skill = %skill_name, error = %e, "LLM summarization failed for cron skill result, returning fallback output");
+                                presentation.fallback_text.clone()
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        skill = %skill_name,
+                        error = %e,
+                        "SKILL.rhai cron execution failed"
+                    );
+                    format!("[{}] 定时任务执行失败: {}", skill_name, e)
+                }
             };
 
-            // Send response to outbound
-            if let Some(tx) = &self.outbound_tx {
-                let mut outbound =
-                    OutboundMessage::new(&msg.channel, &msg.chat_id, &final_response);
-                outbound.account_id = msg.account_id.clone();
-                let _ = tx.send(outbound).await;
-            }
-
-            // Deliver to external channel if configured
-            if let Some(true) = msg.metadata.get("deliver").and_then(|v| v.as_bool()) {
+            let deliver_target = if let Some(true) = msg.metadata.get("deliver").and_then(|v| v.as_bool()) {
                 if let (Some(channel), Some(to)) = (
                     msg.metadata.get("deliver_channel").and_then(|v| v.as_str()),
                     msg.metadata.get("deliver_to").and_then(|v| v.as_str()),
                 ) {
-                    if let Some(tx) = &self.outbound_tx {
-                        let outbound = OutboundMessage::new(channel, to, &final_response);
-                        let _ = tx.send(outbound).await;
+                    if !channel.is_empty() && !to.is_empty() {
+                        Some((channel.to_string(), to.to_string()))
+                    } else {
+                        None
                     }
+                } else {
+                    None
                 }
+            } else {
+                None
+            };
+
+            let persist_session_key = if let Some((channel, to)) = &deliver_target {
+                blockcell_core::build_session_key(channel, to)
+            } else {
+                session_key.clone()
+            };
+
+            let skill_history_message = ChatMessage::assistant(&final_response);
+            let _ = self
+                .session_store
+                .append(&persist_session_key, &skill_history_message);
+
+            if let Some((channel, to)) = deliver_target {
+                if channel == "ws" {
+                    if let Some(ref event_tx) = self.event_tx {
+                        let event = serde_json::json!({
+                            "type": "message_done",
+                            "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
+                            "chat_id": to,
+                            "task_id": "",
+                            "content": final_response,
+                            "tool_calls": 0,
+                            "duration_ms": 0,
+                            "media": [],
+                            "background_delivery": true,
+                            "delivery_kind": "cron",
+                            "cron_kind": "script",
+                        });
+                        let _ = event_tx.send(event.to_string());
+                    }
+                } else if let Some(tx) = &self.outbound_tx {
+                    let mut outbound = OutboundMessage::new(&channel, &to, &final_response);
+                    outbound.account_id = msg.account_id.clone();
+                    let _ = tx.send(outbound).await;
+                }
+            } else if let Some(tx) = &self.outbound_tx {
+                let mut outbound =
+                    OutboundMessage::new(&msg.channel, &msg.chat_id, &final_response);
+                outbound.account_id = msg.account_id.clone();
+                let _ = tx.send(outbound).await;
             }
 
             return Ok(final_response);
@@ -1444,6 +1722,28 @@ impl AgentRuntime {
             let final_response = format!("⏰ [{}] {}", job_name, reminder_msg);
             info!(job_name = %job_name, "Cron reminder delivered directly (bypassing LLM)");
 
+            let persist_session_key = if let Some(true) = msg.metadata.get("deliver").and_then(|v| v.as_bool()) {
+                if let (Some(channel), Some(to)) = (
+                    msg.metadata.get("deliver_channel").and_then(|v| v.as_str()),
+                    msg.metadata.get("deliver_to").and_then(|v| v.as_str()),
+                ) {
+                    if !channel.is_empty() && !to.is_empty() {
+                        blockcell_core::build_session_key(channel, to)
+                    } else {
+                        session_key.clone()
+                    }
+                } else {
+                    session_key.clone()
+                }
+            } else {
+                session_key.clone()
+            };
+
+            let reminder_history_message = ChatMessage::assistant(&final_response);
+            let _ = self
+                .session_store
+                .append(&persist_session_key, &reminder_history_message);
+
             // Send to outbound (CLI printer + gateway's outbound_to_ws_bridge)
             if let Some(tx) = &self.outbound_tx {
                 let mut outbound =
@@ -1458,6 +1758,24 @@ impl AgentRuntime {
                     msg.metadata.get("deliver_channel").and_then(|v| v.as_str()),
                     msg.metadata.get("deliver_to").and_then(|v| v.as_str()),
                 ) {
+                    if channel == "ws" {
+                        if let Some(ref event_tx) = self.event_tx {
+                            let event = serde_json::json!({
+                                "type": "message_done",
+                                "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
+                                "chat_id": to,
+                                "task_id": "",
+                                "content": final_response,
+                                "tool_calls": 0,
+                                "duration_ms": 0,
+                                "media": [],
+                                "background_delivery": true,
+                                "delivery_kind": "cron",
+                                "cron_kind": "reminder",
+                            });
+                            let _ = event_tx.send(event.to_string());
+                        }
+                    }
                     if let Some(tx) = &self.outbound_tx {
                         let outbound = OutboundMessage::new(channel, to, &final_response);
                         let _ = tx.send(outbound).await;
@@ -2891,6 +3209,20 @@ impl AgentRuntime {
         context_vars.insert("skill_name".to_string(), serde_json::json!(skill_name));
         context_vars.insert("trigger".to_string(), serde_json::json!("cron"));
 
+        // Build a `ctx` map so SKILL.rhai scripts can use `ctx.user_input`, `ctx.channel`, etc.
+        context_vars.insert(
+            "ctx".to_string(),
+            serde_json::json!({
+                "user_input": msg.content,
+                "skill_name": skill_name,
+                "trigger": "cron",
+                "channel": msg.channel,
+                "chat_id": msg.chat_id,
+                "message": msg.content,
+                "metadata": msg.metadata,
+            }),
+        );
+
         // Execute the Rhai script in a blocking task
         let dispatcher = SkillDispatcher::new();
         let user_input = msg.content.clone();
@@ -3451,6 +3783,21 @@ async fn run_subagent_task(
     // Create a unique session key for this subagent
     let session_key = format!("subagent:{}", task_id);
 
+    let mut subagent_metadata = build_subagent_metadata(agent_id.as_deref());
+    if !subagent_metadata.is_object() {
+        subagent_metadata = serde_json::json!({});
+    }
+    if let Some(obj) = subagent_metadata.as_object_mut() {
+        obj.insert(
+            "origin_channel".to_string(),
+            serde_json::json!(origin_channel.clone()),
+        );
+        obj.insert(
+            "origin_chat_id".to_string(),
+            serde_json::json!(origin_chat_id.clone()),
+        );
+    }
+
     // Detect skill script execution prefix from spawn(skill_name=...)
     let result = if task_str.starts_with("__SKILL_EXEC__:") {
         // Parse: __SKILL_EXEC__:<skill_name>:<params_json>:<user_query>
@@ -3460,20 +3807,18 @@ async fn run_subagent_task(
         let user_query = parts.get(2).unwrap_or(&"");
 
         let inbound = InboundMessage {
-            channel: "subagent".to_string(),
+            channel: origin_channel.clone(),
             account_id: None,
             sender_id: "system".to_string(),
-            chat_id: session_key,
+            chat_id: origin_chat_id.clone(),
             content: user_query.to_string(),
             media: vec![],
             metadata: {
-                let mut metadata = build_subagent_metadata(agent_id.as_deref());
-                if !metadata.is_object() {
-                    metadata = serde_json::json!({});
-                }
+                let mut metadata = subagent_metadata.clone();
                 if let Some(obj) = metadata.as_object_mut() {
                     obj.insert("skill_script".to_string(), serde_json::json!(true));
                     obj.insert("skill_name".to_string(), serde_json::json!(skill_name));
+                    obj.insert("subagent_session_key".to_string(), serde_json::json!(session_key.clone()));
                 }
                 metadata
             },
@@ -3483,13 +3828,19 @@ async fn run_subagent_task(
         sub_runtime.process_message(inbound).await
     } else {
         let inbound = InboundMessage {
-            channel: "subagent".to_string(),
+            channel: origin_channel.clone(),
             account_id: None,
             sender_id: "system".to_string(),
-            chat_id: session_key,
+            chat_id: origin_chat_id.clone(),
             content: task_str,
             media: vec![],
-            metadata: build_subagent_metadata(agent_id.as_deref()),
+            metadata: {
+                let mut metadata = subagent_metadata.clone();
+                if let Some(obj) = metadata.as_object_mut() {
+                    obj.insert("subagent_session_key".to_string(), serde_json::json!(session_key.clone()));
+                }
+                metadata
+            },
             timestamp_ms: chrono::Utc::now().timestamp_millis(),
         };
         sub_runtime.process_message(inbound).await

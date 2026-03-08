@@ -95,6 +95,12 @@ use webui::*;
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
 enum WsEvent {
+    #[serde(rename = "session_bound")]
+    SessionBound {
+        client_chat_id: String,
+        chat_id: String,
+        agent_id: String,
+    },
     #[serde(rename = "message_done")]
     MessageDone {
         chat_id: String,

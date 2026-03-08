@@ -19,7 +19,7 @@ export function ConnectionOverlay() {
 
   // Countdown timer for reconnect
   useEffect(() => {
-    if (connected || reason === 'auth_failed' || reason === 'none') {
+    if (connected || reason === 'auth_failed' || reason === 'none' || reason === 'reconnect_exhausted') {
       setCountdown(0);
       return;
     }
@@ -57,10 +57,15 @@ export function ConnectionOverlay() {
     });
   }
 
+  function handleReload() {
+    window.location.reload();
+  }
+
   const isAuthFailed = reason === 'auth_failed';
   const isServerDown = reason === 'server_down';
   const isNetworkError = reason === 'network_error';
   const isConnecting = reason === 'connecting';
+  const isReconnectExhausted = reason === 'reconnect_exhausted';
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
@@ -76,6 +81,7 @@ export function ConnectionOverlay() {
             {isAuthFailed && <ShieldAlert size={32} className="text-amber-500" />}
             {isServerDown && <ServerCrash size={32} className="text-red-500" />}
             {isNetworkError && <WifiOff size={32} className="text-orange-500" />}
+            {isReconnectExhausted && <ServerCrash size={32} className="text-red-500" />}
             {isConnecting && <Loader2 size={32} className="text-orange-500 animate-spin" />}
           </div>
 
@@ -83,6 +89,7 @@ export function ConnectionOverlay() {
             {isAuthFailed && t('conn.authFailed')}
             {isServerDown && t('conn.serverDown')}
             {isNetworkError && t('conn.networkError')}
+            {isReconnectExhausted && t('conn.reconnectExhausted')}
             {isConnecting && t('conn.connecting')}
           </h2>
 
@@ -90,12 +97,13 @@ export function ConnectionOverlay() {
             {isAuthFailed && t('conn.authFailedDesc')}
             {isServerDown && t('conn.serverDownDesc')}
             {isNetworkError && t('conn.networkErrorDesc')}
+            {isReconnectExhausted && t('conn.reconnectExhaustedDesc')}
             {isConnecting && t('conn.connectingDesc')}
           </p>
         </div>
 
         {/* Reconnect status */}
-        {!isAuthFailed && reconnectAttempt > 0 && (
+        {!isAuthFailed && !isReconnectExhausted && reconnectAttempt > 0 && (
           <div className="px-6 pb-2">
             <div className="flex items-center justify-center gap-2 text-xs text-muted-foreground">
               <Loader2 size={12} className="animate-spin" />
@@ -130,6 +138,12 @@ export function ConnectionOverlay() {
           </div>
         )}
 
+        {isReconnectExhausted && (
+          <div className="mx-6 mb-2 p-3 rounded-lg bg-muted/50 border border-border">
+            <p className="text-xs text-muted-foreground">{t('conn.refreshToReload')}</p>
+          </div>
+        )}
+
         {/* Actions */}
         <div className="px-6 pb-6 pt-2 flex flex-col gap-2">
           {isAuthFailed ? (
@@ -140,6 +154,22 @@ export function ConnectionOverlay() {
               <LogIn size={16} />
               {t('conn.relogin')}
             </button>
+          ) : isReconnectExhausted ? (
+            <>
+              <button
+                onClick={handleReload}
+                className="w-full py-3 text-sm font-medium rounded-xl bg-primary text-primary-foreground hover:bg-primary/90 flex items-center justify-center gap-2 transition-colors"
+              >
+                <RefreshCw size={16} />
+                {t('common.refresh')}
+              </button>
+              <button
+                onClick={() => setDismissed(true)}
+                className="w-full py-2 text-xs text-muted-foreground hover:text-foreground transition-colors"
+              >
+                {t('conn.dismiss')}
+              </button>
+            </>
           ) : (
             <>
               <button

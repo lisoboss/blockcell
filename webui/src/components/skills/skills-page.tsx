@@ -21,7 +21,7 @@ function SkillToggle({ enabled, onChange, enabledTitle, disabledTitle }: { enabl
       title={enabled ? (enabledTitle ?? '') : (disabledTitle ?? '')}
       className={cn(
         'relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors focus:outline-none',
-        enabled ? 'bg-cyber' : 'bg-muted'
+        enabled ? 'bg-[hsl(var(--brand-green))]' : 'bg-muted'
       )}
     >
       <span className={cn(
@@ -107,7 +107,7 @@ function InstalledSkillsTab({ onInstalledNamesChange }: { onInstalledNamesChange
   if (loading) {
     return (
       <div className="flex items-center justify-center py-16">
-        <Loader2 className="w-5 h-5 animate-spin text-cyber" />
+        <Loader2 className="w-5 h-5 animate-spin text-[hsl(var(--brand-green))]" />
       </div>
     );
   }
@@ -118,7 +118,7 @@ function InstalledSkillsTab({ onInstalledNamesChange }: { onInstalledNamesChange
         <div className={cn(
           'flex items-center gap-2 text-sm px-4 py-2.5 rounded-lg border',
           toast.type === 'success'
-            ? 'bg-green-500/10 border-green-500/20 text-green-400'
+            ? 'border-[hsl(var(--brand-green))] bg-[hsl(var(--brand-green)/0.10)] text-[hsl(var(--brand-green))]'
             : 'bg-red-500/10 border-red-500/20 text-red-400'
         )}>
           {toast.type === 'success' ? <CheckCircle className="w-4 h-4" /> : <AlertCircle className="w-4 h-4" />}
@@ -147,7 +147,7 @@ function InstalledSkillsTab({ onInstalledNamesChange }: { onInstalledNamesChange
             <div className="flex items-center gap-3 min-w-0">
               <div className={cn(
                 'p-2 rounded-lg',
-                skill.source === 'builtin' ? 'bg-muted/60 text-muted-foreground' : 'bg-cyber/10 text-cyber'
+                skill.source === 'builtin' ? 'bg-muted/60 text-muted-foreground' : 'bg-[hsl(var(--brand-green)/0.12)] text-[hsl(var(--brand-green))]'
               )}>
                 <Package className="w-4 h-4" />
               </div>
@@ -169,7 +169,7 @@ function InstalledSkillsTab({ onInstalledNamesChange }: { onInstalledNamesChange
             <div className="flex items-center gap-3 shrink-0">
               {/* Enable/disable toggle — calls same API as dashboard */}
               <div className="flex items-center gap-1.5">
-                <span className={cn('text-xs', isEnabled(skill.name) ? 'text-cyber' : 'text-muted-foreground')}>
+                <span className={cn('text-xs', isEnabled(skill.name) ? 'text-[hsl(var(--brand-green))]' : 'text-muted-foreground')}>
                   {isEnabled(skill.name) ? t('skills.enabled') : t('skills.disabled')}
                 </span>
                 <SkillToggle
@@ -280,7 +280,7 @@ function CommunitySkillsTab({ installedNames }: { installedNames: Set<string> })
   if (loading) {
     return (
       <div className="flex items-center justify-center py-16">
-        <Loader2 className="w-5 h-5 animate-spin text-cyber" />
+        <Loader2 className="w-5 h-5 animate-spin text-[hsl(var(--brand-green))]" />
       </div>
     );
   }
@@ -290,7 +290,7 @@ function CommunitySkillsTab({ installedNames }: { installedNames: Set<string> })
       <div className="flex flex-col items-center py-12 gap-3">
         <AlertCircle className="w-8 h-8 text-muted-foreground" />
         <p className="text-sm text-muted-foreground">{error}</p>
-        <button onClick={load} className="text-xs text-cyber hover:underline">{t('skills.retry')}</button>
+        <button onClick={load} className="text-xs text-[hsl(var(--brand-green))] hover:underline">{t('skills.retry')}</button>
       </div>
     );
   }
@@ -304,7 +304,7 @@ function CommunitySkillsTab({ installedNames }: { installedNames: Set<string> })
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           placeholder={t('skills.searchPlaceholder')}
-          className="w-full bg-muted/40 border border-border rounded-lg pl-9 pr-4 py-2 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-cyber/60"
+          className="w-full bg-muted/40 border border-border rounded-lg pl-9 pr-4 py-2 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-[hsl(var(--brand-green)/0.45)]"
         />
       </div>
 
@@ -322,7 +322,7 @@ function CommunitySkillsTab({ installedNames }: { installedNames: Set<string> })
           return (
             <div key={name} className="rounded-xl border border-border/40 bg-card/60 overflow-hidden">
               <div className="flex items-start gap-3 p-4">
-                <div className="p-2 rounded-lg bg-cyber/10 text-cyber shrink-0 mt-0.5">
+                <div className="p-2 rounded-lg bg-[hsl(var(--brand-green)/0.10)] text-[hsl(var(--brand-green))] shrink-0 mt-0.5">
                   <Globe className="w-4 h-4" />
                 </div>
                 <div className="flex-1 min-w-0">
@@ -376,16 +376,16 @@ function CommunitySkillsTab({ installedNames }: { installedNames: Set<string> })
                 {state === 'installing' ? (
                   <div className="flex-1 flex items-center gap-3">
                     <div className="flex-1 h-1.5 bg-muted rounded-full overflow-hidden">
-                      <div className="h-full bg-cyber rounded-full animate-pulse w-2/3" />
+                      <div className="h-full bg-[hsl(var(--brand-green))] rounded-full animate-pulse w-2/3" />
                     </div>
-                    <span className="text-xs text-cyber">{t('skills.installing')}</span>
+                    <span className="text-xs text-[hsl(var(--brand-green))]">{t('skills.installing')}</span>
                   </div>
                 ) : state === 'done' ? (
-                  <span className="flex items-center gap-1.5 text-xs text-green-400">
+                  <span className="flex items-center gap-1.5 text-xs text-[hsl(var(--success))]">
                     <CheckCircle className="w-3.5 h-3.5" /> {t('skills.installDone')}
                   </span>
                 ) : state === 'pre-installed' ? (
-                  <span className="flex items-center gap-1.5 text-xs text-cyber/70">
+                  <span className="flex items-center gap-1.5 text-xs text-[hsl(var(--brand-green)/0.72)]">
                     <CheckCircle className="w-3.5 h-3.5" /> {t('skills.installed')}
                   </span>
                 ) : state === 'error' ? (
@@ -396,7 +396,7 @@ function CommunitySkillsTab({ installedNames }: { installedNames: Set<string> })
                   <button
                     onClick={() => handleInstall(name)}
                     disabled={installing !== null}
-                    className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg bg-cyber/15 border border-cyber/30 text-cyber hover:bg-cyber/25 transition-colors disabled:opacity-50"
+                    className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg bg-[hsl(var(--brand-green)/0.10)] border border-[hsl(var(--brand-green)/0.25)] text-[hsl(var(--brand-green))] hover:bg-[hsl(var(--brand-green)/0.16)] transition-colors disabled:opacity-50"
                   >
                     <Download className="w-3.5 h-3.5" /> {t('skills.oneClickInstall')}
                   </button>
@@ -472,7 +472,7 @@ function ExternalSkillTab() {
   return (
     <div className="space-y-5 max-w-2xl">
       {/* Install Form */}
-      <div className="p-4 rounded-xl bg-cyber/5 border border-cyber/20">
+      <div className="p-4 rounded-xl bg-[hsl(var(--brand-green)/0.04)] border border-[hsl(var(--brand-green)/0.18)]">
         <h3 className="text-sm font-medium text-foreground mb-1">{t('skills.installExternal')}</h3>
         <p className="text-xs text-muted-foreground">
           {t('skills.installExternalDesc')}
@@ -489,13 +489,13 @@ function ExternalSkillTab() {
               onChange={(e) => setUrl(e.target.value)}
               placeholder="https://example.com/my-skill.zip"
               disabled={status === 'installing'}
-              className="w-full bg-muted/40 border border-border rounded-lg pl-9 pr-4 py-2.5 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-cyber/60 transition-colors disabled:opacity-50"
+              className="w-full bg-muted/40 border border-border rounded-lg pl-9 pr-4 py-2.5 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-[hsl(var(--brand-green)/0.45)] transition-colors disabled:opacity-50"
             />
           </div>
           <button
             onClick={handleInstall}
             disabled={!url.trim() || status === 'installing'}
-            className="flex items-center gap-2 px-4 py-2.5 rounded-lg bg-cyber/20 border border-cyber/40 text-cyber text-sm font-medium hover:bg-cyber/30 transition-colors disabled:opacity-50 shrink-0"
+            className="flex items-center gap-2 px-4 py-2.5 rounded-lg bg-[hsl(var(--brand-green)/0.10)] border border-[hsl(var(--brand-green)/0.25)] text-[hsl(var(--brand-green))] text-sm font-medium hover:bg-[hsl(var(--brand-green)/0.16)] transition-colors disabled:opacity-50 shrink-0"
           >
             {status === 'installing' ? (
               <><Loader2 className="w-4 h-4 animate-spin" /> {t('skills.installing2')}</>
@@ -510,7 +510,7 @@ function ExternalSkillTab() {
       {status === 'installing' && (
         <div className="space-y-2">
           <div className="h-2 bg-muted rounded-full overflow-hidden">
-            <div className="h-full bg-cyber rounded-full animate-pulse w-1/2 transition-all" />
+            <div className="h-full bg-[hsl(var(--brand-green))] rounded-full animate-pulse w-1/2 transition-all" />
           </div>
           <p className="text-xs text-muted-foreground">{t('skills.downloadingParsing')}</p>
         </div>
@@ -521,17 +521,17 @@ function ExternalSkillTab() {
         <div className={cn(
           'p-4 rounded-xl border space-y-2',
           status === 'done'
-            ? 'bg-green-500/5 border-green-500/20'
+            ? 'bg-[hsl(var(--success)/0.08)] border-[hsl(var(--success)/0.22)]'
             : 'bg-red-500/5 border-red-500/20'
         )}>
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
               {status === 'done' ? (
-                <CheckCircle className="w-4 h-4 text-green-400" />
+                <CheckCircle className="w-4 h-4 text-[hsl(var(--success))]" />
               ) : (
                 <AlertCircle className="w-4 h-4 text-red-400" />
               )}
-              <span className={cn('text-sm font-medium', status === 'done' ? 'text-green-400' : 'text-red-400')}>
+              <span className={cn('text-sm font-medium', status === 'done' ? 'text-[hsl(var(--success))]' : 'text-red-400')}>
                 {status === 'done' ? t('skills.evolutionTriggered') : t('skills.installFailed')}
               </span>
             </div>
@@ -551,15 +551,15 @@ function ExternalSkillTab() {
         <p className="text-xs font-medium text-muted-foreground">{t('skills.supportedFormats')}</p>
         <ul className="space-y-1.5 text-xs text-muted-foreground">
           <li className="flex items-center gap-2">
-            <span className="w-1.5 h-1.5 rounded-full bg-cyber/60" />
+            <span className="w-1.5 h-1.5 rounded-full bg-[hsl(var(--brand-green)/0.65)]" />
             {t('skills.fmt.githubDir')}
           </li>
           <li className="flex items-center gap-2">
-            <span className="w-1.5 h-1.5 rounded-full bg-cyber/60" />
+            <span className="w-1.5 h-1.5 rounded-full bg-[hsl(var(--brand-green)/0.65)]" />
             {t('skills.fmt.githubFile')}
           </li>
           <li className="flex items-center gap-2">
-            <span className="w-1.5 h-1.5 rounded-full bg-cyber/60" />
+            <span className="w-1.5 h-1.5 rounded-full bg-[hsl(var(--brand-green)/0.65)]" />
             {t('skills.fmt.zip')}
           </li>
         </ul>
@@ -567,7 +567,7 @@ function ExternalSkillTab() {
           href="https://github.com/blockcell-labs/blockcell/blob/main/docs/04_skill_system.md"
           target="_blank"
           rel="noopener noreferrer"
-          className="flex items-center gap-1.5 text-xs text-cyber hover:underline mt-2"
+          className="flex items-center gap-1.5 text-xs text-[hsl(var(--brand-green))] hover:underline mt-2"
         >
           <ExternalLink className="w-3.5 h-3.5" />
           {t('skills.devDocs')}
@@ -587,17 +587,17 @@ function ExternalSkillTab() {
               href={source.url}
               target="_blank"
               rel="noopener noreferrer"
-              className="flex items-start gap-3 p-4 rounded-xl border border-border/40 bg-card/60 hover:border-cyber/40 hover:bg-card transition-all group"
+              className="flex items-start gap-3 p-4 rounded-xl border border-border/40 bg-card/60 hover:border-[hsl(var(--brand-green)/0.35)] hover:bg-card transition-all group"
             >
-              <div className="p-2 rounded-lg bg-cyber/10 text-cyber shrink-0 group-hover:bg-cyber/20 transition-colors">
+              <div className="p-2 rounded-lg bg-[hsl(var(--brand-green)/0.10)] text-[hsl(var(--brand-green))] shrink-0 group-hover:bg-[hsl(var(--brand-green)/0.18)] transition-colors">
                 {source.icon}
               </div>
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2">
-                  <p className="text-sm font-medium text-foreground group-hover:text-cyber transition-colors">
+                  <p className="text-sm font-medium text-foreground group-hover:text-[hsl(var(--brand-green))] transition-colors">
                     {source.name}
                   </p>
-                  <ExternalLink className="w-3.5 h-3.5 text-muted-foreground group-hover:text-cyber transition-colors" />
+                  <ExternalLink className="w-3.5 h-3.5 text-muted-foreground group-hover:text-[hsl(var(--brand-green))] transition-colors" />
                 </div>
                 <p className="text-xs text-muted-foreground mt-0.5">{source.desc}</p>
               </div>
@@ -642,7 +642,7 @@ export function SkillsPage() {
               className={cn(
                 'flex items-center gap-2 px-4 py-3 text-sm font-medium border-b-2 transition-colors',
                 activeTab === tab.id
-                  ? 'border-cyber text-cyber'
+                  ? 'border-[hsl(var(--brand-green))] text-[hsl(var(--brand-green))]'
                   : 'border-transparent text-muted-foreground hover:text-foreground hover:border-border'
               )}
             >

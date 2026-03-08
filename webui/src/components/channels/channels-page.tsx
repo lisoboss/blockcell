@@ -37,8 +37,8 @@ const CHANNEL_COLORS: Record<string, string> = {
   slack: 'text-purple-400',
   feishu: 'text-cyan-400',
   dingtalk: 'text-orange-400',
-  wecom: 'text-green-400',
-  whatsapp: 'text-emerald-400',
+  wecom: 'text-[hsl(var(--brand-green))]',
+  whatsapp: 'text-[hsl(var(--brand-green))]',
   lark: 'text-sky-400',
 };
 
@@ -278,7 +278,7 @@ function ToggleSwitch({
       className={cn(
         'relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors focus:outline-none',
         disabled ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer',
-        enabled ? 'bg-cyber' : 'bg-muted'
+        enabled ? 'bg-[hsl(var(--brand-green))]' : 'bg-muted'
       )}
     >
       <span className={cn(
@@ -302,7 +302,7 @@ function ChannelCard({
 }) {
   const { locale } = useI18nStore();
   const t = useT();
-  const iconColor = CHANNEL_COLORS[channel.id] || 'text-cyber';
+  const iconColor = CHANNEL_COLORS[channel.id] || 'text-[hsl(var(--brand-green))]';
   const isActive = channel.configured;
   const owner = (channel.ownerAgent ?? '').trim();
   const accountCount = channel.accounts?.length ?? 0;
@@ -318,7 +318,7 @@ function ChannelCard({
       className={cn(
         'relative rounded-xl border p-5 flex flex-col gap-3 transition-all duration-200 cursor-pointer group',
         isActive
-          ? 'border-cyber/40 bg-cyber/5 shadow-md shadow-cyber/10'
+          ? 'border-[hsl(var(--brand-green)/0.24)] bg-[hsl(var(--brand-green)/0.04)] shadow-md shadow-[hsl(var(--brand-green)/0.08)]'
           : 'border-border/40 bg-card/60 opacity-70 hover:opacity-90'
       )}
       onClick={() => onConfigure(channel)}
@@ -331,7 +331,7 @@ function ChannelCard({
         <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
           <span className={cn(
             'text-xs',
-            !channel.configured ? 'text-muted-foreground/50' : channel.enabled ? 'text-cyber' : 'text-muted-foreground'
+            !channel.configured ? 'text-muted-foreground/50' : channel.enabled ? 'text-[hsl(var(--brand-green))]' : 'text-muted-foreground'
           )}>
             {channel.enabled ? t('channels.enabled') : t('channels.disabled')}
           </span>
@@ -374,11 +374,11 @@ function ChannelCard({
         {runtimeStatus && (
           <p className={cn(
             'text-xs mt-0.5 flex items-start gap-1.5',
-            runtimeActive ? 'text-emerald-400' : 'text-muted-foreground'
+            runtimeActive ? 'text-[hsl(var(--brand-green))]' : 'text-muted-foreground'
           )}>
             <span className={cn(
               'mt-1 h-1.5 w-1.5 shrink-0 rounded-full',
-              runtimeActive ? 'bg-emerald-400' : 'bg-muted-foreground/60'
+              runtimeActive ? 'bg-[hsl(var(--brand-green))]' : 'bg-muted-foreground/60'
             )} />
             <span>
               {t('channels.runtimeStatus')}: {runtimeActive ? t('channels.runtimeOnline') : t('channels.runtimeOffline')}
@@ -390,8 +390,8 @@ function ChannelCard({
 
       <div className="flex items-center gap-2 pt-1 border-t border-border/30">
         {isActive && (
-          <span className="flex items-center gap-1 text-xs text-cyber font-medium">
-            <span className="w-1.5 h-1.5 rounded-full bg-cyber animate-pulse" />
+          <span className="flex items-center gap-1 text-xs text-[hsl(var(--brand-green))] font-medium">
+            <span className="w-1.5 h-1.5 rounded-full bg-[hsl(var(--brand-green))] animate-pulse" />
             {t('channels.configured')}
           </span>
         )}
@@ -399,7 +399,7 @@ function ChannelCard({
           href={docUrl}
           target="_blank"
           rel="noopener noreferrer"
-          className="ml-auto text-xs text-muted-foreground hover:text-cyber transition-colors flex items-center gap-1"
+          className="ml-auto text-xs text-muted-foreground hover:text-[hsl(var(--brand-green))] transition-colors flex items-center gap-1"
           onClick={(e) => e.stopPropagation()}
         >
           {t('channels.docs')} <ExternalLink className="w-3 h-3" />
@@ -631,7 +631,7 @@ function ChannelDrawer({
         {/* Header */}
         <div className="flex items-center justify-between p-5 border-b border-border">
           <div className="flex items-center gap-3">
-            <span className={cn('text-xl', CHANNEL_COLORS[channel.id] || 'text-cyber')}>
+            <span className={cn('text-xl', CHANNEL_COLORS[channel.id] || 'text-[hsl(var(--brand-green))]')}>
               {CHANNEL_ICONS[channel.id] ?? <Globe className="w-5 h-5" />}
             </span>
             <div>
@@ -652,7 +652,10 @@ function ChannelDrawer({
               <p className="text-sm font-medium text-foreground">{t('channels.enableChannel')}</p>
               <p className="text-xs text-muted-foreground">{t('channels.enableChannelDesc')}</p>
             </div>
-            <ToggleSwitch enabled={enabled} onChange={setEnabled} />
+            <ToggleSwitch
+              enabled={enabled}
+              onChange={setEnabled}
+            />
           </div>
 
           {/* Fields */}
@@ -661,7 +664,7 @@ function ChannelDrawer({
             <select
               value={ownerAgent}
               onChange={(e) => setOwnerAgent(e.target.value)}
-              className="w-full bg-muted/40 border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:outline-none focus:border-cyber/60 transition-colors"
+              className="w-full bg-muted/40 border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:outline-none focus:border-[hsl(var(--brand-green)/0.45)] transition-colors"
             >
               <option value="">{t('channels.ownerUnbound')}</option>
               {ownerOptions.map((id) => (
@@ -698,7 +701,7 @@ function ChannelDrawer({
               value={defaultAccountId}
               onChange={(e) => setDefaultAccountId(e.target.value)}
               placeholder={t('channels.defaultAccountPlaceholder')}
-              className="w-full bg-muted/40 border border-border rounded-lg px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-cyber/60 transition-colors"
+              className="w-full bg-muted/40 border border-border rounded-lg px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-[hsl(var(--brand-green)/0.45)] transition-colors"
             />
           </div>
 
@@ -708,7 +711,7 @@ function ChannelDrawer({
               <button
                 type="button"
                 onClick={addAccount}
-                className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded border border-cyber/40 text-cyber hover:bg-cyber/10"
+                className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded border border-[hsl(var(--brand-green)/0.28)] text-[hsl(var(--brand-green))] hover:bg-[hsl(var(--brand-green)/0.08)]"
               >
                 <Plus className="w-3.5 h-3.5" />
                 {t('channels.addAccount')}
@@ -728,7 +731,7 @@ function ChannelDrawer({
                     value={draft.id}
                     onChange={(e) => updateAccountDraft(index, { id: e.target.value })}
                     placeholder={t('channels.accountId')}
-                    className="flex-1 bg-muted/40 border border-border rounded px-2 py-1.5 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-cyber/60"
+                    className="flex-1 bg-muted/40 border border-border rounded px-2 py-1.5 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-[hsl(var(--brand-green)/0.45)]"
                   />
                   <ToggleSwitch
                     enabled={draft.enabled}
@@ -751,7 +754,7 @@ function ChannelDrawer({
                   <select
                     value={draft.ownerAgent}
                     onChange={(e) => updateAccountDraft(index, { ownerAgent: e.target.value })}
-                    className="w-full bg-muted/40 border border-border rounded px-2 py-1.5 text-xs text-foreground focus:outline-none focus:border-cyber/60"
+                    className="w-full bg-muted/40 border border-border rounded px-2 py-1.5 text-xs text-foreground focus:outline-none focus:border-[hsl(var(--brand-green)/0.45)]"
                   >
                     <option value="">{t('channels.accountOwnerFallback')}</option>
                     {ownerOptions.map((id) => (
@@ -766,7 +769,7 @@ function ChannelDrawer({
                       type={spec.secret ? 'password' : 'text'}
                       value={draft.values[spec.key] ?? ''}
                       onChange={(e) => updateAccountField(index, spec.key, e.target.value)}
-                      className="w-full bg-muted/40 border border-border rounded px-2 py-1.5 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-cyber/60"
+                      className="w-full bg-muted/40 border border-border rounded px-2 py-1.5 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-[hsl(var(--brand-green)/0.45)]"
                     />
                   </div>
                 ))}
@@ -782,7 +785,7 @@ function ChannelDrawer({
                 value={fields[f.key] ?? ''}
                 onChange={(e) => setFields({ ...fields, [f.key]: e.target.value })}
                 placeholder={f.secret ? '\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022' : f.label}
-                className="w-full bg-muted/40 border border-border rounded-lg px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-cyber/60 transition-colors"
+                className="w-full bg-muted/40 border border-border rounded-lg px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-[hsl(var(--brand-green)/0.45)] transition-colors"
               />
             </div>
           ))}
@@ -799,7 +802,7 @@ function ChannelDrawer({
             href={docUrl}
             target="_blank"
             rel="noopener noreferrer"
-            className="flex items-center gap-2 text-xs text-muted-foreground hover:text-cyber transition-colors"
+            className="flex items-center gap-2 text-xs text-muted-foreground hover:text-[hsl(var(--brand-green))] transition-colors"
           >
             <ExternalLink className="w-3.5 h-3.5" />
             {t('channels.viewDocs', { name: channel.name })}
@@ -814,8 +817,8 @@ function ChannelDrawer({
             className={cn(
               'w-full flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-medium transition-all',
               saved
-                ? 'bg-green-500/20 border border-green-500/40 text-green-400'
-                : 'bg-cyber/20 border border-cyber/40 text-cyber hover:bg-cyber/30'
+                ? 'border border-[hsl(var(--success)/0.35)] bg-[hsl(var(--success)/0.12)] text-[hsl(var(--success))]'
+                : 'bg-[hsl(var(--brand-green)/0.10)] border border-[hsl(var(--brand-green)/0.25)] text-[hsl(var(--brand-green))] hover:bg-[hsl(var(--brand-green)/0.16)]'
             )}
           >
             {saving ? (
@@ -921,7 +924,7 @@ export function ChannelsPage() {
       <div className="flex-1 overflow-y-auto p-6">
         {loading ? (
           <div className="flex items-center justify-center py-20">
-            <Loader2 className="w-6 h-6 animate-spin text-cyber" />
+            <Loader2 className="w-6 h-6 animate-spin text-[hsl(var(--brand-green))]" />
           </div>
         ) : (
           <div className="grid grid-cols-2 gap-4 max-w-3xl">

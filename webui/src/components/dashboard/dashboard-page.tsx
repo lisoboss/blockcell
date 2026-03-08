@@ -103,7 +103,7 @@ export function DashboardPage() {
             icon={<Activity size={20} />}
             label={t('dashboard.status')}
             value={health?.status || '—'}
-            color={health?.status === 'ok' ? 'text-cyber' : 'text-red-500'}
+            color={health?.status === 'ok' ? 'text-[hsl(var(--brand-green))]' : 'text-red-500'}
           />
           <StatCard
             icon={<Cpu size={20} />}
@@ -163,7 +163,7 @@ export function DashboardPage() {
         {evolution.length > 0 && (
           <section>
             <h2 className="text-sm font-semibold mb-3 text-muted-foreground uppercase tracking-wider font-mono">
-              <span className="text-cyber">▸</span> {t('dashboard.recentEvolution')} ({evolution.length})
+              <span className="text-[hsl(var(--brand-green))]">▸</span> {t('dashboard.recentEvolution')} ({evolution.length})
             </h2>
             <div className="space-y-2">
               {evolution.slice(0, 10).map((rec: any, i: number) => (
@@ -220,7 +220,7 @@ function ToggleSwitch({ enabled, onChange }: { enabled: boolean; onChange: () =>
       onClick={(e) => { e.stopPropagation(); onChange(); }}
       className={`shrink-0 px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider border transition-all duration-150 cursor-pointer select-none ${
         enabled
-          ? 'bg-cyber/15 text-cyber border-cyber/40 hover:bg-cyber/25'
+          ? 'bg-[hsl(var(--brand-green)/0.10)] text-[hsl(var(--brand-green))] border-[hsl(var(--brand-green)/0.28)] hover:bg-[hsl(var(--brand-green)/0.16)]'
           : 'bg-red-500/15 text-red-400 border-red-500/40 hover:bg-red-500/25'
       }`}
       role="switch"

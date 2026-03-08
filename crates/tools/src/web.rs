@@ -14,7 +14,7 @@ impl Tool for WebSearchTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "web_search",
-            description: "Search the web. Supports two backends: Brave Search API (api_key) and Baidu AI Search API (baidu_api_key). For Chinese queries, Baidu is preferred. Configure keys in tools.web.search or env vars BAIDU_API_KEY. Set freshness for time-filtered results.",
+            description: "Search the web. REQUIRED: always provide a non-empty string parameter `query`; do not call this tool with `{}`. Optional parameters: `count` (number of results) and `freshness` (time filter). Supports two backends: Brave Search API (`api_key`) and Baidu AI Search API (`baidu_api_key`). For Chinese queries, Baidu is preferred. Configure keys in `tools.web.search` or env var `BAIDU_API_KEY`.",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -294,8 +294,6 @@ async fn baidu_search(
     Ok(results)
 }
 
-// ============ web_fetch ============
-
 pub struct WebFetchTool;
 
 #[async_trait]
@@ -303,7 +301,7 @@ impl Tool for WebFetchTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "web_fetch",
-            description: "Fetch a web page and return its content as clean Markdown. Uses 'Accept: text/markdown' content negotiation (Cloudflare Markdown for Agents) for optimal results — if the server supports it, markdown is returned directly with ~80% token savings. Otherwise, HTML is converted to markdown locally. Returns markdown_tokens estimate and content_signal when available.",
+            description: "Fetch a web page and return its content as clean Markdown. REQUIRED: always provide a valid `http` or `https` URL in parameter `url`; do not call this tool with `{}`. Optional parameters include `extractMode` and `maxChars`. Uses `Accept: text/markdown` content negotiation (Cloudflare Markdown for Agents) for optimal results — if the server supports it, markdown is returned directly with ~80% token savings. Otherwise, HTML is converted to markdown locally. Returns `markdown_tokens` estimate and `content_signal` when available.",
             parameters: json!({
                 "type": "object",
                 "properties": {

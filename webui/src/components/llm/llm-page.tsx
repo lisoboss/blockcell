@@ -277,7 +277,7 @@ export function LLMPage() {
             onClick={handleSave}
             disabled={saving}
             className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg transition-colors disabled:opacity-50 ${
-              saveStatus === 'saved' ? 'bg-cyber/10 text-cyber border border-cyber/30'
+              saveStatus === 'saved' ? 'bg-[hsl(var(--brand-green)/0.10)] text-[hsl(var(--brand-green))] border border-[hsl(var(--brand-green)/0.28)]'
               : saveStatus === 'error' ? 'bg-destructive/10 text-destructive border border-destructive/30'
               : 'bg-rust text-white hover:bg-rust/90'
             }`}
@@ -343,7 +343,7 @@ export function LLMPage() {
               {/* Save message */}
               {saveStatus !== 'idle' && saveMsg && (
                 <div className={`flex items-center gap-2 p-3 rounded-lg text-sm ${
-                  saveStatus === 'saved' ? 'bg-cyber/10 text-cyber border border-cyber/30' : 'bg-destructive/10 text-destructive border border-destructive/30'
+                  saveStatus === 'saved' ? 'bg-[hsl(var(--brand-green)/0.10)] text-[hsl(var(--brand-green))] border border-[hsl(var(--brand-green)/0.28)]' : 'bg-destructive/10 text-destructive border border-destructive/30'
                 }`}>
                   {saveStatus === 'saved' ? <CheckCircle size={13} /> : <AlertTriangle size={13} />}
                   {saveMsg}
@@ -452,7 +452,7 @@ export function LLMPage() {
                         <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
                           <span className="font-medium">{t('llm.currentEffect')}</span>
                           {selectedProviderConfig.proxy
-                            ? <span className="text-cyber font-mono">{selectedProviderConfig.proxy}</span>
+                            ? <span className="text-[hsl(var(--brand-green))] font-mono">{selectedProviderConfig.proxy}</span>
                             : <span className="text-amber-500">{t('llm.forceDirect')}</span>
                           }
                         </div>
@@ -476,7 +476,7 @@ export function LLMPage() {
                       {t('llm.testConnection')}
                     </button>
                     {testResult && (
-                      <div className={`flex items-center gap-1.5 text-xs ${testResult.ok ? 'text-cyber' : 'text-red-400'}`}>
+                      <div className={`flex items-center gap-1.5 text-xs ${testResult.ok ? 'text-[hsl(var(--brand-green))]' : 'text-red-400'}`}>
                         {testResult.ok ? <CheckCircle size={12} /> : <XCircle size={12} />}
                         <span>{testResult.msg}</span>
                       </div>

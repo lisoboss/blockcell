@@ -19,14 +19,14 @@ interface DeliverableFile {
 function getFileIcon(ext: string): React.ReactNode {
   switch (ext) {
     case 'pptx': case 'ppt': return <Presentation size={18} className="text-orange-400" />;
-    case 'xlsx': case 'xls': case 'csv': return <Table2 size={18} className="text-green-400" />;
+    case 'xlsx': case 'xls': case 'csv': return <Table2 size={18} className="text-[hsl(var(--brand-green))]" />;
     case 'docx': case 'doc': case 'pdf': case 'txt': case 'md':
       return <FileText size={18} className="text-blue-400" />;
     case 'png': case 'jpg': case 'jpeg': case 'webp': case 'svg': case 'gif':
       return <Image size={18} className="text-purple-400" />;
     case 'mp3': case 'wav': case 'mp4': case 'm4a': case 'mkv': case 'webm':
-      return <FileAudio size={18} className="text-pink-400" />;
-    default: return <File size={18} className="text-muted-foreground" />;
+      return <FileAudio size={18} className="text-[hsl(var(--brand-green))]" />;
+    default: return <File size={18} className="text-[hsl(var(--brand-green))]" />;
   }
 }
 

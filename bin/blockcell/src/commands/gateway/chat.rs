@@ -3,6 +3,27 @@ use super::*;
 // HTTP request / response types
 // ---------------------------------------------------------------------------
 
+pub(super) fn assign_session_id(chat_id: &str, agent_id: &str) -> String {
+    let trimmed = chat_id.trim();
+    if trimmed.is_empty() || trimmed == "default" {
+        return format!("{}:{}", agent_id, chrono::Utc::now().timestamp_millis());
+    }
+
+    if let Some(rest) = trimmed.strip_prefix(&format!("{}:", agent_id)) {
+        if rest.chars().all(|c| c.is_ascii_digit()) && rest.len() >= 10 {
+            return format!("{}:{}", agent_id, chrono::Utc::now().timestamp_millis());
+        }
+    }
+
+    if let Some(rest) = trimmed.strip_prefix(&format!("{}_", agent_id)) {
+        if rest.chars().all(|c| c.is_ascii_digit()) && rest.len() >= 10 {
+            return format!("{}:{}", agent_id, chrono::Utc::now().timestamp_millis());
+        }
+    }
+
+    trimmed.to_string()
+}
+
 #[derive(Deserialize)]
 pub(super) struct ChatRequest {
     content: String,
@@ -12,7 +33,7 @@ pub(super) struct ChatRequest {
     account_id: Option<String>,
     #[serde(default = "default_sender")]
     sender_id: String,
-    #[serde(default = "default_chat")]
+    #[serde(default)]
     chat_id: String,
     #[serde(default)]
     media: Vec<String>,
@@ -26,14 +47,11 @@ fn default_channel() -> String {
 fn default_sender() -> String {
     "user".to_string()
 }
-fn default_chat() -> String {
-    "default".to_string()
-}
-
 #[derive(Serialize)]
 struct ChatResponse {
     status: String,
     message: String,
+    session_id: String,
 }
 
 #[derive(Serialize)]
@@ -97,32 +115,37 @@ pub(super) async fn handle_chat(
     State(state): State<GatewayState>,
     Json(req): Json<ChatRequest>,
 ) -> impl IntoResponse {
-    let inbound = InboundMessage {
-        channel: req.channel,
-        account_id: req.account_id,
-        sender_id: req.sender_id,
-        chat_id: req.chat_id,
-        content: req.content,
-        media: req.media,
-        metadata: serde_json::Value::Null,
-        timestamp_ms: chrono::Utc::now().timestamp_millis(),
-    };
-
-    let inbound = match req.agent_id.as_deref() {
+    let resolved_agent_id = match req.agent_id.as_deref() {
         Some(requested) => match resolve_requested_agent_id(&state.config, Some(requested)) {
-            Ok(agent_id) => with_route_agent_id(inbound, &agent_id),
+            Ok(agent_id) => agent_id,
             Err(err) => {
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(ChatResponse {
                         status: "error".to_string(),
                         message: err,
+                        session_id: String::new(),
                     }),
                 )
             }
         },
-        None => inbound,
+        None => "default".to_string(),
     };
+
+    let session_id = assign_session_id(&req.chat_id, &resolved_agent_id);
+
+    let inbound = InboundMessage {
+        channel: req.channel,
+        account_id: req.account_id,
+        sender_id: req.sender_id,
+        chat_id: session_id.clone(),
+        content: req.content,
+        media: req.media,
+        metadata: serde_json::Value::Null,
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+    };
+
+    let inbound = with_route_agent_id(inbound, &resolved_agent_id);
 
     match state.inbound_tx.send(inbound).await {
         Ok(_) => (
@@ -130,6 +153,7 @@ pub(super) async fn handle_chat(
             Json(ChatResponse {
                 status: "accepted".to_string(),
                 message: "Message queued for processing".to_string(),
+                session_id: session_id.clone(),
             }),
         ),
         Err(e) => (
@@ -137,6 +161,7 @@ pub(super) async fn handle_chat(
             Json(ChatResponse {
                 status: "error".to_string(),
                 message: format!("Failed to queue message: {}", e),
+                session_id,
             }),
         ),
     }

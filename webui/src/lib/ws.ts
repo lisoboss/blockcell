@@ -3,6 +3,7 @@ export type WsEventType =
   | 'tool_call_start'
   | 'tool_call_result'
   | 'message_done'
+  | 'session_bound'
   | 'task_update'
   | 'confirm_request'
   | 'error'
@@ -18,6 +19,10 @@ export interface WsEvent {
   type: WsEventType;
   agent_id?: string;
   chat_id?: string;
+  client_chat_id?: string;
+  background_delivery?: boolean;
+  delivery_kind?: string;
+  cron_kind?: string;
   task_id?: string;
   delta?: string;
   content?: string;
@@ -46,7 +51,7 @@ export interface WsEvent {
   items?: any[];
 }
 
-export type DisconnectReason = 'none' | 'auth_failed' | 'network_error' | 'server_down' | 'connecting';
+export type DisconnectReason = 'none' | 'auth_failed' | 'network_error' | 'server_down' | 'connecting' | 'reconnect_exhausted';
 
 export interface ConnectionState {
   connected: boolean;
@@ -86,6 +91,7 @@ class WebSocketManager {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectDelay = 1000;
   private maxReconnectDelay = 30000;
+  private maxReconnectAttempts = 60;
   private url: string;
   private shouldReconnect = true;
   private _reconnectAttempt = 0;
@@ -99,6 +105,8 @@ class WebSocketManager {
 
   connect() {
     if (this.ws?.readyState === WebSocket.OPEN || this.ws?.readyState === WebSocket.CONNECTING) return;
+
+    if (this._reason === 'reconnect_exhausted') return;
 
     this.shouldReconnect = true;
     this._reason = 'connecting';
@@ -199,6 +207,7 @@ class WebSocketManager {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    this.shouldReconnect = true;
     this.ws?.close();
     this.ws = null;
     this.reconnectDelay = 1000;
@@ -242,6 +251,12 @@ class WebSocketManager {
 
   private scheduleReconnect() {
     if (this.reconnectTimer) return;
+    if (this._reconnectAttempt >= this.maxReconnectAttempts) {
+      this.shouldReconnect = false;
+      this._reason = 'reconnect_exhausted';
+      this.emitConnectionState();
+      return;
+    }
     this._reconnectAttempt++;
     const delay = this.reconnectDelay;
     this.emitConnectionState();
@@ -258,7 +273,7 @@ class WebSocketManager {
     }
   }
 
-  sendChat(content: string, chatId = 'default', media: string[] = [], agentId?: string) {
+  sendChat(content: string, chatId?: string, media: string[] = [], agentId?: string) {
     this.send({ type: 'chat', content, chat_id: chatId, media, agent_id: agentId });
   }
 

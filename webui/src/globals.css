@@ -4,23 +4,27 @@
 
 @layer base {
   :root {
-    --background: 210 20% 98%;
-    --foreground: 222 47% 11%;
-    --card: 0 0% 100%;
-    --card-foreground: 222 47% 11%;
+    --background: 35 44% 96%;
+    --foreground: 22 24% 18%;
+    --card: 36 41% 98%;
+    --card-foreground: 22 24% 18%;
     --primary: 21 90% 48%;
     --primary-foreground: 0 0% 100%;
-    --secondary: 210 20% 94%;
-    --secondary-foreground: 222 47% 11%;
-    --muted: 210 20% 94%;
-    --muted-foreground: 215 16% 47%;
-    --accent: 157 72% 94%;
-    --accent-foreground: 222 47% 11%;
+    --secondary: 32 32% 92%;
+    --secondary-foreground: 23 24% 21%;
+    --muted: 30 28% 90%;
+    --muted-foreground: 23 14% 40%;
+    --accent: 34 50% 88%;
+    --accent-foreground: 23 28% 24%;
     --destructive: 0 84.2% 60.2%;
     --destructive-foreground: 0 0% 98%;
-    --border: 214 20% 88%;
-    --input: 214 20% 88%;
-    --ring: 21 90% 48%;
+    --border: 30 24% 82%;
+    --input: 30 26% 84%;
+    --ring: 24 72% 52%;
+    --cyber: 143 34% 38%;
+    --success: 143 38% 40%;
+    --brand-green: 143 34% 38%;
+    --brand-green-strong: 143 36% 33%;
     --radius: 0.5rem;
   }
 
@@ -42,6 +46,10 @@
     --border: 217 33% 17%;
     --input: 215 25% 22%;
     --ring: 21 90% 48%;
+    --cyber: 157 100% 50%;
+    --success: 157 100% 50%;
+    --brand-green: 157 100% 50%;
+    --brand-green-strong: 157 100% 50%;
     --radius: 0.5rem;
   }
 }
@@ -82,7 +90,7 @@
   text-shadow: 0 0 10px rgba(234, 88, 12, 0.5);
 }
 .glow-text-green {
-  text-shadow: 0 0 10px rgba(0, 255, 157, 0.5);
+  text-shadow: 0 0 10px hsl(var(--cyber) / 0.5);
 }
 
 /* Dot-grid background pattern */
@@ -120,8 +128,16 @@
   @apply text-foreground/95;
 }
 
+.chat-markdown {
+  @apply text-foreground/90;
+}
+
 .prose-blockcell :where(p, ul, ol, blockquote, table, pre) {
   @apply my-2.5;
+}
+
+.prose-blockcell :where(h1, h2, h3, h4) {
+  @apply text-foreground;
 }
 
 .prose-blockcell :where(ul, ol) {
@@ -141,11 +157,15 @@
 }
 
 .prose-blockcell :where(a) {
-  @apply decoration-rust/50 underline-offset-2 transition-colors;
+  @apply text-primary decoration-primary/35 underline-offset-4 transition-colors;
+}
+
+.prose-blockcell :where(a:hover) {
+  @apply text-primary/80 decoration-primary/55;
 }
 
 .prose-blockcell :where(strong) {
-  @apply font-semibold;
+  @apply font-semibold text-foreground;
 }
 
 .prose-blockcell :where(hr) {
@@ -156,16 +176,32 @@
   @apply mb-0;
 }
 
+.prose-blockcell :where(blockquote) {
+  @apply border-l-primary/35 bg-muted/50 text-foreground/85 shadow-sm;
+}
+
 .prose-blockcell :where(code):not(:where(pre code)) {
-  @apply border border-border/60 bg-muted/80 text-rust;
+  @apply border border-border/60 bg-muted/70 text-primary/90;
+}
+
+.prose-blockcell :where(pre) {
+  @apply border border-border/60 shadow-sm;
 }
 
 .prose-blockcell :where(thead) {
-  @apply bg-muted/80;
+  @apply bg-muted/75;
 }
 
 .prose-blockcell :where(tbody tr:nth-child(even)) {
-  @apply bg-muted/30;
+  @apply bg-muted/25;
+}
+
+.prose-blockcell :where(th) {
+  @apply text-foreground/85;
+}
+
+.prose-blockcell :where(td) {
+  @apply text-foreground/80;
 }
 
 .prose-blockcell :where(img) {

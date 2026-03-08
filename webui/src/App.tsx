@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
+import { Bell, X } from 'lucide-react';
 import { Sidebar } from './components/sidebar';
 import { ChatPage } from './components/chat/chat-page';
 import { TasksPage } from './components/tasks/tasks-page';
@@ -21,10 +22,9 @@ import { SkillsPage } from './components/skills/skills-page';
 import { SetupWizard } from './components/setup-wizard';
 import { SystemEventsPanel } from './components/system-events-panel';
 import { ThemeProvider } from './components/theme-provider';
-import { useSidebarStore, useChatStore, useConnectionStore } from './lib/store';
+import { useSidebarStore, useChatStore, useConnectionStore, useReminderAlertsStore } from './lib/store';
 import { wsManager } from './lib/ws';
 import { cn } from './lib/utils';
-import { requestNotificationPermission } from './lib/notifications';
 import { registerShortcuts, handleGlobalKeyDown } from './lib/keyboard';
 
 interface ConfirmDialog {
@@ -34,8 +34,15 @@ interface ConfirmDialog {
 }
 
 export default function App() {
-  const { activePage, isOpen } = useSidebarStore();
-  const { setConnected, handleWsEvent } = useChatStore();
+  const { activePage, isOpen, setActivePage } = useSidebarStore();
+  const { setConnected, handleWsEvent, setCurrentSession, setPendingReminderFocus, setSessions } = useChatStore();
+  const chatSessions = useChatStore((s) => s.sessions);
+  const reminderAlerts = useReminderAlertsStore((s) => s.alerts);
+  const dismissReminderAlert = useReminderAlertsStore((s) => s.dismissAlert);
+  const selectedAgentId = typeof window === 'undefined'
+    ? 'default'
+    : (localStorage.getItem('blockcell_selected_agent') || 'default');
+  const visibleReminderAlerts = reminderAlerts.filter((alert) => alert.agentId === selectedAgentId);
   const [authenticated, setAuthenticated] = useState(() => !!localStorage.getItem('blockcell_token'));
   const [confirmDialog, setConfirmDialog] = useState<ConfirmDialog | null>(null);
   const [showWizard, setShowWizard] = useState(() => {
@@ -81,8 +88,6 @@ export default function App() {
       }
     });
 
-    requestNotificationPermission();
-
     registerShortcuts();
     window.addEventListener('keydown', handleGlobalKeyDown);
 
@@ -103,6 +108,24 @@ export default function App() {
     }
   }, [confirmDialog]);
 
+  const handleOpenReminder = useCallback((alertId: string, sessionId: string, content: string) => {
+    if (!chatSessions.some((session) => session.id === sessionId)) {
+      setSessions([
+        {
+          id: sessionId,
+          name: sessionId,
+          message_count: 1,
+          updated_at: new Date().toISOString(),
+        },
+        ...chatSessions,
+      ]);
+    }
+    setPendingReminderFocus(sessionId, content);
+    setCurrentSession(sessionId);
+    setActivePage('chat');
+    dismissReminderAlert(alertId);
+  }, [chatSessions, dismissReminderAlert, setActivePage, setCurrentSession, setPendingReminderFocus, setSessions]);
+
   if (!authenticated) {
     return (
       <ThemeProvider>
@@ -121,6 +144,48 @@ export default function App() {
             isOpen ? 'ml-64' : 'ml-16'
           )}
         >
+          {visibleReminderAlerts.length > 0 && (
+            <div className="absolute top-3 left-1/2 -translate-x-1/2 z-40 flex w-full max-w-2xl flex-col gap-3 px-4 pointer-events-none">
+              {visibleReminderAlerts.map((alert) => (
+                <div
+                  key={alert.id}
+                  className="pointer-events-auto rounded-xl border border-[hsl(var(--brand-green)/0.28)] bg-card/95 shadow-2xl backdrop-blur-sm"
+                >
+                  <div className="flex items-start gap-3 p-4">
+                    <div className="mt-0.5 rounded-full bg-[hsl(var(--brand-green)/0.12)] p-2 text-[hsl(var(--brand-green))]">
+                      <Bell size={16} />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <div className="text-sm font-semibold text-foreground">提醒到了</div>
+                      <div className="mt-1 text-sm text-muted-foreground whitespace-pre-wrap break-words">
+                        {alert.preview}
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => dismissReminderAlert(alert.id)}
+                      className="rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
+                    >
+                      <X size={14} />
+                    </button>
+                  </div>
+                  <div className="flex justify-end gap-2 border-t border-border px-4 py-3">
+                    <button
+                      onClick={() => dismissReminderAlert(alert.id)}
+                      className="px-3 py-1.5 text-sm rounded-lg border border-border hover:bg-accent transition-colors"
+                    >
+                      忽略
+                    </button>
+                    <button
+                      onClick={() => handleOpenReminder(alert.id, alert.sessionId, alert.content)}
+                      className="px-3 py-1.5 text-sm rounded-lg border border-[hsl(var(--brand-green)/0.28)] bg-[hsl(var(--brand-green)/0.10)] text-[hsl(var(--brand-green))] hover:bg-[hsl(var(--brand-green)/0.16)] transition-colors"
+                    >
+                      查看提醒
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
           {/* System events bell — top right corner */}
           <div className="absolute top-3 right-4 z-30">
             <SystemEventsPanel />
@@ -161,7 +226,7 @@ export default function App() {
                 <div>
                   <h2 className="font-semibold text-foreground">安全确认 / Security Confirmation</h2>
                   <p className="text-sm text-muted-foreground mt-1">
-                    工具 <code className="text-cyber font-mono">{confirmDialog.tool}</code> 请求访问工作区以外的路径：
+                    工具 <code className="font-mono text-[hsl(var(--brand-green))]">{confirmDialog.tool}</code> 请求访问工作区以外的路径：
                   </p>
                 </div>
               </div>
@@ -182,7 +247,7 @@ export default function App() {
                 </button>
                 <button
                   onClick={() => handleConfirm(true)}
-                  className="px-4 py-2 text-sm rounded-lg bg-cyber/20 border border-cyber/40 text-cyber hover:bg-cyber/30 transition-colors"
+                  className="px-4 py-2 text-sm rounded-lg border border-[hsl(var(--brand-green)/0.28)] bg-[hsl(var(--brand-green)/0.10)] text-[hsl(var(--brand-green))] hover:bg-[hsl(var(--brand-green)/0.16)] transition-colors"
                 >
                   允许 / Allow
                 </button>

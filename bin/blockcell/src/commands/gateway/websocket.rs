@@ -1,4 +1,5 @@
 use super::*;
+use crate::commands::gateway::chat::assign_session_id;
 // ---------------------------------------------------------------------------
 // P0: WebSocket with structured protocol
 // ---------------------------------------------------------------------------
@@ -90,10 +91,10 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("")
                                 .to_string();
-                            let chat_id = parsed
+                            let client_chat_id = parsed
                                 .get("chat_id")
                                 .and_then(|v| v.as_str())
-                                .unwrap_or("default")
+                                .unwrap_or("")
                                 .to_string();
                             let media: Vec<String> = parsed
                                 .get("media")
@@ -104,6 +105,35 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
                                         .collect()
                                 })
                                 .unwrap_or_default();
+
+                            let requested_agent_id = parsed.get("agent_id").and_then(|v| v.as_str());
+                            let resolved_agent_id = match requested_agent_id {
+                                Some(requested) => match resolve_requested_agent_id(&state.config, Some(requested)) {
+                                    Ok(agent_id) => agent_id,
+                                    Err(err) => {
+                                        let _ = ws_broadcast.send(
+                                            serde_json::to_string(&WsEvent::Error {
+                                                chat_id: client_chat_id.clone(),
+                                                message: err,
+                                            })
+                                            .unwrap_or_default(),
+                                        );
+                                        continue;
+                                    }
+                                },
+                                None => "default".to_string(),
+                            };
+
+                            let chat_id = assign_session_id(&client_chat_id, &resolved_agent_id);
+
+                            let _ = ws_broadcast.send(
+                                serde_json::to_string(&WsEvent::SessionBound {
+                                    client_chat_id: client_chat_id.clone(),
+                                    chat_id: chat_id.clone(),
+                                    agent_id: resolved_agent_id.clone(),
+                                })
+                                .unwrap_or_default(),
+                            );
 
                             let inbound = InboundMessage {
                                 channel: "ws".to_string(),
@@ -116,27 +146,12 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
                                 timestamp_ms: chrono::Utc::now().timestamp_millis(),
                             };
 
-                            let inbound = match parsed.get("agent_id").and_then(|v| v.as_str()) {
-                                Some(requested) => match resolve_requested_agent_id(&state.config, Some(requested)) {
-                                    Ok(agent_id) => with_route_agent_id(inbound, &agent_id),
-                                    Err(err) => {
-                                        let _ = ws_broadcast.send(
-                                            serde_json::to_string(&WsEvent::Error {
-                                                chat_id: chat_id.clone(),
-                                                message: err,
-                                            })
-                                            .unwrap_or_default(),
-                                        );
-                                        continue;
-                                    }
-                                },
-                                None => inbound,
-                            };
+                            let inbound = with_route_agent_id(inbound, &resolved_agent_id);
 
                             if let Err(e) = inbound_tx.send(inbound).await {
                                 let _ = ws_broadcast.send(
                                     serde_json::to_string(&WsEvent::Error {
-                                        chat_id: "default".to_string(),
+                                        chat_id: chat_id.clone(),
                                         message: format!("{}", e),
                                     })
                                     .unwrap_or_default(),

@@ -115,11 +115,12 @@ pub async fn add(
         enabled: true,
         schedule,
         payload: JobPayload {
-            kind: "agent_turn".to_string(),
+            kind: "reminder".to_string(),
             message,
             deliver,
             channel,
             to,
+            script_kind: None,
             skill_name: None,
         },
         state: JobState::default(),

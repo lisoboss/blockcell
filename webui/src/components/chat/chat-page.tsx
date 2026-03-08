@@ -53,15 +53,30 @@ export function ChatPage() {
     if (currentSessionId) {
       const isPersistedSession = sessions.some((s) => s.id === currentSessionId);
       if (isPersistedSession) {
-        loadSessionHistory(currentSessionId, selectedAgentId);
+        const currentMessages = useChatStore.getState().messages;
+        const hasOnlyOptimisticMessages = currentMessages.length > 0 && currentMessages.every((m) => m.id.startsWith('user_') || m.id.startsWith('msg_'));
+        if (!hasOnlyOptimisticMessages) {
+          loadSessionHistory(currentSessionId, selectedAgentId);
+        }
+      } else if (useChatStore.getState().messages.length > 0) {
+        setMessages([]);
       }
+    } else if (useChatStore.getState().messages.length > 0) {
+      setMessages([]);
     }
-  }, [currentSessionId, selectedAgentId, sessions]);
+  }, [currentSessionId, selectedAgentId, sessions, setMessages]);
 
   // Auto-scroll to bottom
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'auto', block: 'end' });
   }, [messages]);
+
+  useEffect(() => {
+    const highlighted = document.querySelector('[data-highlighted-message="true"]');
+    if (highlighted) {
+      highlighted.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+  }, [messages, currentSessionId]);
 
   // Auto-focus input
   useEffect(() => {
@@ -217,7 +232,8 @@ export function ChatPage() {
       timestamp: Date.now(),
     });
 
-    const chatId = currentSessionId.replace(/_/g, ':');
+    const hasPersistedSession = !!currentSessionId && sessions.some((s) => s.id === currentSessionId);
+    const chatId = hasPersistedSession ? currentSessionId.replace(/_/g, ':') : undefined;
 
     // Send via WebSocket
     wsManager.sendChat(content, chatId, mediaPaths, selectedAgentId);
@@ -227,6 +243,7 @@ export function ChatPage() {
 
   function handleCancel() {
     if (!isLoading || isCancelling) return;
+    if (!currentSessionId) return;
     const chatId = currentSessionId.replace(/_/g, ':');
     wsManager.sendCancel(chatId, selectedAgentId);
     setIsCancelling(true);

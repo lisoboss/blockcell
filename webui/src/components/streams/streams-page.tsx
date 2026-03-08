@@ -91,7 +91,7 @@ export function StreamsPage() {
   function statusIcon(status: string) {
     switch (status) {
       case 'connected':
-        return <Wifi size={14} className="text-cyber" />;
+        return <Wifi size={14} className="text-[hsl(var(--brand-green))]" />;
       case 'connecting':
         return <Loader2 size={14} className="text-amber-500 animate-spin" />;
       case 'error':
@@ -160,7 +160,7 @@ export function StreamsPage() {
                       <span className="font-medium text-sm font-mono truncate">{stream.stream_id}</span>
                       <span className={cn(
                         'text-[10px] px-1.5 py-0.5 rounded-full',
-                        stream.status === 'connected' ? 'bg-cyber/10 text-cyber' :
+                        stream.status === 'connected' ? 'bg-[hsl(var(--brand-green)/0.10)] text-[hsl(var(--brand-green))]' :
                         stream.status === 'error' ? 'bg-red-500/10 text-red-500' :
                         'bg-muted text-muted-foreground'
                       )}>
@@ -247,7 +247,7 @@ export function StreamsPage() {
                       {streamData[stream.stream_id]?.length > 0 && (
                         <div>
                           <h3 className="text-xs font-medium text-muted-foreground mb-1.5 uppercase tracking-wider">
-                            <span className="text-cyber">▸</span> Recent Messages ({streamData[stream.stream_id].length})
+                            <span className="text-[hsl(var(--brand-green))]">▸</span> Recent Messages ({streamData[stream.stream_id].length})
                           </h3>
                           <div className="max-h-48 overflow-y-auto space-y-1">
                             {streamData[stream.stream_id].slice(-20).reverse().map((msg: any, i: number) => (

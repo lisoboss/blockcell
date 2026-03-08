@@ -48,6 +48,7 @@ pub const GLOBAL_CORE_TOOL_NAMES: &[&str] = &[
     "list_tasks",
     "agent_status",
     "list_skills",
+    "cron",
     "toggle_manage",
 ];
 
@@ -260,24 +261,12 @@ impl ToolRegistry {
                         }
                     })
                 } else {
-                    // Lightweight schema: name + first sentence of description, no parameters
-                    let desc = schema.description;
-                    let short_desc = desc
-                        .split_once(". ")
-                        .map(|(first, _)| format!("{}.", first))
-                        .unwrap_or_else(|| {
-                            let chars: String = desc.chars().take(120).collect();
-                            if desc.chars().count() > 120 {
-                                format!("{}...", chars)
-                            } else {
-                                chars
-                            }
-                        });
+                    // Lightweight schema: keep the full description but omit parameters.
                     json!({
                         "type": "function",
                         "function": {
                             "name": schema.name,
-                            "description": short_desc,
+                            "description": schema.description,
                             "parameters": { "type": "object", "properties": {} }
                         }
                     })

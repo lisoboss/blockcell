@@ -266,7 +266,7 @@ export function AlertsPage() {
                     onClick={() => setExpandedId(expandedId === rule.id ? null : rule.id)}
                   >
                     {expandedId === rule.id ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-                    <div className={cn('w-2 h-2 rounded-full', rule.enabled ? 'bg-cyber' : 'bg-muted-foreground')} />
+                    <div className={cn('w-2 h-2 rounded-full', rule.enabled ? 'bg-[hsl(var(--brand-green))]' : 'bg-muted-foreground')} />
                     <span className="font-medium text-sm flex-1">{rule.name}</span>
                     <span className="text-xs font-mono text-muted-foreground">
                       {operatorLabel(rule.operator)} {rule.threshold}
@@ -282,7 +282,7 @@ export function AlertsPage() {
                         className="p-1 rounded hover:bg-accent"
                         title={rule.enabled ? 'Disable' : 'Enable'}
                       >
-                        {rule.enabled ? <Power size={14} className="text-cyber" /> : <PowerOff size={14} className="text-muted-foreground" />}
+                        {rule.enabled ? <Power size={14} className="text-[hsl(var(--brand-green))]" /> : <PowerOff size={14} className="text-muted-foreground" />}
                       </button>
                       <button
                         onClick={(e) => { e.stopPropagation(); handleDelete(rule.id); }}

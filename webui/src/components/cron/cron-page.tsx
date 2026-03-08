@@ -322,7 +322,7 @@ export function CronPage() {
                       <span
                         className={cn(
                           'text-[10px] px-1.5 py-0.5 rounded-full',
-                          job.enabled !== false ? 'bg-cyber/10 text-cyber' : 'bg-muted text-muted-foreground'
+                          job.enabled !== false ? 'bg-[hsl(var(--brand-green)/0.10)] text-[hsl(var(--brand-green))]' : 'bg-muted text-muted-foreground'
                         )}
                       >
                         {job.enabled !== false ? 'enabled' : 'disabled'}
@@ -334,7 +334,7 @@ export function CronPage() {
                     )}
                     {job.state?.last_status && (
                       <p className="text-xs mt-1">
-                        Last: <span className={job.state.last_status === 'ok' ? 'text-cyber' : 'text-red-500'}>
+                        Last: <span className={job.state.last_status === 'ok' ? 'text-[hsl(var(--brand-green))]' : 'text-red-500'}>
                           {job.state.last_status}
                         </span>
                         {job.state.last_error && (

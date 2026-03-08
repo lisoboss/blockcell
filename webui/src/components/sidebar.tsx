@@ -58,10 +58,6 @@ export function Sidebar() {
     loadSessions();
   }, [selectedAgentId]);
 
-  function newSessionId(agentId: string) {
-    return `${agentId}_${Date.now()}`;
-  }
-
   async function loadAgents() {
     try {
       const config = await getConfig();
@@ -74,7 +70,7 @@ export function Sidebar() {
       setAgents(derivedAgents);
       if (!derivedAgents.some((agent) => agent.id === selectedAgentId)) {
         setSelectedAgent('default');
-        setCurrentSession(newSessionId('default'));
+        setCurrentSession('');
       }
     } catch {
       setAgents([{ id: 'default', name: 'default' }]);
@@ -90,6 +86,10 @@ export function Sidebar() {
         return;
       }
       setSessions(data.sessions);
+      const currentId = useChatStore.getState().currentSessionId;
+      if (!currentId && data.sessions.length > 0) {
+        setCurrentSession(data.sessions[0].id);
+      }
       setNextCursor(data.next_cursor);
     } catch {
       // ignore
@@ -144,7 +144,8 @@ export function Sidebar() {
       await deleteSession(id, selectedAgentId);
       setSessions(sessions.filter((s) => s.id !== id));
       if (currentSessionId === id) {
-        setCurrentSession(newSessionId(selectedAgentId));
+        const remaining = sessions.filter((s) => s.id !== id);
+        setCurrentSession(remaining[0]?.id || '');
       }
     } catch {
       // ignore
@@ -154,7 +155,7 @@ export function Sidebar() {
   }
 
   function handleNewChat() {
-    setCurrentSession(newSessionId(selectedAgentId));
+    setCurrentSession('');
     setActivePage('chat');
   }
 
@@ -171,9 +172,9 @@ export function Sidebar() {
           <div className="flex items-center gap-2.5">
             <BlockcellLogo size="xs" className="shrink-0" />
             <span className="font-bold text-sm tracking-wider">
-              BLOCK<span className="text-cyber">CELL</span>
+              BLOCK<span className="text-[hsl(var(--brand-green))]">CELL</span>
             </span>
-            <span className={cn('w-2 h-2 rounded-full', isConnected ? 'bg-cyber' : 'bg-red-500')} />
+            <span className={cn('w-2 h-2 rounded-full', isConnected ? 'bg-[hsl(var(--brand-green))]' : 'bg-red-500')} />
           </div>
         ) : (
           <div className="mx-auto shrink-0">
@@ -198,7 +199,7 @@ export function Sidebar() {
                 const nextAgentId = e.target.value;
                 setSelectedAgent(nextAgentId);
                 setSessions([]);
-                setCurrentSession(newSessionId(nextAgentId));
+                setCurrentSession('');
               }}
               className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring"
             >
@@ -280,7 +281,7 @@ export function Sidebar() {
         {isOpen ? (
           <>
             <div className="flex items-center gap-1 text-xs text-muted-foreground">
-              {isConnected ? <Wifi size={12} className="text-cyber" /> : <WifiOff size={12} className="text-red-500" />}
+              {isConnected ? <Wifi size={12} className="text-[hsl(var(--brand-green))]" /> : <WifiOff size={12} className="text-red-500" />}
               <span>{isConnected ? t('sidebar.connected') : t('sidebar.disconnected')}</span>
             </div>
             <div className="flex items-center gap-0.5">

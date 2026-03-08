@@ -407,7 +407,7 @@ function GhostConfigPanel() {
           <p className="text-sm text-muted-foreground">{t('ghost.saving')}</p>
         )}
         {message && (
-          <p className={cn('text-sm animate-in fade-in', message.startsWith('Error') ? 'text-red-500' : 'text-green-500')}>
+          <p className={cn('text-sm animate-in fade-in', message.startsWith('Error') ? 'text-red-500' : 'text-[hsl(var(--success))]')}>
             {message}
           </p>
         )}

@@ -138,7 +138,7 @@ function AudioAttachment({ url, dlUrl, filename }: { url: string; dlUrl: string;
   return (
     <div className="flex flex-col gap-1.5 rounded-lg border border-border bg-card/50 p-3 max-w-sm">
       <div className="flex items-center gap-2 text-xs">
-        <FileAudio size={14} className="text-cyber shrink-0" />
+        <FileAudio size={14} className="text-[hsl(var(--brand-green))] shrink-0" />
         <span className="truncate font-medium">{filename}</span>
         <a href={dlUrl} download className="ml-auto text-muted-foreground hover:text-foreground">
           <Download size={14} />
@@ -158,7 +158,7 @@ function VideoAttachment({ url, dlUrl, filename }: { url: string; dlUrl: string;
         <source src={url} />
       </video>
       <div className="flex items-center gap-2 text-xs px-2 pb-2">
-        <Volume2 size={14} className="text-cyber shrink-0" />
+        <Volume2 size={14} className="text-[hsl(var(--brand-green))] shrink-0" />
         <span className="truncate">{filename}</span>
         <a href={dlUrl} download className="ml-auto text-muted-foreground hover:text-foreground">
           <Download size={14} />

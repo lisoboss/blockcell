@@ -464,7 +464,7 @@ pub(super) async fn handle_pool_status(State(state): State<GatewayState>) -> imp
 }
 
 /// Persona files that can be edited via the WebUI
-const PERSONA_FILES: &[&str] = &["AGENTS.md", "SOUL.md", "USER.md", "CONTEXT.md", "STYLE.md"];
+const PERSONA_FILES: &[&str] = &["AGENTS.md", "SOUL.md", "USER.md"];
 
 /// GET /v1/persona/files — list persona files with their content
 pub(super) async fn handle_persona_list(State(state): State<GatewayState>) -> impl IntoResponse {

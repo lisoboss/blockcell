@@ -166,7 +166,7 @@ function ConfigEditor({ onBack, t }: { onBack: () => void; t: (k: string, p?: Re
       {message && (
         <div className={cn(
           'mx-6 mt-4 px-4 py-2 rounded-lg text-sm flex items-center justify-between',
-          message.type === 'success' ? 'bg-cyber/10 text-cyber border border-cyber/20' : 'bg-red-500/10 text-red-500 border border-red-500/20'
+          message.type === 'success' ? 'bg-[hsl(var(--brand-green)/0.10)] text-[hsl(var(--brand-green))] border border-[hsl(var(--brand-green)/0.20)]' : 'bg-red-500/10 text-red-500 border border-red-500/20'
         )}>
           <span>{message.text}</span>
           <button onClick={() => setMessage(null)} className="p-0.5 hover:opacity-70"><X size={14} /></button>
@@ -408,7 +408,7 @@ export function ConfigPage() {
               {/* Save row */}
               <div className="flex items-center justify-between px-5 py-3 border-t border-border bg-muted/10">
                 {proxyMsg ? (
-                  <span className={`text-xs ${proxyMsg.type === 'success' ? 'text-cyber' : 'text-destructive'}`}>{proxyMsg.text}</span>
+                  <span className={`text-xs ${proxyMsg.type === 'success' ? 'text-[hsl(var(--brand-green))]' : 'text-destructive'}`}>{proxyMsg.text}</span>
                 ) : (
                   <span className="text-xs text-muted-foreground">
                     {proxyEnabled

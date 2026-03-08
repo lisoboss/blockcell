@@ -54,8 +54,8 @@ export function logout() {
 }
 
 // P0: Chat
-export function sendChat(content: string, chatId = 'default', media: string[] = [], agentId?: string) {
-  return request<{ status: string; message: string }>('/chat', {
+export function sendChat(content: string, chatId?: string, media: string[] = [], agentId?: string) {
+  return request<{ status: string; message: string; session_id: string }>('/chat', {
     method: 'POST',
     body: JSON.stringify({ content, chat_id: chatId, channel: 'ws', media, agent_id: agentId }),
   });
@@ -81,7 +81,13 @@ export function getSessionsPage(params?: { limit?: number; cursor?: number; agen
 }
 
 export function getSession(id: string, agentId?: string) {
-  return request<{ session_id: string; messages: ChatMsg[] }>(`/sessions/${id}${buildQuery({ agent: agentId })}`);
+  return request<{ session_id: string; messages: ChatMsg[] }>(`/sessions/${id}${buildQuery({ agent: agentId })}`)
+    .catch((error: Error) => {
+      if (error.message.startsWith('API 404:')) {
+        return { session_id: id, messages: [] };
+      }
+      throw error;
+    });
 }
 
 export function deleteSession(id: string, agentId?: string) {

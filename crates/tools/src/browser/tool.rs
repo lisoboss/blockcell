@@ -286,6 +286,13 @@ async fn action_navigate(session: &mut BrowserSession, params: &Value) -> Result
 
     let new_tab = params["new_tab"].as_bool().unwrap_or(false);
 
+    tracing::info!(
+        session = %session.name,
+        url = %url,
+        new_tab = new_tab,
+        "browse.navigate start"
+    );
+
     if new_tab {
         let target_id = session.cdp.create_target(url).await.map_err(cdp_err)?;
         let _ = session.cdp.activate_target(&target_id).await;
@@ -315,13 +322,20 @@ async fn action_navigate(session: &mut BrowserSession, params: &Value) -> Result
             .enable_domain("Accessibility")
             .await
             .map_err(cdp_err)?;
-        let _ = session.cdp.enable_domain("Target").await;
 
         session.cdp.navigate(url).await.map_err(cdp_err)?;
         session.current_url = Some(url.to_string());
 
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         let snap = take_snapshot(session, true).await?;
+
+        tracing::info!(
+            session = %session.name,
+            url = %url,
+            target_id = %target_id,
+            ref_count = snap.get("ref_count").and_then(|v| v.as_u64()).unwrap_or(0),
+            "browse.navigate success (new_tab)"
+        );
 
         return Ok(json!({
             "status": "navigated",
@@ -341,6 +355,13 @@ async fn action_navigate(session: &mut BrowserSession, params: &Value) -> Result
 
     // Auto-snapshot after navigation
     let snap = take_snapshot(session, true).await?;
+
+    tracing::info!(
+        session = %session.name,
+        url = %url,
+        ref_count = snap.get("ref_count").and_then(|v| v.as_u64()).unwrap_or(0),
+        "browse.navigate success"
+    );
 
     Ok(json!({
         "status": "navigated",
@@ -688,6 +709,17 @@ async fn action_execute_js(session: &mut BrowserSession, params: &Value) -> Resu
 }
 
 async fn action_get_content(session: &mut BrowserSession) -> Result<Value> {
+    let current_url = session
+        .current_url
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+
+    tracing::info!(
+        session = %session.name,
+        url = %current_url,
+        "browse.get_content start"
+    );
+
     // First try to get the full HTML for markdown conversion
     let html_result = session
         .cdp
@@ -701,9 +733,24 @@ async fn action_get_content(session: &mut BrowserSession) -> Result<Value> {
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
+    tracing::info!(
+        session = %session.name,
+        url = %current_url,
+        html_len = html.len(),
+        "browse.get_content html extracted"
+    );
+
     if !html.is_empty() {
         // Convert HTML to markdown for much better token efficiency
         let markdown = crate::html_to_md::html_to_markdown(html);
+
+        tracing::info!(
+            session = %session.name,
+            url = %current_url,
+            html_len = html.len(),
+            markdown_len = markdown.len(),
+            "browse.get_content markdown converted"
+        );
 
         let truncated = if markdown.len() > 50000 {
             format!(
@@ -734,6 +781,13 @@ async fn action_get_content(session: &mut BrowserSession) -> Result<Value> {
         .and_then(|r| r.get("value"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
+
+    tracing::info!(
+        session = %session.name,
+        url = %current_url,
+        text_len = text.len(),
+        "browse.get_content text fallback extracted"
+    );
 
     let truncated = if text.len() > 50000 {
         format!(

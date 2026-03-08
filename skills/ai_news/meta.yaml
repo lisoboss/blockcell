@@ -1,5 +1,5 @@
 name: ai_news
-description: "AI新闻聚合技能 — 直接抓取36氪、机器之心、量子位、InfoQ等权威AI科技媒体，无需搜索引擎，按日期去重排序，获取最新AI资讯"
+description: "AI新闻聚合技能 — 用CDP浏览器抓取网易科技等科技媒体页面内容，提取最新AI相关新闻并输出精简列表"
 requires:
   bins: []
   env: []
@@ -26,14 +26,15 @@ triggers:
   - "最新大模型"
   - "AI热点"
   - "热门AI"
-  - "36氪"
-  - "机器之心"
-  - "量子位"
+  - "网易科技"
+  - "网易"
+  - "163科技"
   - "AI weekly"
   - "AI news"
   - "latest AI"
   - "artificial intelligence news"
 capabilities:
+  - "browse"
   - "web_fetch"
 output_format: "markdown"
 fallback:

@@ -961,9 +961,17 @@ impl SkillEvolution {
         );
         prompt.push_str("- String methods: `.len()`, `.contains()`, `.split()`, `.trim()`, `.to_upper()`, `.to_lower()`\n");
         prompt.push_str("- Array methods: `.push()`, `.pop()`, `.len()`, `.filter()`, `.map()`\n");
+        prompt.push_str("- Built-in helpers: `len(value)`, `str_sub(text, start, len)`, `str_truncate(text, max_chars)`, `str_lines(text, max_lines)`, `arr_join(items, sep)`\n");
         prompt.push_str("- No classes/structs — use maps (object maps) `#{}` instead\n");
         prompt.push_str("- No `import`/`require` — all capabilities come from the host engine\n");
         prompt.push_str("- Print: `print(\"msg\");`\n\n");
+
+        prompt.push_str("## Stable Built-in Helper Functions\n");
+        prompt.push_str("- `len(value)` -> length of string / array / map, returns 0 for null-like values\n");
+        prompt.push_str("- `str_sub(text, start, len)` -> safe substring by character index\n");
+        prompt.push_str("- `str_truncate(text, max_chars)` -> truncate text safely at character boundary\n");
+        prompt.push_str("- `str_lines(text, max_lines)` -> return the first N lines as an array\n");
+        prompt.push_str("- `arr_join(items, sep)` -> join array items into a string\n\n");
 
         // Task description
         if is_manual {
@@ -1008,6 +1016,7 @@ impl SkillEvolution {
         // Output format — P0-2: always request complete script (never diff)
         prompt.push_str("## Output Format\n");
         prompt.push_str("Generate the COMPLETE SKILL.rhai file content.\n");
+        prompt.push_str("When the skill returns structured results, prefer returning `display_text` for final user-facing text. If the result still needs runtime/LLM polishing, return `summary_data` as a lightweight structured summary and keep large raw content out of `summary_data`.\n");
         prompt.push_str("If you output `meta.yaml`, it must follow the trigger rules below.\n\n");
         prompt.push_str(Self::trigger_rules_prompt());
         prompt.push_str("Output ONLY the Rhai code in a ```rhai code block.\n");
@@ -1024,9 +1033,8 @@ impl SkillEvolution {
         let mut prompt = String::new();
 
         prompt.push_str("You are a skill document writer for the blockcell agent framework.\n");
-        prompt.push_str(
-            "Your task is to write or improve a SKILL.md file — a prompt instruction document\n",
-        );
+        prompt
+            .push_str("Your task is to write or improve a SKILL.md file — a prompt instruction document\n");
         prompt.push_str(
             "that tells the AI agent how to handle specific user requests for this skill.\n\n",
         );
@@ -1090,6 +1098,8 @@ impl SkillEvolution {
             }
         }
 
+        prompt.push_str("## Result Contract\n");
+        prompt.push_str("If the skill can directly produce final user-facing text, return `display_text`. Otherwise return `summary_data` as a lightweight structured summary for runtime/LLM polishing. Do NOT place complete webpages, long markdown, or large raw logs into `summary_data`.\n\n");
         prompt.push_str("## Output Format\n");
         prompt.push_str("Generate the COMPLETE SKILL.md content.\n");
         prompt.push_str("Output the markdown content in a ```markdown code block.\n");
@@ -1138,9 +1148,9 @@ impl SkillEvolution {
         );
         prompt.push_str("- String methods: `.len()`, `.contains()`, `.split()`, `.trim()`, `.to_upper()`, `.to_lower()`\n");
         prompt.push_str("- Array methods: `.push()`, `.pop()`, `.len()`, `.filter()`, `.map()`\n");
-        prompt.push_str(
-            "- Map access: `m.key` or `m[\"key\"]`, check existence with `\"key\" in m`\n",
-        );
+        prompt.push_str("- Built-in helpers: `len(value)`, `str_sub(text, start, len)`, `str_truncate(text, max_chars)`, `str_lines(text, max_lines)`, `arr_join(items, sep)`\n");
+        prompt
+            .push_str("- Map access: `m.key` or `m[\"key\"]`, check existence with `\"key\" in m`\n");
         prompt
             .push_str("- Null coalescing: `value ?? default` (use instead of .get with default)\n");
         prompt.push_str("- Type conversion: `.to_string()`, `.to_int()`, `.to_float()`\n");
@@ -1148,6 +1158,13 @@ impl SkillEvolution {
         prompt.push_str("- No classes/structs — use maps (object maps) `#{}` instead\n");
         prompt.push_str("- No `import`/`require` — all capabilities come from the host engine\n");
         prompt.push_str("- Print: `print(\"msg\");`\n\n");
+
+        prompt.push_str("## Stable Built-in Helper Functions\n");
+        prompt.push_str("- `len(value)` -> length of string / array / map, returns 0 for null-like values\n");
+        prompt.push_str("- `str_sub(text, start, len)` -> safe substring by character index\n");
+        prompt.push_str("- `str_truncate(text, max_chars)` -> truncate text safely at character boundary\n");
+        prompt.push_str("- `str_lines(text, max_lines)` -> return the first N lines as an array\n");
+        prompt.push_str("- `arr_join(items, sep)` -> join array items into a string\n\n");
 
         // Task description
         if is_manual {
@@ -1201,6 +1218,7 @@ impl SkillEvolution {
         prompt.push_str(
             "Fix ALL the issues listed above and generate the COMPLETE corrected Rhai script.\n",
         );
+        prompt.push_str("If the skill can directly produce final user-facing text, return `display_text`. Otherwise return `summary_data` as a lightweight structured summary for runtime/LLM polishing. Do NOT place complete webpages, long markdown, or large raw logs into `summary_data`.\n");
         prompt.push_str("If you output `meta.yaml`, it must follow the trigger rules below.\n\n");
         prompt.push_str(Self::trigger_rules_prompt());
         prompt.push_str("Do NOT leave any of the reported issues unfixed.\n");
@@ -1412,6 +1430,7 @@ or\n\
 
         prompt.push_str("## Output Format\n");
         prompt.push_str("Generate the COMPLETE SKILL.py content.\n");
+        prompt.push_str("If the skill can directly produce final user-facing text, return `display_text`. Otherwise return `summary_data` as a lightweight structured summary for runtime/LLM polishing. Do NOT place complete webpages, long markdown, or large raw logs into `summary_data`.\n");
         prompt.push_str("Output the Python code in a ```python code block.\n");
         prompt.push_str("If you output `meta.yaml`, it must follow the trigger rules below.\n\n");
         prompt.push_str(Self::trigger_rules_prompt());
@@ -1505,6 +1524,7 @@ or\n\
 
         prompt.push_str("## Instructions\n");
         prompt.push_str("Fix ALL the issues listed above and generate the COMPLETE corrected SKILL.py content.\n");
+        prompt.push_str("If the skill can directly produce final user-facing text, return `display_text`. Otherwise return `summary_data` as a lightweight structured summary for runtime/LLM polishing. Do NOT place complete webpages, long markdown, or large raw logs into `summary_data`.\n");
         prompt.push_str("Output the Python code in a ```python code block.\n");
         prompt.push_str("If you output `meta.yaml`, it must follow the trigger rules below.\n\n");
         prompt.push_str(Self::trigger_rules_prompt());

@@ -215,7 +215,6 @@ impl SessionManager {
         cdp.enable_domain("DOM").await?;
         cdp.enable_domain("Network").await?;
         cdp.enable_domain("Accessibility").await?;
-        cdp.enable_domain("Target").await.ok(); // optional, may not be available on all browsers
 
         info!(
             session = session_name,

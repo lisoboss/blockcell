@@ -50,7 +50,7 @@ pub(super) struct CronCreateRequest {
 
 fn resolve_cron_skill_payload_kind(paths: &Paths, skill_name: Option<&str>) -> &'static str {
     let Some(skill_name) = skill_name else {
-        return "agent_turn";
+        return "reminder";
     };
 
     let user_dir = paths.skills_dir().join(skill_name);
@@ -61,14 +61,13 @@ fn resolve_cron_skill_payload_kind(paths: &Paths, skill_name: Option<&str>) -> &
     let has_md = user_dir.join("SKILL.md").exists() || builtin_dir.join("SKILL.md").exists();
 
     if has_rhai {
-        "skill_rhai"
+        "rhai"
     } else if has_py {
-        "skill_python"
+        "python"
     } else if has_md {
-        "skill_markdown"
+        "markdown"
     } else {
-        // Keep backward-compatible behavior when script type is unknown.
-        "skill_rhai"
+        "rhai"
     }
 }
 
@@ -118,10 +117,11 @@ pub(super) async fn handle_cron_create(
         Ok(value) => value,
         Err(err) => return Json(serde_json::json!({ "error": err })),
     };
-    let payload_kind = resolve_cron_skill_payload_kind(
-        &state.paths.for_agent(&agent_id),
-        req.skill_name.as_deref(),
-    );
+    let payload_kind = if req.skill_name.is_some() { "script" } else { "reminder" };
+    let script_kind = req
+        .skill_name
+        .as_deref()
+        .map(|skill_name| resolve_cron_skill_payload_kind(&state.paths.for_agent(&agent_id), Some(skill_name)));
 
     let job = CronJob {
         id: uuid::Uuid::new_v4().to_string(),
@@ -134,6 +134,7 @@ pub(super) async fn handle_cron_create(
             deliver: req.deliver,
             channel: req.deliver_channel,
             to: req.deliver_to,
+            script_kind: script_kind.map(|value| value.to_string()),
             skill_name: req.skill_name,
         },
         state: JobState::default(),

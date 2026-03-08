@@ -55,7 +55,7 @@ export function TasksPage() {
   const statusIcon: Record<string, React.ReactNode> = {
     Queued: <Clock size={14} className="text-muted-foreground" />,
     Running: <Loader2 size={14} className="text-rust animate-spin" />,
-    Completed: <CheckCircle size={14} className="text-cyber" />,
+    Completed: <CheckCircle size={14} className="text-[hsl(var(--brand-green))]" />,
     Failed: <XCircle size={14} className="text-red-500" />,
   };
 
@@ -117,7 +117,7 @@ export function TasksPage() {
                   <span className={cn(
                     'text-xs px-2 py-0.5 rounded-full',
                     task.status === 'Running' && 'bg-rust/10 text-rust',
-                    task.status === 'Completed' && 'bg-cyber/10 text-cyber',
+                    task.status === 'Completed' && 'bg-[hsl(var(--brand-green)/0.10)] text-[hsl(var(--brand-green))]',
                     task.status === 'Failed' && 'bg-red-500/10 text-red-500',
                     task.status === 'Queued' && 'bg-muted text-muted-foreground',
                   )}>

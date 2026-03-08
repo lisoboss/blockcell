@@ -5,6 +5,90 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 
+fn safe_char_boundary_prefix(s: &str, max_chars: i64) -> String {
+    if max_chars <= 0 {
+        return String::new();
+    }
+    let max_chars = max_chars as usize;
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => s[..idx].to_string(),
+        None => s.to_string(),
+    }
+}
+
+fn safe_char_substring(s: &str, start: i64, len: i64) -> String {
+    if len <= 0 {
+        return String::new();
+    }
+
+    let start = start.max(0) as usize;
+    let len = len.max(0) as usize;
+    let chars: Vec<char> = s.chars().collect();
+    if start >= chars.len() {
+        return String::new();
+    }
+    chars[start..(start + len).min(chars.len())]
+        .iter()
+        .collect::<String>()
+}
+
+fn take_lines(s: &str, max_lines: i64) -> rhai::Array {
+    if max_lines <= 0 {
+        return Vec::new();
+    }
+    s.lines()
+        .take(max_lines as usize)
+        .map(|line| Dynamic::from(line.to_string()))
+        .collect()
+}
+
+fn join_array_strings(items: rhai::Array, sep: String) -> String {
+    let mut out = String::new();
+    for (idx, item) in items.into_iter().enumerate() {
+        if idx > 0 {
+            out.push_str(&sep);
+        }
+        if item.is::<String>() {
+            out.push_str(&item.into_string().unwrap_or_default());
+        } else if item.is::<rhai::ImmutableString>() {
+            out.push_str(item.cast::<rhai::ImmutableString>().as_str());
+        } else {
+            let json = dynamic_to_json(&item);
+            match json {
+                Value::String(s) => out.push_str(&s),
+                other => out.push_str(&other.to_string()),
+            }
+        }
+    }
+    out
+}
+
+fn dynamic_len(val: Dynamic) -> i64 {
+    if val.is_unit() {
+        0
+    } else if val.is::<String>() {
+        val.into_string().unwrap_or_default().chars().count() as i64
+    } else if val.is::<rhai::ImmutableString>() {
+        val.cast::<rhai::ImmutableString>().chars().count() as i64
+    } else if val.is::<rhai::Array>() {
+        val.into_array().unwrap_or_default().len() as i64
+    } else if val.is::<Map>() {
+        val.try_cast::<Map>().map(|m| m.len() as i64).unwrap_or(0)
+    } else {
+        let json = dynamic_to_json(&val);
+        match json {
+            Value::String(s) => s.chars().count() as i64,
+            Value::Array(arr) => arr.len() as i64,
+            Value::Object(obj) => obj.len() as i64,
+            Value::Null => 0,
+            _ => 0,
+        }
+    }
+}
+
 /// Result of executing a skill's Rhai script.
 #[derive(Debug, Clone)]
 pub struct SkillDispatchResult {
@@ -159,6 +243,11 @@ impl SkillDispatcher {
             warn!(source = "SKILL.rhai", "{}", msg);
         });
 
+        // Register type-check helpers so scripts can call val.is_map(), val.is_string(), etc.
+        engine.register_fn("is_map", |val: Dynamic| -> bool { val.is::<Map>() });
+        engine.register_fn("is_string", |val: Dynamic| -> bool { val.is::<String>() });
+        engine.register_fn("is_array", |val: Dynamic| -> bool { val.is::<rhai::Array>() });
+
         // Register is_error(result) — check if a tool result is an error
         engine.register_fn("is_error", |val: Map| -> bool { val.contains_key("error") });
 
@@ -172,6 +261,21 @@ impl SkillDispatcher {
             let json = dynamic_to_json(&val);
             serde_json::to_string(&json).unwrap_or_default()
         });
+
+        // Stable Rhai helper functions for common string/array operations.
+        engine.register_fn("str_sub", |s: String, start: i64, len: i64| -> String {
+            safe_char_substring(&s, start, len)
+        });
+        engine.register_fn("str_truncate", |s: String, max_chars: i64| -> String {
+            safe_char_boundary_prefix(&s, max_chars)
+        });
+        engine.register_fn("str_lines", |s: String, max_lines: i64| -> rhai::Array {
+            take_lines(&s, max_lines)
+        });
+        engine.register_fn("arr_join", |items: rhai::Array, sep: String| -> String {
+            join_array_strings(items, sep)
+        });
+        engine.register_fn("len", |val: Dynamic| -> i64 { dynamic_len(val) });
 
         // Register from_json(string) — parse a JSON string to Dynamic
         engine.register_fn("from_json", |s: String| -> Dynamic {

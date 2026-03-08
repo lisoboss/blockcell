@@ -16,15 +16,15 @@ function fileIcon(entry: FileEntry) {
   if (entry.is_dir) return <Folder size={18} className="text-amber-500" />;
   switch (entry.type) {
     case 'image': return <Image size={18} className="text-purple-400" />;
-    case 'audio': return <FileAudio size={18} className="text-green-400" />;
-    case 'video': return <FileVideo size={18} className="text-blue-400" />;
+    case 'audio': return <FileAudio size={18} className="text-[hsl(var(--brand-green))]" />;
+    case 'video': return <FileVideo size={18} className="text-[hsl(var(--brand-green))]" />;
     case 'text': return <FileCode size={18} className="text-cyan-400" />;
     case 'json': return <FileCode size={18} className="text-amber-400" />;
     case 'pdf': return <FileText size={18} className="text-red-400" />;
     case 'office': return <FileText size={18} className="text-blue-500" />;
-    case 'archive': return <Archive size={18} className="text-muted-foreground" />;
-    case 'database': return <Database size={18} className="text-muted-foreground" />;
-    default: return <File size={18} className="text-muted-foreground" />;
+    case 'archive': return <Archive size={18} className="text-[hsl(var(--brand-green))]" />;
+    case 'database': return <Database size={18} className="text-[hsl(var(--brand-green))]" />;
+    default: return <File size={18} className="text-[hsl(var(--brand-green))]" />;
   }
 }
 

@@ -14,7 +14,7 @@ export async function requestNotificationPermission(): Promise<boolean> {
   return permissionGranted;
 }
 
-export function sendNotification(title: string, body: string, options?: { tag?: string; icon?: string }) {
+export function sendNotification(title: string, body: string, options?: { tag?: string; icon?: string; onClick?: () => void }) {
   if (!('Notification' in window)) return;
   if (Notification.permission !== 'granted') return;
   // Don't notify if window is focused
