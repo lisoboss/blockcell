@@ -5,6 +5,10 @@ This repo contains **blockcell**, a self-evolving AI agent framework in Rust.
 - It runs as an interactive CLI (`blockcell agent`) or a daemon (`blockcell gateway`).
 - It supports tool-calling, a built-in tool registry, background tasks/subagents, and a WebUI.
 
+This guide is the recommended **single-agent best practice**.
+
+If you want multi-agent routing with multiple channel accounts, use `QUICKSTART.multi-agent.md` instead.
+
 ## 1) Install
 
 ### Option A: Install script (recommended)
@@ -33,7 +37,64 @@ For first-time setup, the recommended flow is:
 blockcell setup
 ```
 
-It creates `~/.blockcell/`, saves provider settings, and auto-fills a default `channelOwners` binding when you enable an external channel. If you later want different accounts of the same channel to route to different agents, add `channelAccountOwners` manually. If you prefer the older manual flow, you can still run `blockcell onboard` and edit `~/.blockcell/config.json` yourself.
+That creates `~/.blockcell/`, saves provider settings, and can also enable one external channel for you.
+
+Minimal example (`~/.blockcell/config.json`):
+
+```json
+{
+  "providers": {
+    "deepseek": {
+      "apiKey": "YOUR_DEEPSEEK_API_KEY",
+      "apiBase": "https://api.deepseek.com"
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": "deepseek-chat"
+    }
+  }
+}
+```
+
+Single-agent best practices:
+
+- Keep everything on the implicit `default` agent first.
+- Do not add `agents.list` unless you actually need separate routing or behavior.
+- Start without external channels, or enable only one channel until the core workflow is stable.
+- Keep `gateway.apiToken` and `gateway.webuiPass` set before exposing the daemon beyond localhost.
+
+Optional single Telegram channel example:
+
+```json
+{
+  "providers": {
+    "deepseek": {
+      "apiKey": "YOUR_DEEPSEEK_API_KEY",
+      "apiBase": "https://api.deepseek.com"
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": "deepseek-chat"
+    }
+  },
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "token": "123456:SINGLE_BOT_TOKEN",
+      "allowFrom": ["alice"]
+    }
+  },
+  "channelOwners": {
+    "telegram": "default"
+  },
+  "gateway": {
+    "apiToken": "YOUR_STABLE_API_TOKEN",
+    "webuiPass": "YOUR_WEBUI_PASSWORD"
+  }
+}
+```
 
 ## 3) Run (interactive)
 
@@ -44,6 +105,7 @@ blockcell agent
 
 Tips:
 
+- `blockcell agent` enters the implicit `default` agent.
 - Type `/tasks` to see background tasks.
 - Type `/quit` to exit.
 

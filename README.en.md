@@ -111,7 +111,7 @@ Each guide includes:
 - 💬 Interaction methods
 - ⚠️ Troubleshooting common issues
 
-### 🏗️ Rust Host + Rhai Skills Architecture
+### 🏗️ Rust Host + Three Skill Forms
 
 ```
 ┌─────────────────────────────────────────────┐
@@ -121,14 +121,16 @@ Each guide includes:
 └─────────────────────────────────────────────┘
                      ↕
 ┌─────────────────────────────────────────────┐
-│       Rhai Skills (Mutable Layer)           │
-│  Custom skills | Auto-generated code        │
-│  Evolvable | Sandboxed | Hot-reloadable     │
+│         Skills Layer (Mutable Layer)        │
+│  Pure Markdown | Markdown + Rhai            │
+│  Markdown + Python                          │
 └─────────────────────────────────────────────┘
 ```
 
 - **Rust host**: Immutable, secure, high-performance foundation
-- **Rhai skills**: Flexible, evolvable, AI-generated capabilities
+- **Pure Markdown skills**: define behavior with `SKILL.md` only, ideal for knowledge and workflow-oriented skills
+- **Markdown + Rhai skills**: combine `SKILL.md` with `SKILL.rhai` for structured orchestration and tool calling
+- **Markdown + Python skills**: combine `SKILL.md` with Python scripts for heavier data processing, integrations, and execution logic
 
 ---
 
@@ -202,35 +204,94 @@ Minimal configuration example (`~/.blockcell/config.json`):
 ```json
 {
   "providers": {
-    "openrouter": {
+    "deepseek": {
       "apiKey": "YOUR_API_KEY",
-      "apiBase": "https://openrouter.ai/api/v1"
+      "apiBase": "https://api.deepseek.com"
     }
   },
   "agents": {
     "defaults": {
-      "model": "anthropic/claude-sonnet-4-20250514"
+      "model": "deepseek-chat"
     }
   }
 }
 ```
 
-To enable multi-agent routing plus external channels, you can extend it with:
+To enable multi-agent routing plus external channels, extend it using the structure currently supported by the codebase. For example, this is a valid "2 agents + 2 Telegram accounts" layout:
 
 ```json
 {
   "agents": {
+    "defaults": {
+      "model": "deepseek-chat"
+    },
     "list": [
-      { "id": "ops", "enabled": true, "intentProfile": "ops" }
+      {
+        "id": "default",
+        "enabled": true,
+        "name": "General Assistant",
+        "intentProfile": "default"
+      },
+      {
+        "id": "ops",
+        "enabled": true,
+        "name": "Operations Assistant",
+        "intentProfile": "ops",
+        "maxToolIterations": 12
+      }
     ]
   },
+  "intentRouter": {
+    "enabled": true,
+    "defaultProfile": "default",
+    "agentProfiles": {
+      "default": "default",
+      "ops": "ops"
+    },
+    "profiles": {
+      "default": {
+        "coreTools": ["read_file", "write_file", "list_dir", "web_fetch", "message"],
+        "intentTools": {
+          "Chat": { "inheritBase": false, "tools": [] },
+          "FileOps": ["read_file", "write_file", "list_dir"],
+          "WebSearch": ["web_search", "web_fetch"]
+        }
+      },
+      "ops": {
+        "coreTools": ["http_request", "message", "notification", "alert_rule", "list_tasks"],
+        "intentTools": {
+          "DevOps": ["http_request", "notification", "alert_rule", "list_tasks"],
+          "Communication": ["message", "notification"]
+        },
+        "denyTools": ["write_file", "exec"]
+      }
+    }
+  },
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "accounts": {
+        "main_bot": {
+          "enabled": true,
+          "token": "123456:MAIN_BOT_TOKEN",
+          "allowFrom": ["alice"]
+        },
+        "ops_bot": {
+          "enabled": true,
+          "token": "123456:OPS_BOT_TOKEN",
+          "allowFrom": ["oncall_group"]
+        }
+      },
+      "defaultAccountId": "main_bot"
+    }
+  },
   "channelOwners": {
-    "telegram": "default",
-    "slack": "ops"
+    "telegram": "default"
   },
   "channelAccountOwners": {
     "telegram": {
-      "bot2": "ops"
+      "main_bot": "default",
+      "ops_bot": "ops"
     }
   },
   "gateway": {
@@ -239,6 +300,17 @@ To enable multi-agent routing plus external channels, you can extend it with:
   }
 }
 ```
+
+Notes:
+
+- `agents.list` should use fields actually supported by the code, such as `id`, `enabled`, `name`, `intentProfile`, and `maxToolIterations`
+- `intentRouter` currently supports `enabled`, `defaultProfile`, `agentProfiles`, and `profiles`
+- Each `profiles.<name>` entry can define `coreTools`, `intentTools`, and `denyTools`
+- Telegram multi-account config belongs under `channels.telegram.accounts`, and each account uses `enabled`, `token`, and `allowFrom`
+- Channel-level routing uses `channelOwners`
+- Account-level overrides use `channelAccountOwners`
+- If you only need a single agent, use the minimal config above or read `QUICKSTART.md`
+- If you want the full multi-agent walkthrough, read `QUICKSTART.multi-agent.md`
 
 ### Supported LLM Providers
 
@@ -269,7 +341,8 @@ For full functionality, install these tools:
 
 ## 📚 Documentation
 
-- [Quick Start Guide](QUICKSTART.md)
+- [Quick Start Guide (Single Agent)](QUICKSTART.md)
+- [Quick Start Guide (Multi-Agent)](QUICKSTART.multi-agent.md)
 - [Architecture Deep Dive](docs/en/12_architecture.md)
 - [Tool System](docs/en/03_tools_system.md)
 - [Skill System](docs/en/04_skill_system.md)

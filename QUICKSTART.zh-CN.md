@@ -5,6 +5,10 @@
 - 你可以用交互式 CLI 运行（`blockcell agent`），也可以用守护进程模式运行（`blockcell gateway`）。
 - 支持 Tool Calling（工具调用）、内置工具注册表、子任务/子代理后台执行、以及 WebUI。
 
+本指南是推荐的 **单 agent 最佳实践**。
+
+如果你需要多 agent 路由和多渠道账号，请改看 `QUICKSTART.multi-agent.zh-CN.md`。
+
 ## 1）安装
 
 ### 方式 A：安装脚本（推荐）
@@ -33,7 +37,64 @@ cargo build -p blockcell --release
 blockcell setup
 ```
 
-它会自动创建 `~/.blockcell/`、写入 provider 配置，并在你启用外部渠道时自动补 `channelOwners` 的默认绑定。若你后续需要把同一渠道的不同账号路由到不同 agent，可以再手动补 `channelAccountOwners`。若你更喜欢旧流程，也仍可执行 `blockcell onboard` 后手动编辑 `~/.blockcell/config.json`。
+它会自动创建 `~/.blockcell/`、写入 provider 配置，也可以顺手帮你启用一个外部渠道。
+
+最小示例（`~/.blockcell/config.json`）：
+
+```json
+{
+  "providers": {
+    "deepseek": {
+      "apiKey": "YOUR_DEEPSEEK_API_KEY",
+      "apiBase": "https://api.deepseek.com"
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": "deepseek-chat"
+    }
+  }
+}
+```
+
+单 agent 最佳实践：
+
+- 先把所有能力都跑在隐式 `default` agent 上。
+- 只有在确实需要独立路由或独立行为时，再增加 `agents.list`。
+- 一开始不要同时接太多外部渠道，最多先启用一个渠道验证主流程。
+- 如果要对外暴露 daemon，先把 `gateway.apiToken` 和 `gateway.webuiPass` 配好。
+
+可选的单 Telegram 渠道示例：
+
+```json
+{
+  "providers": {
+    "deepseek": {
+      "apiKey": "YOUR_DEEPSEEK_API_KEY",
+      "apiBase": "https://api.deepseek.com"
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": "deepseek-chat"
+    }
+  },
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "token": "123456:SINGLE_BOT_TOKEN",
+      "allowFrom": ["alice"]
+    }
+  },
+  "channelOwners": {
+    "telegram": "default"
+  },
+  "gateway": {
+    "apiToken": "YOUR_STABLE_API_TOKEN",
+    "webuiPass": "YOUR_WEBUI_PASSWORD"
+  }
+}
+```
 
 ## 3）交互模式运行
 
@@ -44,6 +105,7 @@ blockcell agent
 
 小技巧：
 
+- `blockcell agent` 进入隐式的 `default` agent。
 - 输入 `/tasks` 查看后台任务。
 - 输入 `/quit` 退出。
 
