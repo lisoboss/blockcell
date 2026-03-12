@@ -3,6 +3,7 @@ pub mod config;
 pub mod error;
 pub mod mcp_config;
 pub mod message;
+pub mod path_policy;
 pub mod paths;
 pub mod session_key;
 pub mod system_event;

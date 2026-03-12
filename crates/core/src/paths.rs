@@ -131,6 +131,10 @@ impl Paths {
         self.base.join("channel_contacts.json")
     }
 
+    pub fn path_access_file(&self) -> PathBuf {
+        self.base.join("path_access.json5")
+    }
+
     pub fn toggles_file(&self) -> PathBuf {
         self.workspace().join("toggles.json")
     }

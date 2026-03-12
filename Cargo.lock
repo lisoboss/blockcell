@@ -481,6 +481,7 @@ dependencies = [
  "chrono",
  "dirs",
  "futures",
+ "md5",
  "prost",
  "reqwest",
  "serde",

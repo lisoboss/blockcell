@@ -1152,6 +1152,57 @@ fn default_tick_interval() -> u32 {
     30
 }
 
+/// Configuration for the path-access policy system.
+/// Points to the separate `path_access.json5` rules file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PathAccessConfig {
+    /// Whether the path-access policy system is active.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Path to the rules file. Supports `~/` expansion.
+    #[serde(default = "default_path_access_policy_file")]
+    pub policy_file: String,
+
+    /// Behavior when the policy file is missing or unparseable.
+    /// One of: `"fallback_to_safe_default"` | `"fail_closed"` | `"disabled"`
+    #[serde(default = "default_missing_file_policy")]
+    pub missing_file_policy: String,
+
+    /// Reserved for future hot-reload support.
+    #[serde(default)]
+    pub reload_on_change: bool,
+}
+
+fn default_path_access_policy_file() -> String {
+    "~/.blockcell/path_access.json5".to_string()
+}
+
+fn default_missing_file_policy() -> String {
+    "fallback_to_safe_default".to_string()
+}
+
+impl Default for PathAccessConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            policy_file: default_path_access_policy_file(),
+            missing_file_policy: default_missing_file_policy(),
+            reload_on_change: false,
+        }
+    }
+}
+
+/// Top-level security settings for the agent runtime.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SecurityConfig {
+    /// Path-access policy rules.
+    #[serde(default)]
+    pub path_access: PathAccessConfig,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AutoUpgradeConfig {
@@ -1209,6 +1260,8 @@ pub struct Config {
     pub intent_router: Option<IntentRouterConfig>,
     #[serde(default)]
     pub auto_upgrade: AutoUpgradeConfig,
+    #[serde(default)]
+    pub security: SecurityConfig,
 }
 
 impl Default for Config {
@@ -1341,6 +1394,7 @@ impl Default for Config {
             tools: ToolsConfig::default(),
             intent_router: Some(IntentRouterConfig::default()),
             auto_upgrade: AutoUpgradeConfig::default(),
+            security: SecurityConfig::default(),
         }
     }
 }

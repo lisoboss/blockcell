@@ -1,3 +1,4 @@
+use blockcell_core::path_policy::{PathOp, PathPolicy, PolicyAction};
 use blockcell_core::system_event::{EventPriority, EventScope, SessionSummary, SystemEvent};
 use blockcell_core::types::{ChatMessage, ToolCallRequest};
 use blockcell_core::{Config, InboundMessage, OutboundMessage, Paths, Result};
@@ -787,9 +788,52 @@ fn is_dangerous_exec_command(command: &str) -> bool {
         return false;
     }
 
-    // Commands that can terminate the agent itself or disrupt system services.
-    // ExecTool already blocks some destructive patterns (rm -rf /, shutdown, reboot...),
-    // but it does NOT block kill/pkill/killall.
+    let direct_patterns = [
+        r"(^|[;&|]\s*|\b(?:sudo|env)\s+)(?:rm|trash|unlink)\b",
+        r"(^|[;&|]\s*|\b(?:sudo|env)\s+)rmdir\b",
+        r"\bfind\b[\s\S]*\s-delete\b",
+        r"\bfind\b[\s\S]*\s-exec\s+rm\b",
+        r#"\bsh\s+-c\s+['"][^'"]*\brm\b"#,
+        r#"\bbash\s+-c\s+['"][^'"]*\brm\b"#,
+        r#"\bzsh\s+-c\s+['"][^'"]*\brm\b"#,
+        r"\bpython(?:3)?\b[\s\S]*\b(?:shutil\.rmtree|os\.remove|os\.unlink|os\.rmdir)\b",
+        r"\bperl\b[\s\S]*\bunlink\b",
+    ];
+    for pattern in direct_patterns {
+        if let Ok(re) = Regex::new(pattern) {
+            if re.is_match(c) {
+                return true;
+            }
+        }
+    }
+
+    if let Ok(rm_re) = Regex::new(r"(^|[;&|]\s*|\b(?:sudo|env)\s+)rm\b([^;&|]*)") {
+        for caps in rm_re.captures_iter(c) {
+            let suffix = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+            let has_recursive = suffix.contains(" -r")
+                || suffix.contains(" -rf")
+                || suffix.contains(" -fr")
+                || suffix.starts_with("-r")
+                || suffix.starts_with("-rf")
+                || suffix.starts_with("-fr");
+            let has_force = suffix.contains(" -f")
+                || suffix.contains(" -rf")
+                || suffix.contains(" -fr")
+                || suffix.starts_with("-f")
+                || suffix.starts_with("-rf")
+                || suffix.starts_with("-fr");
+            let has_target = suffix
+                .split_whitespace()
+                .any(|token| !token.starts_with('-') && !token.is_empty());
+            if has_target && (has_recursive || has_force) {
+                return true;
+            }
+            if has_target && suffix.contains("../") {
+                return true;
+            }
+        }
+    }
+
     let dangerous = [
         "kill ",
         "pkill",
@@ -832,6 +876,42 @@ fn overwrite_last_assistant_message(history: &mut [ChatMessage], new_text: &str)
             last.content = serde_json::Value::String(new_text.to_string());
         }
     }
+}
+
+/// Load (or initialise) the path-access policy from the location specified
+/// in `config.security.path_access`.
+///
+/// Side-effect: writes the default template to disk if the file doesn't exist
+/// and the configured path matches the standard `~/.blockcell/path_access.json5`
+/// location, so first-time users get a ready-to-edit example.
+fn load_path_policy(config: &Config, paths: &Paths) -> PathPolicy {
+    use blockcell_core::path_policy::{default_policy_template, expand_tilde};
+
+    let pa = &config.security.path_access;
+    if !pa.enabled {
+        return PathPolicy::safe_default();
+    }
+
+    // Resolve the configured policy-file path (supports ~/ expansion)
+    let policy_path = if pa.policy_file.trim().is_empty() {
+        paths.path_access_file()
+    } else {
+        expand_tilde(pa.policy_file.trim())
+    };
+
+    // Bootstrap: if the file doesn't exist, write the starter template
+    if !policy_path.exists() {
+        if let Some(parent) = policy_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = std::fs::write(&policy_path, default_policy_template()) {
+            warn!(path = %policy_path.display(), error = %e, "Failed to write default path_access.json5 template");
+        } else {
+            info!(path = %policy_path.display(), "Wrote default path_access.json5 template");
+        }
+    }
+
+    PathPolicy::load(&policy_path)
 }
 
 /// Read toggles.json and return the set of disabled item names for a category.
@@ -892,6 +972,8 @@ pub struct AgentRuntime {
     cap_request_cooldown: HashMap<String, i64>,
     /// Persistent registry of known channel contacts for cross-channel messaging.
     channel_contacts: blockcell_storage::ChannelContacts,
+    /// Loaded path-access policy engine (from `~/.blockcell/path_access.json5`).
+    path_policy: PathPolicy,
 }
 
 impl AgentRuntime {
@@ -916,6 +998,7 @@ impl AgentRuntime {
         let session_store = SessionStore::new(paths.clone());
         let audit_logger = AuditLogger::new(paths.clone());
         let channel_contacts = blockcell_storage::ChannelContacts::new(paths.clone());
+        let path_policy = load_path_policy(&config, &paths);
         let system_event_store = InMemorySystemEventStore::default();
         let summary_queue = MainSessionSummaryQueue::with_policy(
             5,
@@ -951,6 +1034,7 @@ impl AgentRuntime {
             main_session_target: None,
             cap_request_cooldown: HashMap::new(),
             channel_contacts,
+            path_policy,
         })
     }
 
@@ -2647,8 +2731,15 @@ impl AgentRuntime {
     }
 
     /// For tools that access the filesystem, check if any paths are outside the
-    /// workspace. If so, send a confirmation request to the user and wait for
-    /// their response. Returns Ok(true) if access is allowed, Ok(false) if denied.
+    /// workspace. Applies the path-access policy first; only paths whose policy
+    /// outcome is `Confirm` are forwarded to the user for interactive approval.
+    ///
+    /// Priority (highest → lowest):
+    /// 1. Workspace-safe paths  → always allowed
+    /// 2. Session-authorized dirs → allowed (cached from prior confirmation)
+    /// 3. Policy `Deny`         → rejected immediately, no confirmation sent
+    /// 4. Policy `Allow`        → allowed immediately, cached for this session
+    /// 5. Policy `Confirm`      → user confirmation required
     async fn check_path_permission(
         &mut self,
         tool_name: &str,
@@ -2657,29 +2748,72 @@ impl AgentRuntime {
     ) -> bool {
         let raw_paths = self.extract_paths(tool_name, args);
         if raw_paths.is_empty() {
-            return true; // No filesystem paths to check
+            return true;
         }
 
-        let unsafe_paths: Vec<String> = raw_paths
-            .iter()
-            .filter(|p| {
-                let resolved = self.resolve_path(p);
-                // Safe if inside workspace OR inside an already-authorized directory
-                !self.is_path_safe(&resolved) && !self.is_path_authorized(&resolved)
-            })
-            .cloned()
-            .collect();
+        let op = PathOp::from_tool_name(tool_name);
 
-        if unsafe_paths.is_empty() {
-            return true; // All paths are within workspace or authorized dirs
+        // Classify each path by policy outcome
+        let mut deny_paths: Vec<String> = Vec::new();
+        let mut confirm_paths: Vec<String> = Vec::new();
+
+        for p in &raw_paths {
+            let resolved = self.resolve_path(p);
+
+            // 1. Workspace-safe → always OK
+            if self.is_path_safe(&resolved) {
+                continue;
+            }
+
+            // 2. Already authorized by user this session → OK
+            if self.is_path_authorized(&resolved) {
+                continue;
+            }
+
+            // 3. Evaluate policy
+            let action = self.path_policy.evaluate(&resolved, op);
+            match action {
+                PolicyAction::Deny => {
+                    warn!(
+                        tool = tool_name,
+                        path = %resolved.display(),
+                        "Path access denied by policy"
+                    );
+                    deny_paths.push(p.clone());
+                }
+                PolicyAction::Allow => {
+                    // Policy explicitly allows — cache for this session
+                    info!(
+                        tool = tool_name,
+                        path = %resolved.display(),
+                        "Path access allowed by policy"
+                    );
+                    if self.path_policy.cache_confirmed_dirs() {
+                        self.authorize_directory(&resolved);
+                    }
+                }
+                PolicyAction::Confirm => {
+                    confirm_paths.push(p.clone());
+                }
+            }
         }
 
-        // Need user confirmation
+        // Any hard-deny → reject the whole operation
+        if !deny_paths.is_empty() {
+            return false;
+        }
+
+        // All paths were allowed (workspace / session-cache / policy-allow)
+        if confirm_paths.is_empty() {
+            return true;
+        }
+
+        // Need user confirmation for the remaining paths
         if let Some(confirm_tx) = &self.confirm_tx {
             let (response_tx, response_rx) = tokio::sync::oneshot::channel();
             let request = ConfirmRequest {
                 tool_name: tool_name.to_string(),
-                paths: unsafe_paths.clone(),
+                paths: confirm_paths.clone(),
                 response_tx,
                 channel: msg.channel.clone(),
                 chat_id: msg.chat_id.clone(),
@@ -2692,9 +2826,8 @@ impl AgentRuntime {
 
             match response_rx.await {
                 Ok(allowed) => {
-                    if allowed {
-                        // Cache the authorized directories so files within don't need re-confirmation
-                        for p in &unsafe_paths {
+                    if allowed && self.path_policy.cache_confirmed_dirs() {
+                        for p in &confirm_paths {
                             let resolved = self.resolve_path(p);
                             self.authorize_directory(&resolved);
                         }
@@ -2707,7 +2840,6 @@ impl AgentRuntime {
                 }
             }
         } else {
-            // No confirmation channel available (e.g. single message mode), deny
             warn!(
                 tool = tool_name,
                 "No confirmation channel, denying access to paths outside workspace"

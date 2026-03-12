@@ -1,0 +1,210 @@
+# 目录访问安全策略
+
+Blockcell 内置了可配置的**文件系统访问策略系统**，让你可以精确控制 AI 智能体能够读取、写入、列举或执行哪些路径——无需每次都手动确认。
+
+---
+
+## 核心概念
+
+### 策略结果（PolicyAction）
+
+| 结果 | 含义 |
+|------|------|
+| `allow` | 直接放行，无需用户确认 |
+| `confirm` | 弹出确认请求，由用户决定 |
+| `deny` | 直接拒绝，不会弹出确认 |
+
+### 操作类型（ops）
+
+| 操作 | 对应工具 |
+|------|---------|
+| `read` | `read_file` |
+| `write` | `write_file`、`edit_file`、`file_ops`、`data_process` 等 |
+| `list` | `list_dir` |
+| `exec` | `exec`（命令执行，`working_dir` 参数） |
+
+### 判定优先级（从高到低）
+
+1. **工作区路径**（`~/.blockcell/workspace`）→ 始终放行
+2. **本次会话已授权目录** → 放行（用户曾在本次会话中确认过）
+3. **内置敏感路径保护**（`builtin_protected_paths: true`）→ 拒绝（`~/.ssh`、`/etc` 等）
+4. **用户 `deny` 规则** → 拒绝
+5. **用户 `allow` 规则**（若比 deny 规则更精确）→ 放行
+6. **用户 `confirm` 规则** → 询问用户
+7. **`default_policy`** → 默认行为（默认 `confirm`）
+
+> **最长前缀优先**：当 `deny` 和 `allow` 都匹配同一路径时，前缀更长（更具体）的规则胜出。
+
+---
+
+## 文件位置
+
+| 文件 | 说明 |
+|------|------|
+| `~/.blockcell/config.json5` | 主配置，控制策略系统的开关和文件路径 |
+| `~/.blockcell/path_access.json5` | 具体的路径规则（**首次启动自动生成示例**） |
+
+---
+
+## 主配置（config.json5）
+
+```json5
+{
+  "security": {
+    "pathAccess": {
+      // 是否启用策略系统（关闭后退回到旧的纯工作区限制）
+      "enabled": true,
+
+      // 规则文件路径（支持 ~/）
+      "policyFile": "~/.blockcell/path_access.json5",
+
+      // 规则文件缺失/解析失败时的行为
+      // "fallback_to_safe_default" | "disabled"
+      "missingFilePolicy": "fallback_to_safe_default"
+    }
+  }
+}
+```
+
+---
+
+## 规则文件（path_access.json5）
+
+```json5
+{
+  version: 1,
+
+  // 没有任何规则匹配时的默认行为
+  default_policy: "confirm",
+
+  // 用户确认过的目录在本次会话内自动放行（减少重复询问）
+  cache_confirmed_dirs: true,
+
+  // 始终拒绝内置敏感路径（~/.ssh、/etc 等）
+  builtin_protected_paths: true,
+
+  rules: [
+    // ── 高优先级：拒绝敏感凭证目录 ────────────────────────────────────
+    {
+      name: "deny-secrets",
+      action: "deny",
+      ops: ["read", "write", "list", "exec"],
+      paths: [
+        "~/.ssh",
+        "~/.aws",
+        "~/.gnupg",
+        "~/.kube",
+        "~/.config/gcloud",
+        "/etc",
+        "/System"
+      ]
+    },
+
+    // ── 允许开发目录直接访问，无需每次确认 ────────────────────────────
+    {
+      name: "allow-dev-roots",
+      action: "allow",
+      ops: ["read", "list", "write"],
+      paths: [
+        "~/dev",
+        "~/projects",
+        "~/Desktop",
+        "~/Documents"
+      ]
+    },
+
+    // ── 执行命令时始终需要确认（即使在已允许的目录中）────────────────
+    {
+      name: "confirm-all-exec",
+      action: "confirm",
+      ops: ["exec"],
+      paths: ["~"]
+    }
+  ]
+}
+```
+
+---
+
+## 内置敏感路径
+
+当 `builtin_protected_paths: true`（默认），以下路径**始终被拒绝**，无论用户规则如何：
+
+```
+~/.ssh          ~/.aws          ~/.gnupg        ~/.kube
+~/.config/gcloud  ~/.azure      ~/.netrc
+/etc            /System         /private/etc    /private/var
+/usr/bin        /usr/sbin       /bin            /sbin
+```
+
+---
+
+## 典型场景示例
+
+### 场景 1：只允许特定项目目录，其余全拒
+
+```json5
+{
+  default_policy: "deny",
+  rules: [
+    {
+      name: "allow-my-project",
+      action: "allow",
+      ops: ["read", "write", "list"],
+      paths: ["~/projects/my-app"]
+    }
+  ]
+}
+```
+
+### 场景 2：读取任意路径，但写入需要确认
+
+```json5
+{
+  default_policy: "confirm",
+  rules: [
+    {
+      name: "allow-read-anywhere",
+      action: "allow",
+      ops: ["read", "list"],
+      paths: ["~"]
+    },
+    {
+      name: "confirm-write",
+      action: "confirm",
+      ops: ["write"],
+      paths: ["~"]
+    }
+  ]
+}
+```
+
+### 场景 3：完全关闭策略系统（退回旧行为）
+
+在 `config.json5` 中：
+
+```json5
+{
+  "security": {
+    "pathAccess": {
+      "enabled": false
+    }
+  }
+}
+```
+
+---
+
+## 更改后何时生效？
+
+修改 `path_access.json5` 后，**重启 Blockcell** 即可生效（当前版本不支持热重载，`reload_on_change` 字段预留供未来使用）。
+
+---
+
+## 与会话授权缓存的关系
+
+用户在会话中点击"允许"确认的目录，会被加入**本次会话的授权缓存**（`authorized_dirs`），在该会话剩余时间内不再询问。
+
+策略系统的优先级高于会话缓存——如果某目录后来被策略标记为 `deny`，下次会话将直接拒绝，不会被旧缓存绕过。
+
+缓存功能可通过 `cache_confirmed_dirs: false` 关闭，关闭后每次访问都会重新询问。
