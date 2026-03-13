@@ -113,11 +113,32 @@ impl QQEnvironment {
 
 #[derive(Debug, Deserialize)]
 struct QQResponse<T> {
+    #[serde(default)]
+    code: i32,
+    #[serde(default)]
     retcode: i32,
+    #[serde(default)]
+    msg: String,
     #[serde(default)]
     message: String,
     #[serde(default)]
     data: Option<T>,
+}
+
+impl<T> QQResponse<T> {
+    fn is_success(&self) -> bool {
+        self.code == 0 || self.retcode == 0
+    }
+
+    fn error_message(&self) -> &str {
+        if !self.msg.is_empty() {
+            &self.msg
+        } else if !self.message.is_empty() {
+            &self.message
+        } else {
+            "unknown error"
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -125,7 +146,27 @@ struct AccessTokenResponse {
     #[serde(default)]
     access_token: String,
     #[serde(default)]
-    expires_in: u64,
+    app_access_token: String,
+    #[serde(default)]
+    expires_in: String,  // QQ API returns this as string "7200"
+}
+
+impl AccessTokenResponse {
+    fn token(&self) -> &str {
+        if !self.app_access_token.is_empty() {
+            &self.app_access_token
+        } else {
+            &self.access_token
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        !self.token().is_empty()
+    }
+
+    fn expires_in_seconds(&self) -> u64 {
+        self.expires_in.parse().unwrap_or(7200)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -208,35 +249,34 @@ impl QQChannel {
             .await
             .map_err(|e| Error::Channel(format!("QQ auth request failed: {}", e)))?;
 
-        let qq_response: QQResponse<AccessTokenResponse> = response
-            .json()
+        let response_text = response
+            .text()
             .await
+            .map_err(|e| Error::Channel(format!("Failed to read auth response: {}", e)))?;
+
+        debug!("QQ auth response: {}", response_text);
+
+        // Try parsing as direct response first (getAppAccessToken returns direct response)
+        let token_data: AccessTokenResponse = serde_json::from_str(&response_text)
             .map_err(|e| Error::Channel(format!("Failed to parse QQ auth response: {}", e)))?;
 
-        if qq_response.retcode != 0 {
-            return Err(Error::Channel(format!(
-                "QQ auth failed: {}",
-                qq_response.message
-            )));
+        if !token_data.is_valid() {
+            return Err(Error::Channel("QQ auth response missing access_token".to_string()));
         }
-
-        let token_data = qq_response.data.ok_or_else(|| {
-            Error::Channel("QQ auth response missing token data".to_string())
-        })?;
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
-        let expires_at = now + token_data.expires_in;
+        let expires_at = now + token_data.expires_in_seconds();
 
         cache_guard.insert(app_id.clone(), CachedToken {
-            token: token_data.access_token.clone(),
+            token: token_data.token().to_string(),
             expires_at,
         });
 
-        Ok(token_data.access_token)
+        Ok(token_data.token().to_string())
     }
 
     async fn is_duplicate(msg_id: &str) -> bool {
@@ -825,10 +865,10 @@ pub async fn send_message(config: &Config, chat_id: &str, text: &str) -> Result<
         .await
         .map_err(|e| Error::Channel(format!("Failed to parse QQ response: {}", e)))?;
 
-    if qq_response.retcode != 0 {
+    if !qq_response.is_success() {
         return Err(Error::Channel(format!(
             "QQ send message failed: {}",
-            qq_response.message
+            qq_response.error_message()
         )));
     }
 
@@ -861,35 +901,34 @@ async fn get_access_token_internal(
         .await
         .map_err(|e| Error::Channel(format!("QQ auth request failed: {}", e)))?;
 
-    let qq_response: QQResponse<AccessTokenResponse> = response
-        .json()
+    let response_text = response
+        .text()
         .await
+        .map_err(|e| Error::Channel(format!("Failed to read auth response: {}", e)))?;
+
+    debug!("QQ auth response: {}", response_text);
+
+    // Try parsing as direct response first (getAppAccessToken returns direct response)
+    let token_data: AccessTokenResponse = serde_json::from_str(&response_text)
         .map_err(|e| Error::Channel(format!("Failed to parse QQ auth response: {}", e)))?;
 
-    if qq_response.retcode != 0 {
-        return Err(Error::Channel(format!(
-            "QQ auth failed: {}",
-            qq_response.message
-        )));
+    if !token_data.is_valid() {
+        return Err(Error::Channel("QQ auth response missing access_token".to_string()));
     }
-
-    let token_data = qq_response.data.ok_or_else(|| {
-        Error::Channel("QQ auth response missing token data".to_string())
-    })?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
 
-    let expires_at = now + token_data.expires_in;
+    let expires_at = now + token_data.expires_in_seconds();
 
     cache_guard.insert(app_id.to_string(), CachedToken {
-        token: token_data.access_token.clone(),
+        token: token_data.token().to_string(),
         expires_at,
     });
 
-    Ok(token_data.access_token)
+    Ok(token_data.token().to_string())
 }
 
 pub async fn send_media_message(config: &Config, chat_id: &str, file_path: &str) -> Result<()> {
@@ -967,10 +1006,10 @@ pub async fn send_media_message(config: &Config, chat_id: &str, file_path: &str)
         .await
         .map_err(|e| Error::Channel(format!("Failed to parse QQ response: {}", e)))?;
 
-    if qq_response.retcode != 0 {
+    if !qq_response.is_success() {
         return Err(Error::Channel(format!(
             "QQ upload file failed: {}",
-            qq_response.message
+            qq_response.error_message()
         )));
     }
 
@@ -1009,10 +1048,10 @@ pub async fn send_media_message(config: &Config, chat_id: &str, file_path: &str)
         .await
         .map_err(|e| Error::Channel(format!("Failed to parse QQ response: {}", e)))?;
 
-    if qq_response.retcode != 0 {
+    if !qq_response.is_success() {
         return Err(Error::Channel(format!(
             "QQ send media failed: {}",
-            qq_response.message
+            qq_response.error_message()
         )));
     }
 
