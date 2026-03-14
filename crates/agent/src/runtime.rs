@@ -2032,8 +2032,7 @@ impl AgentRuntime {
             .agents
             .defaults
             .max_tool_iterations
-            .min(4)
-            .max(1);
+            .clamp(1, 4);
         let mut current_messages = messages;
         let mut final_response = String::new();
 
