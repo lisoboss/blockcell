@@ -45,6 +45,7 @@ impl AnthropicProvider {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_proxy(
         api_key: &str,
         api_base: Option<&str>,
@@ -582,34 +583,31 @@ impl Provider for AnthropicProvider {
                                         }
                                         "content_block_start" => {
                                             if let Some(content_block) = &event.content_block {
-                                                match content_block.block_type.as_str() {
-                                                    "tool_use" => {
-                                                        if let (Some(id), Some(name), Some(idx)) =
-                                                            (&content_block.id, &content_block.name, event.index)
-                                                        {
-                                                            // 建立 index -> id 映射
-                                                            tool_index_to_id.insert(idx, id.clone());
+                                                if content_block.block_type.as_str() == "tool_use" {
+                                                    if let (Some(id), Some(name), Some(idx)) =
+                                                        (&content_block.id, &content_block.name, event.index)
+                                                    {
+                                                        // 建立 index -> id 映射
+                                                        tool_index_to_id.insert(idx, id.clone());
 
-                                                            let acc = tool_calls
-                                                                .entry(id.clone())
-                                                                .or_insert_with(|| ToolCallAccumulator {
-                                                                    id: id.clone(),
-                                                                    name: name.clone(),
-                                                                    arguments: String::new(),
-                                                                });
-                                                            acc.id = id.clone();
-                                                            acc.name = name.clone();
+                                                        let acc = tool_calls
+                                                            .entry(id.clone())
+                                                            .or_insert_with(|| ToolCallAccumulator {
+                                                                id: id.clone(),
+                                                                name: name.clone(),
+                                                                arguments: String::new(),
+                                                            });
+                                                        acc.id = id.clone();
+                                                        acc.name = name.clone();
 
-                                                            let _ = tx
-                                                                .send(StreamChunk::ToolCallStart {
-                                                                    index: idx,
-                                                                    id: id.clone(),
-                                                                    name: name.clone(),
-                                                                })
-                                                                .await;
-                                                        }
+                                                        let _ = tx
+                                                            .send(StreamChunk::ToolCallStart {
+                                                                index: idx,
+                                                                id: id.clone(),
+                                                                name: name.clone(),
+                                                            })
+                                                            .await;
                                                     }
-                                                    _ => {}
                                                 }
                                             }
                                         }
@@ -637,8 +635,8 @@ impl Provider for AnthropicProvider {
                                         "message_stop" => {
                                             // 消息结束
                                             let final_tool_calls: Vec<ToolCallRequest> = tool_calls
-                                                .into_iter()
-                                                .map(|(_, acc)| acc.to_tool_call_request())
+                                                .into_values()
+                                                .map(|acc| acc.to_tool_call_request())
                                                 .collect();
 
                                             let response = LLMResponse {
@@ -684,8 +682,8 @@ impl Provider for AnthropicProvider {
 
             // 如果流结束但没有收到 message_stop，也发送完成事件
             let final_tool_calls: Vec<ToolCallRequest> = tool_calls
-                .into_iter()
-                .map(|(_, acc)| acc.to_tool_call_request())
+                .into_values()
+                .map(|acc| acc.to_tool_call_request())
                 .collect();
 
             let response = LLMResponse {
