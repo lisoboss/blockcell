@@ -1,7 +1,9 @@
 pub mod bus;
+pub mod response_cache;
 pub mod capability_adapter;
 pub mod context;
 pub mod health;
+pub mod history_projector;
 pub mod intent;
 pub mod memory_adapter;
 pub mod prompt_skill_executor;
@@ -22,3 +24,4 @@ pub use intent::{IntentCategory, IntentClassifier};
 pub use memory_adapter::MemoryStoreAdapter;
 pub use runtime::{AgentRuntime, ConfirmRequest, SkillScriptKind};
 pub use task_manager::TaskManager;
+pub use response_cache::ResponseCache;
