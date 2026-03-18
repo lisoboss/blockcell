@@ -1,84 +1,32 @@
-# 通用应用控制技能 (app_control)
+# App Control
 
-## 触发短语
-- 控制应用/软件、截图应用、看看屏幕/IDE、操作IDE、读取界面/UI、点击菜单
-- windsurf、vscode、control app、app screenshot、what's on screen
+## Shared {#shared}
 
-## 核心能力
-通过 AppleScript + System Events 控制任何 macOS 应用程序。
+- 适合查看或操作 macOS 应用，例如 Windsurf、VS Code、Terminal、Finder、Safari、Chrome、微信、飞书。
+- 常用名称映射：
+  - Windsurf -> `Windsurf`
+  - VS Code / vscode -> `Code`
+  - 终端 -> `Terminal`
+  - 访达 -> `Finder`
+  - Chrome -> `Google Chrome`
+  - 飞书 -> `Lark`
+- 如果用户没有明确应用名，但问题明显是在问当前前台应用，可先获取前台应用再继续。
 
-## 常用应用名称映射
-| 用户说的 | app 参数 |
-|---------|---------|
-| Windsurf / windsurf | Windsurf |
-| VS Code / vscode | Code |
-| 终端 / Terminal | Terminal |
-| Finder / 访达 | Finder |
-| Safari | Safari |
-| Chrome | Google Chrome |
-| 微信 | WeChat |
-| 飞书 | Lark |
+## Prompt {#prompt}
 
-## 工具调用顺序
-
-### 场景 1: 查看某个应用正在做什么
-1. `app_control` action=screenshot, app=目标应用 → 截图
-2. 将截图路径作为 media 发送给多模态模型分析
-3. 可选: `app_control` action=read_ui, app=目标应用, depth=3 → 读取 UI 树补充信息
-
-### 场景 2: 在应用中执行操作
-1. `app_control` action=activate, app=目标应用 → 激活应用
-2. `app_control` action=press_key/type/click_menu → 执行操作
-3. `app_control` action=screenshot → 确认结果
-
-### 场景 3: 了解当前环境
-1. `app_control` action=list_apps → 列出所有运行中的应用
-2. `app_control` action=get_frontmost → 获取当前最前面的应用
-
-### 场景 4: 操作 IDE (Windsurf/VS Code)
-常用快捷键:
-- `cmd+p` — 快速打开文件
-- `cmd+shift+p` — 命令面板
-- `cmd+s` — 保存
-- `cmd+shift+f` — 全局搜索
-- `cmd+b` — 切换侧边栏
-- `cmd+j` — 切换终端面板
-- `cmd+,` — 打开设置
-
-## 输出格式
-```
-📱 应用: {app_name}
-🎯 操作: {action_description}
-✅ 结果: {result_summary}
-```
-
-## 降级策略
-1. 如果 read_ui 超时或返回空 → 降低 depth 重试 (depth=2 或 1)
-2. 如果 screenshot 失败 → 尝试 screencapture 全屏截图作为降级
-3. 如果进程名解析失败 → 用 list_apps 查找正确的进程名
-4. 如果 click_menu 失败 → 尝试用 press_key 快捷键替代
-
-## 示例
-
-### 示例 1: 看看 Windsurf 在做什么
-用户: "看看 Windsurf 在干什么"
-```
-call_tool("app_control", {"action": "screenshot", "app": "Windsurf"})
-call_tool("app_control", {"action": "read_ui", "app": "Windsurf", "depth": 2})
-```
-→ 截图 + UI 树分析，告诉用户当前打开的文件、编辑器状态等
-
-### 示例 2: 在 Windsurf 中打开文件
-用户: "在 Windsurf 里打开 main.rs"
-```
-call_tool("app_control", {"action": "activate", "app": "Windsurf"})
-call_tool("app_control", {"action": "press_key", "app": "Windsurf", "text": "cmd+p"})
-call_tool("app_control", {"action": "type", "app": "Windsurf", "text": "main.rs"})
-call_tool("app_control", {"action": "press_key", "app": "Windsurf", "text": "return"})
-```
-
-### 示例 3: 列出所有运行的应用
-用户: "现在电脑上开了什么应用"
-```
-call_tool("app_control", {"action": "list_apps"})
-```
+- 只有在“目标应用不明确”或“要执行的动作不明确”时才澄清。
+- 查看应用当前状态时，优先策略：
+  1. 如果未给应用名且明显在问当前界面，先用 `app_control` 获取 frontmost app。
+  2. 优先用 `read_ui` 获取界面结构，默认从较浅层开始。
+  3. 只有在用户明确要截图，或需要给用户留存视觉证据时，才补 `screenshot`。
+- 执行动作时，优先策略：
+  1. 必要时先 `activate`
+  2. 再执行 `press_key`、`type`、`click_menu` 等单个明确动作
+  3. 执行后用 `read_ui` 或 `screenshot` 做一次确认
+- 如果应用名解析失败，先用 `list_apps` 判断是否在运行，再告知用户。
+- 输出要求：
+  - 说明目标应用
+  - 说明执行的动作或读到的当前状态
+  - 说明结果是否成功
+  - 如果还差一步才能完成，给出下一步建议
+- 不要连续触发多次不必要的界面操作，不要输出 AppleScript 或内部控制细节。

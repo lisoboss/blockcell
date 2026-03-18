@@ -573,24 +573,36 @@ pub async fn test(path: &str, input: Option<String>, verbose: bool) -> anyhow::R
         fail += 1;
     } else {
         let meta_str = std::fs::read_to_string(&meta_path)?;
-        // Basic structural check: required keys
-        let required = ["name:", "description:", "triggers:", "capabilities:"];
-        let missing: Vec<&str> = required
-            .iter()
-            .filter(|k| !meta_str.contains(*k))
-            .copied()
-            .collect();
-        if missing.is_empty() {
-            println!("✅ OK");
-            pass += 1;
-            if verbose {
-                for line in meta_str.lines().take(6) {
-                    println!("            {}", line);
+        match serde_yaml::from_str::<serde_json::Value>(&meta_str) {
+            Ok(meta) => {
+                let required = ["name", "description"];
+                let missing: Vec<&str> = required
+                    .iter()
+                    .filter(|key| {
+                        meta.get(**key)
+                            .and_then(|value| value.as_str())
+                            .map(|value| value.trim().is_empty())
+                            .unwrap_or(true)
+                    })
+                    .copied()
+                    .collect();
+                if missing.is_empty() {
+                    println!("✅ OK");
+                    pass += 1;
+                    if verbose {
+                        for line in meta_str.lines().take(8) {
+                            println!("            {}", line);
+                        }
+                    }
+                } else {
+                    println!("❌ Missing required fields: {}", missing.join(", "));
+                    fail += 1;
                 }
             }
-        } else {
-            println!("❌ Missing keys: {}", missing.join(", "));
-            fail += 1;
+            Err(err) => {
+                println!("❌ Invalid YAML: {}", err);
+                fail += 1;
+            }
         }
     }
 

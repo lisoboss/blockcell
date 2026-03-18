@@ -2,6 +2,7 @@ use blockcell_core::types::ChatMessage;
 use serde_json::Value;
 use std::collections::HashSet;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HistoryProjectionProfile {
     Conversation,
@@ -16,6 +17,7 @@ pub(crate) struct HistoryAnalysis {
     pub has_reference_intent: bool,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct HistoryProjection {
     pub messages: Vec<ChatMessage>,
@@ -943,7 +945,7 @@ mod tests {
         let projection_text = projection
             .messages
             .iter()
-            .map(|msg| stringify_chat_message_content(msg))
+            .map(stringify_chat_message_content)
             .collect::<Vec<_>>()
             .join("\n");
 

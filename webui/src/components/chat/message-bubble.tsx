@@ -1,11 +1,11 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, memo } from 'react';
 import { User, Bot, ChevronDown, ChevronRight, Clock, Check, AlertCircle } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import type { UiMessage, ToolCallInfo } from '@/lib/store';
 import { MarkdownContent } from './markdown-content';
 import { MediaList, extractMediaPaths, isMediaPath } from './media-attachment';
 
-export function MessageBubble({ message }: { message: UiMessage }) {
+export const MessageBubble = memo(function MessageBubble({ message }: { message: UiMessage }) {
   const isUser = message.role === 'user';
   const isTool = message.role === 'tool';
 
@@ -69,6 +69,8 @@ export function MessageBubble({ message }: { message: UiMessage }) {
           >
             {isUser ? (
               <p className="whitespace-pre-wrap">{message.content}</p>
+            ) : message.streaming ? (
+              <p className="whitespace-pre-wrap text-sm leading-7">{message.content}</p>
             ) : (
               <MarkdownContent content={message.content} />
             )}
@@ -82,7 +84,7 @@ export function MessageBubble({ message }: { message: UiMessage }) {
       </div>
     </div>
   );
-}
+});
 
 function ToolCallCard({ toolCall }: { toolCall: ToolCallInfo }) {
   const [isOpen, setIsOpen] = useState(false);

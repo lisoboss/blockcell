@@ -1,30 +1,9 @@
 name: shell
-description: "Shell 命令执行技能 — 在本机执行命令行操作，支持脚本运行、文件管理、系统查询"
-requires:
-  bins: []
-  env: []
+description: 执行明确的本机命令并整理结果
+tools:
+  - exec
 permissions:
   - system.exec
-  - fs.read
-  - fs.write
-always: false
-triggers:
-  - "执行命令"
-  - "运行脚本"
-  - "命令行"
-  - "终端"
-  - "shell"
-  - "bash"
-  - "跑一下"
-  - "执行"
-  - "run command"
-  - "execute"
-  - "terminal"
-  - "系统命令"
-  - "运行命令"
-capabilities:
-  - "exec"
-output_format: "markdown"
 fallback:
-  strategy: "error"
-  message: "命令执行失败。请检查命令语法，或确认相关程序已安装。"
+  strategy: error
+  message: 当前无法完成命令执行。请检查命令、权限或运行环境。

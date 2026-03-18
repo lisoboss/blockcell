@@ -1,13 +1,50 @@
+import { memo, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
-import { useState } from 'react';
 import { Copy, Check } from 'lucide-react';
 import { mediaFileUrl } from '@/lib/api';
 import { useAgentStore } from '@/lib/store';
 
-export function MarkdownContent({ content }: { content: string }) {
+function CodeBlock({ language, code }: { language: string; code: string }) {
+  const [copied, setCopied] = useState(false);
+
+  function handleCopy() {
+    navigator.clipboard.writeText(code);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  }
+
+  return (
+    <div className="relative group not-prose">
+      <div className="flex items-center justify-between rounded-t-xl border border-b-0 border-border/70 bg-muted/75 px-3 py-1.5 text-[11px] text-muted-foreground shadow-sm">
+        <span className="font-medium tracking-wide text-foreground/70">{language}</span>
+        <button
+          onClick={handleCopy}
+          className="flex items-center gap-1 rounded-md px-1.5 py-0.5 hover:bg-background/60 hover:text-foreground transition-colors"
+        >
+          {copied ? <Check size={12} /> : <Copy size={12} />}
+          <span>{copied ? 'Copied' : 'Copy'}</span>
+        </button>
+      </div>
+      <SyntaxHighlighter
+        language={language}
+        style={oneDark}
+        customStyle={{
+          margin: 0,
+          borderTopLeftRadius: 0,
+          borderTopRightRadius: 0,
+          fontSize: '0.8rem',
+        }}
+      >
+        {code}
+      </SyntaxHighlighter>
+    </div>
+  );
+}
+
+export const MarkdownContent = memo(function MarkdownContent({ content }: { content: string }) {
   const selectedAgentId = useAgentStore((s) => s.selectedAgentId);
   return (
     <div className="prose prose-sm dark:prose-invert max-w-none prose-blockcell chat-markdown">
@@ -93,41 +130,5 @@ export function MarkdownContent({ content }: { content: string }) {
       </ReactMarkdown>
     </div>
   );
-}
+});
 
-function CodeBlock({ language, code }: { language: string; code: string }) {
-  const [copied, setCopied] = useState(false);
-
-  function handleCopy() {
-    navigator.clipboard.writeText(code);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-  }
-
-  return (
-    <div className="relative group not-prose">
-      <div className="flex items-center justify-between rounded-t-xl border border-b-0 border-border/70 bg-muted/75 px-3 py-1.5 text-[11px] text-muted-foreground shadow-sm">
-        <span className="font-medium tracking-wide text-foreground/70">{language}</span>
-        <button
-          onClick={handleCopy}
-          className="flex items-center gap-1 rounded-md px-1.5 py-0.5 hover:bg-background/60 hover:text-foreground transition-colors"
-        >
-          {copied ? <Check size={12} /> : <Copy size={12} />}
-          <span>{copied ? 'Copied' : 'Copy'}</span>
-        </button>
-      </div>
-      <SyntaxHighlighter
-        language={language}
-        style={oneDark}
-        customStyle={{
-          margin: 0,
-          borderTopLeftRadius: 0,
-          borderTopRightRadius: 0,
-          fontSize: '0.8rem',
-        }}
-      >
-        {code}
-      </SyntaxHighlighter>
-    </div>
-  );
-}

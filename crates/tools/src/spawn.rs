@@ -166,6 +166,7 @@ mod tests {
         let ctx = ToolContext {
             workspace: PathBuf::from("/tmp/workspace"),
             builtin_skills_dir: None,
+            active_skill_dir: None,
             session_key: "cli:test".to_string(),
             channel: "cli".to_string(),
             account_id: None,

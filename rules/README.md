@@ -1,238 +1,158 @@
-# Skills Development Rules
+# Skills 开发规范
 
-> Last updated: 2026-03-15
-> Scope: all new skills in blockcell
+> Last updated: 2026-03-17
+> Scope: blockcell 当前 skill 内核
 
-## 1. 总体规范
+## 1. 当前执行模型
 
-一个 skill 由 3 层信息组成：
+blockcell 现在只有一条统一的用户 skill 执行链路：
 
-1. `meta.yaml`
-2. 根 `SKILL.md`
-3. 可选脚本文件：`SKILL.rhai` 或 `SKILL.py`
+1. planner 根据用户问题、历史和已启用 skill 描述选择是否进入 skill
+2. runtime 读取根 `SKILL.md`
+3. 只把 `shared + prompt` 注入当前 skill 上下文
+4. 模型自行决定是否调用普通工具，或在需要时调用 `exec_local`
+5. 完整 tool trace 写回主历史
 
-复杂 skill 可以把说明拆到多个子 `.md` 文件，但运行时入口永远只有根 `SKILL.md`。
+当前规范的核心结论：
 
-## 2. skill 类型选择
+- `meta.yaml` 不再承担路由职责
+- 不使用 `triggers`
+- 不使用私有 continuation context
+- follow-up 只依赖主历史里的完整 tool trace
+- `SKILL.md` 是 skill 的唯一运行时说明书
 
-### Prompt Skill
-
-适合：
-
-- 主要靠 `SKILL.md` 和受控工具完成任务
-- 不需要脚本级确定性编排
-
-规范见：
-
-- [01-prompt-only-skill-development.md](01-prompt-only-skill-development.md)
-
-### Rhai Skill
-
-适合：
-
-- 需要确定性工具编排
-- 主要依赖 blockcell 工具能力
-- 不想引入 Python 运行时和第三方依赖
-
-规范见：
-
-- [02-rhai-skill-development.md](02-rhai-skill-development.md)
-
-### Python Skill
-
-适合：
-
-- 需要外部 SDK、HTTP 客户端、复杂解析
-- 需要把协议和数据清洗封装进脚本
-
-规范见：
-
-- [03-python-skill-development.md](03-python-skill-development.md)
-
-## 3. `meta.yaml` 规范
-
-`meta.yaml` 只承载最小元数据：
-
-```yaml
-name: weather
-description: 查询天气并整理结果
-triggers:
-  - 天气
-tools:
-  - web_fetch
-permissions: []
-requires:
-  bins: []
-  env: []
-fallback:
-  strategy: degrade
-  message: 当前无法完成天气查询，请稍后重试。
-```
-
-字段职责：
-
-- `name`：skill 名称
-- `description`：一句话描述
-- `triggers`：路由触发词
-- `tools`：Prompt/Rhai 的工具白名单
-- `permissions`：权限声明
-- `requires`：运行时依赖
-- `fallback`：失败时的默认用户提示
-- `always` / `output_format`：仅在确实需要时使用
-
-## 4. `SKILL.md` 规范
-
-根 `SKILL.md` 是技能调用说明书，也是结果整理说明书。
-
-它必须覆盖：
-
-1. 什么时候应该使用这个 skill
-2. 哪些输入直接执行，哪些输入先澄清
-3. 参数和默认值如何构造
-4. 结果如何整理
-
-## 5. 多 `.md` 文档设计
-
-复杂 skill 可以拆成：
+## 2. skill 目录结构
 
 ```text
 skills/<skill_name>/
 ├── meta.yaml
 ├── SKILL.md
 ├── manual/
-│   ├── planning.md
-│   └── summary.md
-└── SKILL.rhai | SKILL.py
+│   └── *.md
+└── scripts/ | SKILL.py | SKILL.sh | cli.js | app
 ```
 
-根 `SKILL.md` 使用标准 markdown 链接引用子文档：
+复杂 skill 可以拆多个子 `.md`，但运行时入口永远是根 `SKILL.md`。
 
-```md
-## Planning {#planning}
-- [参数构造规则](manual/planning.md#build-argv)
-- [默认值规则](manual/planning.md#defaults)
+## 3. meta.yaml 最小规范
 
-## Summary {#summary}
-- [结果整理规则](manual/summary.md#final-answer)
+推荐只保留：
+
+```yaml
+name: weather
+description: 查询天气和短期预报
+tools:
+  - web_fetch
+requires:
+  bins: []
+  env: []
+permissions: []
+fallback:
+  strategy: degrade
+  message: 当前无法获取天气数据，请稍后重试。
 ```
 
-子文档用显式 section id：
+字段说明：
 
-```md
-## 参数构造规则 {#build-argv}
-...
+- `name`：skill 名称
+- `description`：给 planner 和人看的简洁描述
+- `tools`：普通工具白名单
+- `requires`：本地脚本或环境依赖
+- `permissions`：显式权限声明
+- `fallback`：用户可理解的失败提示
 
-## 默认值规则 {#defaults}
-...
-```
+不要写：
 
-## 6. 链接解析规则
+- `triggers`
+- `capabilities`
+- `always`
+- `output_format`
 
-运行时只解析根 `SKILL.md` 中的本地 markdown 链接。
+## 4. 根 SKILL.md 规范
 
-解析规则：
-
-- 只解析根 `SKILL.md`
-- 子 `.md` 里的链接不递归解析
-- 只允许相对路径 `.md` 链接
-- 路径 canonicalize 后必须仍在当前 skill 目录内
-- `a.md#summary` 表示提取 `summary` 对应 section
-- `a.md` 表示提取整份子文档
-- section 范围为：目标标题开始，到下一个同级或更高层级标题之前
-- section 优先匹配显式 id，如 `{#summary}`
-- 找不到路径或 section 时，视为 skill 文档错误
-
-## 7. 根 `SKILL.md` 的保留章节
-
-根 `SKILL.md` 使用以下保留章节作为运行时文档入口：
+根 `SKILL.md` 必须包含：
 
 - `## Shared {#shared}`
 - `## Prompt {#prompt}`
-- `## Planning {#planning}`
-- `## Summary {#summary}`
 
-规则：
+当前内核只注入这两部分，因此所有真实规则都必须能通过这两部分拿到。
 
-- `Shared`：所有阶段共享规则
-- `Prompt`：Prompt Skill 注入内容
-- `Planning`：脚本 skill 的动作和参数构造规则
-- `Summary`：脚本结果整理规则
+根文档职责：
 
-每个保留章节中可以同时包含：
+- 说明这个 skill 适合处理什么问题
+- 说明哪些请求直接执行，哪些请求先澄清
+- 说明工具或 `exec_local` 的使用顺序
+- 说明默认值如何推断
+- 说明最终结果如何整理
+- 说明哪些字段不能暴露给用户
 
-- 章节正文
-- 指向子文档的 markdown 链接
+## 5. 子文档与 section link
 
-运行时会按出现顺序拼接正文和被引用 section。
+根 `SKILL.md` 可以用标准 markdown 链接拆分复杂规则：
 
-## 8. 缓存设计
+```md
+## Prompt {#prompt}
+- [动作映射](manual/planning.md#actions)
+- [结果整理规则](manual/summary.md#final-answer)
+```
 
-### 8.1 `meta.yaml` 缓存
+当前解析规则：
 
-`meta.yaml` 在 skill 扫描或 reload 时读取、解析并缓存到内存中的 skill 对象。
+- 只解析根 `SKILL.md` 中出现的本地 `.md` 链接
+- 只允许 skill 目录内相对路径
+- 支持 `a.md#section-id`
+- 只展开一层
+- 子文档里的二次链接不递归解析
+- section 优先匹配显式 id，如 `{#final-answer}`
 
-缓存内容：
+## 6. 三种 authoring pattern
 
-- 解析后的 `SkillMeta`
-- 可用性检查结果
-- 当前 skill 路径和版本信息
+当前只保留三类 skill 写法：
 
-### 8.2 文档缓存
+### 1. Prompt Tool Skill
 
-每个 skill 的文档缓存按 skill 目录整体维护，缓存内容应包括：
+- 只用普通工具
+- 不运行本地脚本
 
-- 根 `SKILL.md` 原文
-- 被引用子 `.md` 原文
-- 子文档 section 索引
-- 拼接后的阶段 bundle
+规范见：
 
-推荐缓存 bundle：
+- [01-prompt-tool-skill-development.md](01-prompt-tool-skill-development.md)
 
-- `prompt_bundle`
-- `planning_bundle`
-- `summary_bundle`
+### 2. Local Script Skill
 
-### 8.3 失效策略
+- 通过 `exec_local` 调用 skill 目录内本地脚本或 CLI
 
-任意 skill 目录文件改动后，整 skill 文档缓存整体失效并重建。
+规范见：
 
-重建范围：
+- [02-local-script-skill-development.md](02-local-script-skill-development.md)
 
-- `meta.yaml`
-- 根 `SKILL.md`
-- 根 `SKILL.md` 引用到的子 `.md`
-- 阶段 bundle
+### 3. Hybrid Skill
 
-不做子文档递归增量失效。
+- 同时使用普通工具和 `exec_local`
 
-## 9. 运行时如何使用这些 bundle
+规范见：
 
-- Prompt Skill：使用 `shared + prompt`
-- Rhai Skill 参数构造：使用 `shared + planning`
-- Rhai Skill 结果整理：使用 `shared + summary`
-- Python Skill 参数构造：使用 `shared + planning`
-- Python Skill 结果整理：使用 `shared + summary`
+- [03-hybrid-skill-development.md](03-hybrid-skill-development.md)
 
-## 10. 历史、测试、cron
+## 7. 历史与 follow-up 规则
 
-统一规则：
+skill 设计必须默认以下事实：
 
-- 主历史持久化完整 tool 链路
-- follow-up 只依赖主历史
-- WebUI 技能测试走同一套 skill kernel
-- cron 技能任务走同一套 skill kernel
+- 最近主历史里会保留完整 tool trace
+- 用户会继续问“第 N 条”“刚才那个”“继续”
+- 模型应优先复用历史里的 tool 结果，再决定是否重跑
 
-skill 设计时要默认：
+因此 skill 说明里必须明确：
 
-- 脚本结果里保留足够的结构化标识
-- `SKILL.md` 的 `Summary` 章节明确哪些字段可展示，哪些只用于内部整理
+- 哪些字段是后续引用所必需的内部标识
+- 这些字段如何保留在 trace 中
+- 这些字段为什么不能直接展示给用户
 
-## 11. 作者检查清单
+## 8. 作者检查清单
 
-- `meta.yaml` 只包含最小元数据
-- 根 `SKILL.md` 是唯一入口
-- 子文档只通过根 `SKILL.md` 链接暴露给运行时
-- 链接全部是 skill 目录内相对 `.md` 路径
-- section 都有稳定显式 id
-- 规划和总结规则已拆清
-- WebUI 测试和 cron 都不需要额外协议
+- `meta.yaml` 是最小元数据
+- 根 `SKILL.md` 是唯一运行时入口
+- 所有真实规则都能通过 `shared + prompt` 拿到
+- 根文档中的链接只指向 skill 目录内一层 `.md`
+- 需要 follow-up 的 skill 已明确历史复用策略
+- 需要本地脚本的 skill 已明确 `exec_local` 调用方式

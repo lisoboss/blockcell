@@ -1,5 +1,6 @@
 export type WsEventType =
   | 'token'
+  | 'stream_reset'
   | 'tool_call_start'
   | 'tool_call_result'
   | 'message_done'

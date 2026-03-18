@@ -1319,7 +1319,7 @@ impl Provider for OpenAIProvider {
 
         let (api_messages, api_tools) =
             if tools_available && !matches!(mode, ToolCallMode::Text | ToolCallMode::None) {
-                (messages.to_vec(), tools.to_vec())
+                (Self::sanitize_messages_for_native_tools(messages), tools.to_vec())
             } else if tools_available {
                 (Self::inject_tools_into_messages(messages, tools), vec![])
             } else {
@@ -1513,6 +1513,7 @@ impl Provider for OpenAIProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use blockcell_core::types::ChatMessage;
 
     #[test]
     fn test_parse_xml_tool_call() {
@@ -1726,5 +1727,64 @@ ls -la
             Some("我来帮您查看上一级目录。")
         );
         assert_eq!(response.finish_reason, "tool_calls");
+    }
+
+    #[test]
+    fn test_sanitize_messages_for_native_tools_drops_incomplete_tool_round() {
+        let messages = vec![
+            ChatMessage::user("先写一个故事"),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: Value::String(String::new()),
+                reasoning_content: None,
+                tool_calls: Some(vec![ToolCallRequest {
+                    id: "call-1".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: serde_json::json!({"path":"story.md"}),
+                    thought_signature: None,
+                }]),
+                tool_call_id: None,
+                name: None,
+            },
+            ChatMessage::assistant("已经写好了"),
+        ];
+
+        let sanitized = OpenAIProvider::sanitize_messages_for_native_tools(&messages);
+
+        assert_eq!(sanitized.len(), 2);
+        assert_eq!(sanitized[0].role, "user");
+        assert_eq!(sanitized[1].role, "assistant");
+        assert!(sanitized.iter().all(|msg| msg.tool_calls.is_none()));
+        assert!(sanitized.iter().all(|msg| msg.tool_call_id.is_none()));
+    }
+
+    #[test]
+    fn test_sanitize_messages_for_native_tools_keeps_complete_tool_round() {
+        let messages = vec![
+            ChatMessage::user("列出当前目录"),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: Value::String(String::new()),
+                reasoning_content: None,
+                tool_calls: Some(vec![ToolCallRequest {
+                    id: "call-1".to_string(),
+                    name: "list_dir".to_string(),
+                    arguments: serde_json::json!({"path":"."}),
+                    thought_signature: None,
+                }]),
+                tool_call_id: None,
+                name: None,
+            },
+            ChatMessage::tool_result("call-1", r#"{"entries":[]}"#),
+            ChatMessage::assistant("目录为空"),
+        ];
+
+        let sanitized = OpenAIProvider::sanitize_messages_for_native_tools(&messages);
+
+        assert_eq!(sanitized.len(), 4);
+        assert_eq!(sanitized[1].role, "assistant");
+        assert!(sanitized[1].tool_calls.is_some());
+        assert_eq!(sanitized[2].role, "tool");
+        assert_eq!(sanitized[2].tool_call_id.as_deref(), Some("call-1"));
     }
 }

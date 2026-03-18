@@ -281,19 +281,16 @@ impl SkillEvolution {
     }
 
     fn trigger_rules_prompt() -> &'static str {
-        "## meta.yaml trigger rules\n\
-- Generate `triggers` as a concise YAML string list.\n\
-- Generate **4 to 8** triggers total. Do not output fewer than 4 or more than 8.\n\
-- Each trigger should be **2 to 8 Chinese characters** or **1 to 3 English words**.\n\
-- Prefer **Chinese natural-language triggers** when the skill is mainly for Chinese users. Add **0 to 2 English triggers** only when the capability is commonly searched in English or the skill name itself is English.\n\
-- Include **1 exact skill-name trigger** or a very close stable alias.\n\
-- Include **2 to 4 user-intent triggers** that reflect how users actually ask for this capability in chat.\n\
-- Include **1 to 2 narrow synonyms or aliases** only when they are genuinely equivalent in meaning. Do not pad with weak variants.\n\
-- Avoid overly broad or generic triggers such as `查询`, `工具`, `助手`, `分析`, `处理`, `搜索`, `生成`, `数据`, `信息`, `market`, `crypto` unless the phrase is paired with the skill's specific domain intent.\n\
-- Avoid triggers that overlap too broadly with unrelated skills. Triggers must be specific enough to activate this skill but not so specific that normal user wording would never match.\n\
-- Prefer wording that matches **actual user utterances**, not taxonomy labels. Good triggers sound like something a user would really type.\n\
-- Do not include punctuation, full sentences, repeated variants, or explanation text in `triggers`.\n\
-- Keep triggers accurate and conservative. Do **not** over-expand with speculative synonyms.\n\n"
+        "## meta.yaml rules\n\
+- Keep `meta.yaml` minimal.\n\
+- Required fields: `name`, `description`.\n\
+- Optional fields: `tools`, `requires`, `permissions`, `fallback`.\n\
+- `tools` must be a short YAML string list of ordinary host tools actually used by the skill.\n\
+- Do NOT include `exec_local` in `tools`; local execution belongs in `SKILL.md` instructions.\n\
+- `requires` may contain `bins` and `env` only when there is a real local dependency.\n\
+- `permissions` should be an empty list unless the skill truly needs explicit permission declarations.\n\
+- `fallback` is optional; when present, keep it simple with a `strategy` and user-facing `message`.\n\
+- Do NOT generate any legacy routing or formatting fields.\n\n"
     }
 
     /// Get the evolution records directory path.
@@ -1021,7 +1018,7 @@ impl SkillEvolution {
         prompt.push_str("## Output Format\n");
         prompt.push_str("Generate the COMPLETE SKILL.rhai file content.\n");
         prompt.push_str("When the skill returns structured results, prefer returning `display_text` for final user-facing text. If the result still needs runtime/LLM polishing, return `summary_data` as a lightweight structured summary and keep large raw content out of `summary_data`.\n");
-        prompt.push_str("If you output `meta.yaml`, it must follow the trigger rules below.\n\n");
+        prompt.push_str("If you output `meta.yaml`, it must follow the minimal meta rules below.\n\n");
         prompt.push_str(Self::trigger_rules_prompt());
         prompt.push_str("Output ONLY the Rhai code in a ```rhai code block.\n");
         prompt.push_str(
@@ -1229,7 +1226,7 @@ impl SkillEvolution {
             "Fix ALL the issues listed above and generate the COMPLETE corrected Rhai script.\n",
         );
         prompt.push_str("If the skill can directly produce final user-facing text, return `display_text`. Otherwise return `summary_data` as a lightweight structured summary for runtime/LLM polishing. Do NOT place complete webpages, long markdown, or large raw logs into `summary_data`.\n");
-        prompt.push_str("If you output `meta.yaml`, it must follow the trigger rules below.\n\n");
+        prompt.push_str("If you output `meta.yaml`, it must follow the minimal meta rules below.\n\n");
         prompt.push_str(Self::trigger_rules_prompt());
         prompt.push_str("Do NOT leave any of the reported issues unfixed.\n");
         prompt.push_str("Output ONLY the corrected Rhai code in a ```rhai code block.\n");
@@ -1442,7 +1439,7 @@ or\n\
         prompt.push_str("Generate the COMPLETE SKILL.py content.\n");
         prompt.push_str("If the skill can directly produce final user-facing text, return `display_text`. Otherwise return `summary_data` as a lightweight structured summary for runtime/LLM polishing. Do NOT place complete webpages, long markdown, or large raw logs into `summary_data`.\n");
         prompt.push_str("Output the Python code in a ```python code block.\n");
-        prompt.push_str("If you output `meta.yaml`, it must follow the trigger rules below.\n\n");
+        prompt.push_str("If you output `meta.yaml`, it must follow the minimal meta rules below.\n\n");
         prompt.push_str(Self::trigger_rules_prompt());
         prompt.push_str("The script must be syntactically valid Python.\n");
 
@@ -1536,7 +1533,7 @@ or\n\
         prompt.push_str("Fix ALL the issues listed above and generate the COMPLETE corrected SKILL.py content.\n");
         prompt.push_str("If the skill can directly produce final user-facing text, return `display_text`. Otherwise return `summary_data` as a lightweight structured summary for runtime/LLM polishing. Do NOT place complete webpages, long markdown, or large raw logs into `summary_data`.\n");
         prompt.push_str("Output the Python code in a ```python code block.\n");
-        prompt.push_str("If you output `meta.yaml`, it must follow the trigger rules below.\n\n");
+        prompt.push_str("If you output `meta.yaml`, it must follow the minimal meta rules below.\n\n");
         prompt.push_str(Self::trigger_rules_prompt());
 
         Ok(prompt)

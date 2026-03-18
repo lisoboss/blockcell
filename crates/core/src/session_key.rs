@@ -62,7 +62,7 @@ mod tests {
 
     #[test]
     fn test_resolve_session_key_from_id_prefers_existing_direct_stem() {
-        let stems = vec!["ws_default_123", "telegram_chat_1"];
+        let stems = ["ws_default_123", "telegram_chat_1"];
         assert_eq!(
             resolve_session_key_from_id("default_123", stems.iter().copied()),
             "ws:default:123"
@@ -71,7 +71,7 @@ mod tests {
 
     #[test]
     fn test_resolve_session_key_from_id_falls_back_to_matching_stem() {
-        let stems = vec!["ws_ws_default_123", "telegram_chat_1"];
+        let stems = ["ws_ws_default_123", "telegram_chat_1"];
         assert_eq!(
             resolve_session_key_from_id("ws_default_123", stems.iter().copied()),
             "ws:ws:default:123"

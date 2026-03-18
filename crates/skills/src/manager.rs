@@ -18,9 +18,6 @@ pub struct SkillMeta {
     pub permissions: Vec<String>,
     #[serde(default)]
     pub always: bool,
-    /// Trigger phrases — when user input matches any of these, this skill is activated.
-    #[serde(default)]
-    pub triggers: Vec<String>,
     /// Explicit tools this skill may use when activated.
     #[serde(default)]
     pub tools: Vec<String>,
@@ -432,6 +429,147 @@ fn resolve_markdown_path(skill_dir: &Path, relative_path: &str) -> Result<PathBu
     Ok(canonical_target)
 }
 
+fn strip_inline_markdown(line: &str) -> String {
+    let mut output = String::new();
+    let mut index = 0usize;
+
+    while index < line.len() {
+        let rest = &line[index..];
+        let Some(label_start_rel) = rest.find('[') else {
+            output.push_str(rest);
+            break;
+        };
+        let label_start = index + label_start_rel;
+        output.push_str(&line[index..label_start]);
+
+        let Some(label_end_rel) = line[label_start + 1..].find("](") else {
+            output.push_str(&line[label_start..]);
+            break;
+        };
+        let label_end = label_start + 1 + label_end_rel;
+        let Some(target_end_rel) = line[label_end + 2..].find(')') else {
+            output.push_str(&line[label_start..]);
+            break;
+        };
+        let target_end = label_end + 2 + target_end_rel;
+        output.push_str(&line[label_start + 1..label_end]);
+        index = target_end + 1;
+    }
+
+    output
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+
+    match text.char_indices().nth(max_chars) {
+        Some((idx, _)) => format!("{}...", text[..idx].trim_end()),
+        None => text.to_string(),
+    }
+}
+
+fn concise_markdown_excerpt(text: &str, max_chars: usize) -> String {
+    let mut excerpt = String::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if !excerpt.is_empty() {
+                break;
+            }
+            continue;
+        }
+        if trimmed.starts_with('#') || trimmed == "---" {
+            continue;
+        }
+
+        let cleaned = strip_inline_markdown(strip_markdown_list_prefix(trimmed))
+            .replace('`', "")
+            .trim()
+            .to_string();
+        if cleaned.is_empty() {
+            continue;
+        }
+
+        if !excerpt.is_empty() {
+            excerpt.push(' ');
+        }
+        excerpt.push_str(&cleaned);
+
+        if excerpt.chars().count() >= max_chars {
+            break;
+        }
+    }
+
+    truncate_chars(excerpt.trim(), max_chars)
+}
+
+fn skill_supports_local_exec(skill: &Skill, manual: &str) -> bool {
+    if skill.path.join("SKILL.py").exists() || skill.path.join("SKILL.rhai").exists() {
+        return true;
+    }
+
+    if skill_dir_contains_local_script(&skill.path) {
+        return true;
+    }
+
+    let manual_lower = manual.to_lowercase();
+    [
+        "exec_local",
+        "本地脚本",
+        "local script",
+        "scripts/",
+        ".py",
+        ".sh",
+        ".php",
+        ".js",
+        "python ",
+        "bash ",
+        "sh ",
+        "./",
+    ]
+        .iter()
+        .any(|needle| manual_lower.contains(needle))
+}
+
+fn skill_dir_contains_local_script(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if skill_dir_contains_local_script(&path) {
+                return true;
+            }
+            continue;
+        }
+
+        if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| matches!(ext, "py" | "sh" | "php" | "js" | "ts" | "rb"))
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SkillCard {
+    pub name: String,
+    pub description: String,
+    pub when_to_use: String,
+    pub outputs: String,
+    pub allowed_tools: Vec<String>,
+    pub supports_local_exec: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct Skill {
     pub name: String,
@@ -794,47 +932,82 @@ impl SkillManager {
         self.skills.get(name)
     }
 
-    /// Find a skill whose trigger phrases match the user input.
-    /// Disabled skills are skipped during candidate selection.
-    /// Returns the first matching skill.
-    pub fn match_skill(
-        &self,
-        user_input: &str,
-        disabled_skills: &HashSet<String>,
-    ) -> Option<&Skill> {
-        let input_lower = user_input.to_lowercase();
-        self.skills
-            .values()
-            .filter(|s| {
-                s.available && !s.meta.triggers.is_empty() && !disabled_skills.contains(&s.name)
-            })
-            .find(|s| {
-                s.meta
-                    .triggers
-                    .iter()
-                    .any(|trigger: &String| input_lower.contains(&trigger.to_lowercase()))
-            })
+    pub fn build_skill_card(skill: &Skill) -> SkillCard {
+        let cached_docs = skill
+            .cached_docs
+            .clone()
+            .or_else(|| SkillDocCache::load(&skill.path).ok().flatten());
+        let manual = cached_docs
+            .as_ref()
+            .map(|docs| docs.root_md.clone())
+            .or_else(|| skill.load_md())
+            .unwrap_or_default();
+        let prompt_bundle = cached_docs
+            .as_ref()
+            .map(|docs| docs.prompt_bundle.clone())
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or_else(|| manual.clone());
+        let summary_bundle = cached_docs
+            .as_ref()
+            .map(|docs| docs.summary_bundle.clone())
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or_else(|| manual.clone());
+        let shared_section = extract_section_by_anchor(&manual, "shared").unwrap_or_default();
+        let prompt_section = extract_section_by_anchor(&manual, "prompt").unwrap_or_default();
+        let summary_section = extract_section_by_anchor(&manual, "summary").unwrap_or_default();
+        let when_to_use_source = join_markdown_parts(&[shared_section.as_str(), prompt_section.as_str()]);
+        let when_to_use = concise_markdown_excerpt(
+            if when_to_use_source.trim().is_empty() {
+                &prompt_bundle
+            } else {
+                &when_to_use_source
+            },
+            220,
+        );
+        let outputs = concise_markdown_excerpt(
+            if summary_section.trim().is_empty() {
+                &summary_bundle
+            } else {
+                &summary_section
+            },
+            220,
+        );
+
+        SkillCard {
+            name: skill.name.clone(),
+            description: skill.meta.description.clone(),
+            when_to_use: if when_to_use.is_empty() {
+                concise_markdown_excerpt(&manual, 220)
+            } else {
+                when_to_use
+            },
+            outputs: if outputs.is_empty() {
+                skill.meta
+                    .output_format
+                    .clone()
+                    .unwrap_or_else(|| "Answer the user's request directly.".to_string())
+            } else {
+                outputs
+            },
+            allowed_tools: skill.meta.effective_tools(),
+            supports_local_exec: skill_supports_local_exec(skill, &manual),
+        }
     }
 
-    /// Return ALL skills whose trigger phrases match the user input.
-    /// Used for multi-skill disambiguation when more than one skill matches.
-    pub fn match_all_skills<'a>(
+    pub fn list_enabled_skills<'a>(
         &'a self,
-        user_input: &str,
         disabled_skills: &HashSet<String>,
     ) -> Vec<&'a Skill> {
-        let input_lower = user_input.to_lowercase();
         self.skills
             .values()
-            .filter(|s| {
-                s.available
-                    && !s.meta.triggers.is_empty()
-                    && !disabled_skills.contains(&s.name)
-                    && s.meta
-                        .triggers
-                        .iter()
-                        .any(|trigger: &String| input_lower.contains(&trigger.to_lowercase()))
-            })
+            .filter(|s| s.available && !disabled_skills.contains(&s.name))
+            .collect()
+    }
+
+    pub fn list_enabled_skill_cards(&self, disabled_skills: &HashSet<String>) -> Vec<SkillCard> {
+        self.list_enabled_skills(disabled_skills)
+            .into_iter()
+            .map(Self::build_skill_card)
             .collect()
     }
 
@@ -1002,7 +1175,7 @@ capabilities:
     }
 
     #[test]
-    fn test_match_skill_skips_disabled_matching_skill_and_returns_next_candidate() {
+    fn test_skill_manager_lists_enabled_skills_without_free_text_matching() {
         let mut manager = SkillManager::new();
         manager.skills = HashMap::from([
             (
@@ -1012,7 +1185,6 @@ capabilities:
                     path: PathBuf::from("/tmp/disabled_skill"),
                     meta: SkillMeta {
                         name: "disabled_skill".to_string(),
-                        triggers: vec!["deploy".to_string()],
                         ..SkillMeta::default()
                     },
                     available: true,
@@ -1028,7 +1200,6 @@ capabilities:
                     path: PathBuf::from("/tmp/active_skill"),
                     meta: SkillMeta {
                         name: "active_skill".to_string(),
-                        triggers: vec!["deploy".to_string()],
                         ..SkillMeta::default()
                     },
                     available: true,
@@ -1040,22 +1211,23 @@ capabilities:
         ]);
 
         let disabled_skills = HashSet::from(["disabled_skill".to_string()]);
-        let matched = manager.match_skill("please deploy the release", &disabled_skills);
+        let listed = manager.list_enabled_skills(&disabled_skills);
 
         assert_eq!(
-            matched.map(|skill| skill.name.as_str()),
-            Some("active_skill")
+            listed
+                .into_iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["active_skill"]
         );
     }
 
     #[test]
-    fn test_skill_meta_serializes_without_execution_contract_fields() {
+    fn test_skill_meta_serializes_without_legacy_fields() {
         let meta: SkillMeta = serde_yaml::from_str(
             r#"
 name: demo
 description: minimal
-triggers:
-  - "demo"
 permissions:
   - network
 requires:
@@ -1069,7 +1241,6 @@ fallback:
 
         assert_eq!(meta.name, "demo");
         assert_eq!(meta.description, "minimal");
-        assert_eq!(meta.triggers, vec!["demo"]);
         assert_eq!(meta.permissions, vec!["network"]);
         assert_eq!(meta.requires.bins, vec!["python3"]);
         assert_eq!(
@@ -1080,33 +1251,22 @@ fallback:
         );
 
         let value = serde_json::to_value(&meta).expect("serialize skill meta");
-        assert!(value.get("execution").is_none());
-        assert!(value.get("actions").is_none());
-        assert!(value.get("dispatch_kind").is_none());
-        assert!(value.get("summary_mode").is_none());
-    }
-
-    #[test]
-    fn test_skill_meta_drops_legacy_execution_block_when_reserialized() {
-        let meta: SkillMeta = serde_yaml::from_str(
-            r#"
-name: demo
-description: legacy
-triggers:
-  - "demo"
-execution:
-  kind: python
-  entry: SKILL.py
-  actions:
-    - name: search
-      argv: ["search", "{query}"]
-"#,
-        )
-        .expect("legacy meta should still parse");
-
-        let value = serde_json::to_value(&meta).expect("serialize skill meta");
-        assert_eq!(value.get("name").and_then(|v| v.as_str()), Some("demo"));
-        assert!(value.get("execution").is_none());
+        let object = value
+            .as_object()
+            .expect("skill meta should serialize to an object");
+        let keys = object.keys().cloned().collect::<std::collections::HashSet<_>>();
+        let expected = std::collections::HashSet::from([
+            "name".to_string(),
+            "description".to_string(),
+            "requires".to_string(),
+            "permissions".to_string(),
+            "always".to_string(),
+            "tools".to_string(),
+            "capabilities".to_string(),
+            "output_format".to_string(),
+            "fallback".to_string(),
+        ]);
+        assert_eq!(keys, expected);
     }
 
     #[test]
@@ -1227,5 +1387,150 @@ Summarize in Chinese with concise bullets.
             .expect_err("parent escape should fail");
 
         assert!(format!("{}", err).contains("outside"));
+    }
+
+    #[test]
+    fn test_skill_card_is_built_from_meta_and_skill_doc() {
+        let skill_dir = temp_skill_dir("blockcell-skill-card");
+        fs::write(
+            skill_dir.join("meta.yaml"),
+            r#"
+name: weather
+description: 查询天气
+tools:
+  - web_fetch
+"#,
+        )
+        .expect("write meta");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            r#"# Weather
+
+## Shared {#shared}
+适合查询城市天气、未来天气和天气趋势。
+
+## Prompt {#prompt}
+先确认用户想查哪个城市、哪一天。
+
+## Summary {#summary}
+输出天气概览、温度和降雨提示。
+"#,
+        )
+        .expect("write skill md");
+        fs::write(skill_dir.join("weather.py"), "print('ok')").expect("write local script");
+
+        let skill = Skill {
+            name: "weather".to_string(),
+            path: skill_dir,
+            meta: SkillMeta {
+                name: "weather".to_string(),
+                description: "查询天气".to_string(),
+                tools: vec!["web_fetch".to_string()],
+                ..SkillMeta::default()
+            },
+            available: true,
+            unavailable_reason: None,
+            current_version: None,
+            cached_docs: None,
+        };
+
+        let card = SkillManager::build_skill_card(&skill);
+        assert_eq!(card.name, "weather");
+        assert_eq!(card.description, "查询天气");
+        assert!(card.when_to_use.contains("适合查询城市天气"));
+        assert!(card.outputs.contains("输出天气概览"));
+        assert_eq!(card.allowed_tools, vec!["web_fetch"]);
+        assert!(card.supports_local_exec);
+    }
+
+    #[test]
+    fn test_skill_cards_are_short_and_do_not_inline_full_skill_md() {
+        let skill_dir = temp_skill_dir("blockcell-skill-card-short");
+        fs::write(
+            skill_dir.join("meta.yaml"),
+            r#"
+name: ppt
+description: 生成 PPT 页面
+"#,
+        )
+        .expect("write meta");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            format!(
+                "# PPT\n\n## Shared {{#shared}}\n适合把信息整理成演示页面。\n\n## Prompt {{#prompt}}\n{}\n",
+                "VERY_DETAILED_INTERNAL_STEP ".repeat(80)
+            ),
+        )
+        .expect("write skill md");
+
+        let mut manager = SkillManager::new();
+        manager.skills = HashMap::from([(
+            "ppt".to_string(),
+            Skill {
+                name: "ppt".to_string(),
+                path: skill_dir,
+                meta: SkillMeta {
+                    name: "ppt".to_string(),
+                    description: "生成 PPT 页面".to_string(),
+                    ..SkillMeta::default()
+                },
+                available: true,
+                unavailable_reason: None,
+                current_version: None,
+                cached_docs: None,
+            },
+        )]);
+
+        let cards = manager.list_enabled_skill_cards(&HashSet::new());
+        assert_eq!(cards.len(), 1);
+        assert!(cards[0].when_to_use.len() <= 240);
+        assert!(!cards[0]
+            .when_to_use
+            .contains("VERY_DETAILED_INTERNAL_STEP VERY_DETAILED_INTERNAL_STEP VERY_DETAILED_INTERNAL_STEP VERY_DETAILED_INTERNAL_STEP VERY_DETAILED_INTERNAL_STEP"));
+    }
+
+    #[test]
+    fn test_skill_card_detects_exec_local_from_manual_and_nested_script() {
+        let skill_dir = temp_skill_dir("blockcell-skill-card-exec-local");
+        fs::create_dir_all(skill_dir.join("scripts")).expect("create scripts dir");
+        fs::write(
+            skill_dir.join("meta.yaml"),
+            r#"
+name: local_demo
+description: 本地脚本 demo
+"#,
+        )
+        .expect("write meta");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            r#"# Local Demo
+
+## Shared {#shared}
+适合执行 skill 目录内的本地脚本。
+
+## Prompt {#prompt}
+如果要运行本地脚本，使用 exec_local。
+"#,
+        )
+        .expect("write skill md");
+        fs::write(skill_dir.join("scripts/hello.sh"), "#!/bin/sh\necho ok\n")
+            .expect("write script");
+
+        let skill = Skill {
+            name: "local_demo".to_string(),
+            path: skill_dir,
+            meta: SkillMeta {
+                name: "local_demo".to_string(),
+                description: "本地脚本 demo".to_string(),
+                ..SkillMeta::default()
+            },
+            available: true,
+            unavailable_reason: None,
+            current_version: None,
+            cached_docs: None,
+        };
+
+        let card = SkillManager::build_skill_card(&skill);
+        assert!(card.supports_local_exec);
     }
 }

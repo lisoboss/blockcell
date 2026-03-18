@@ -200,7 +200,7 @@ async fn mcp_client_respects_call_timeout() {
     let call_result = result.expect("tool call finished before harness timeout");
     assert!(call_result.is_err(), "tool call should time out");
     assert!(elapsed < Duration::from_secs(2));
-    let err = call_result.err().expect("call timeout error").to_string();
+    let err = call_result.expect_err("call timeout error").to_string();
     assert!(
         err.contains("timeout") || err.contains("timed out"),
         "unexpected error: {err}"

@@ -12,6 +12,7 @@ pub mod data_process;
 pub mod email;
 pub mod encrypt;
 pub mod exec;
+pub mod exec_local;
 pub mod file_ops;
 pub mod fs;
 pub mod html_to_md;
@@ -204,6 +205,7 @@ pub trait TaskManagerOps: Send + Sync {
 pub struct ToolContext {
     pub workspace: PathBuf,
     pub builtin_skills_dir: Option<PathBuf>,
+    pub active_skill_dir: Option<PathBuf>,
     pub session_key: String,
     pub channel: String,
     pub account_id: Option<String>,

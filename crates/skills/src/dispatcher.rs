@@ -639,8 +639,6 @@ fn map_to_json(map: &Map) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use std::path::PathBuf;
 
     #[test]
     fn test_simple_skill_script() {
@@ -830,11 +828,20 @@ mod tests {
     }
 
     #[test]
-    fn test_weather_skill_script_handles_wttr_json_response() {
+    fn test_dispatcher_handles_web_fetch_json_payload() {
         let dispatcher = SkillDispatcher::new();
-        let script_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../skills/weather/SKILL.rhai");
-        let script = fs::read_to_string(&script_path).expect("read weather skill script");
+        let script = r#"
+            let result = call_tool("web_fetch", #{
+                url: "https://wttr.in/Shenzhen?format=j1"
+            });
+            let payload = from_json(get_field(result, "text"));
+            let _current = get_field(payload, "current_condition");
+            let _area = get_field(payload, "nearest_area");
+            set_output(#{
+                success: !is_error(result),
+                source: "wttr.in"
+            });
+        "#;
 
         let mut ctx = HashMap::new();
         ctx.insert(
@@ -845,7 +852,7 @@ mod tests {
         );
 
         let result = dispatcher
-            .execute_sync(&script, "深圳天气", ctx, |name, params| {
+            .execute_sync(script, "深圳天气", ctx, |name, params| {
                 assert_eq!(name, "web_fetch");
                 let url = params
                     .get("url")
@@ -868,11 +875,27 @@ mod tests {
     }
 
     #[test]
-    fn test_weather_skill_script_returns_direct_text_for_tomorrow_query() {
+    fn test_dispatcher_can_build_weather_summary_from_json_payload() {
         let dispatcher = SkillDispatcher::new();
-        let script_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../skills/weather/SKILL.rhai");
-        let script = fs::read_to_string(&script_path).expect("read weather skill script");
+        let script = r#"
+            let result = call_tool("web_fetch", #{
+                url: "https://wttr.in/Shenzhen?format=j1"
+            });
+            let payload = from_json(get_field(result, "text"));
+            let forecast = get_field(payload, "weather")[1];
+            let date = get_field(forecast, "date");
+            let maxtemp = get_field(forecast, "maxtempC");
+            set_output(#{
+                success: !is_error(result),
+                display_text: "明天深圳天气预报已生成",
+                summary_data: #{
+                    forecast: #{
+                        date: date,
+                        maxtempC: maxtemp
+                    }
+                }
+            });
+        "#;
 
         let mut ctx = HashMap::new();
         ctx.insert(
@@ -883,7 +906,7 @@ mod tests {
         );
 
         let result = dispatcher
-            .execute_sync(&script, "深圳明天的天气怎么样", ctx, |name, params| {
+            .execute_sync(script, "深圳明天的天气怎么样", ctx, |name, params| {
                 assert_eq!(name, "web_fetch");
                 let url = params
                     .get("url")

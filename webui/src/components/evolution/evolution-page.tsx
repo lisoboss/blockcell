@@ -157,7 +157,6 @@ export function EvolutionPage() {
 
   // Test & Evolve form (merged)
   const [testSkillName, setTestSkillName] = useState('');
-  const [testSkillTriggers, setTestSkillTriggers] = useState<string[]>([]);
   const [testInput, setTestInput] = useState('');
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<any>(null);
@@ -248,15 +247,12 @@ export function EvolutionPage() {
     setTestResult(null);
     setShowEvolveForm(false);
     setTab('test');
-    // Set triggers from skills list
-    const found = skills.find((s: any) => s.name === skillName);
-    setTestSkillTriggers(found?.triggers ?? []);
     // Auto-load suggestion
     setLoadingSuggestion(true);
     getTestSuggestion(skillName).then(res => {
       if (res.suggestion) setTestInput(res.suggestion);
     }).catch(() => {}).finally(() => setLoadingSuggestion(false));
-  }, [skills]);
+  }, []);
 
   const handleDelete = useCallback(async (id: string) => {
     await deleteEvolution(id);
@@ -269,9 +265,6 @@ export function EvolutionPage() {
     setTestResult(null);
     setShowEvolveForm(false);
     setEvolveDesc('');
-    // 从 skills 数组中读取该技能的 triggers
-    const found = skills.find((s: any) => s.name === name);
-    setTestSkillTriggers(found?.triggers ?? []);
     if (!name) return;
     setLoadingSuggestion(true);
     try {
@@ -284,7 +277,7 @@ export function EvolutionPage() {
     } finally {
       setLoadingSuggestion(false);
     }
-  }, [skills]);
+  }, []);
 
   const handleTest = useCallback(async () => {
     if (!testSkillName.trim() || !testInput.trim()) return;
@@ -438,9 +431,6 @@ export function EvolutionPage() {
                             </div>
                             {r.description && (
                               <p className="text-[10px] text-muted-foreground mt-0.5 truncate">{r.description}</p>
-                            )}
-                            {r.triggers && (
-                              <p className="text-[10px] text-muted-foreground/60 mt-0.5 truncate">{r.triggers}</p>
                             )}
                           </div>
                           <button
@@ -604,27 +594,6 @@ export function EvolutionPage() {
                     ))}
                   </select>
                 </div>
-                {/* Triggers hint — 选技能后展示触发关键字，方便用户自定义输入 */}
-                {testSkillName && testSkillTriggers.length > 0 && (
-                  <div className="rounded-lg border border-[hsl(var(--brand-green)/0.20)] bg-[hsl(var(--brand-green)/0.05)] px-3 py-2">
-                    <p className="text-[10px] text-[hsl(var(--brand-green)/0.72)] font-medium mb-1.5">
-                      触发关键字 <span className="text-muted-foreground font-normal">— 真实对话中，输入需包含以下关键字之一才能激活此技能</span>
-                    </p>
-                    <div className="flex flex-wrap gap-1.5">
-                      {testSkillTriggers.map((kw: string) => (
-                        <button
-                          key={kw}
-                          type="button"
-                          onClick={() => setTestInput(prev => prev ? `${kw} ${prev}` : kw)}
-                          className="px-2 py-0.5 text-[11px] rounded-md bg-[hsl(var(--brand-green)/0.10)] text-[hsl(var(--brand-green))] border border-[hsl(var(--brand-green)/0.20)] hover:bg-[hsl(var(--brand-green)/0.16)] transition-colors font-mono"
-                          title="点击插入到输入框开头"
-                        >
-                          {kw}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                )}
                 <div>
                   <label className="text-xs text-muted-foreground mb-1 block">
                     {t('evolution.testInput')}

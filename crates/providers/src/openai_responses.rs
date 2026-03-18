@@ -5,6 +5,7 @@ use blockcell_core::{Error, Result};
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
@@ -189,6 +190,7 @@ impl OpenAIResponsesProvider {
 
     fn build_input(messages: &[ChatMessage]) -> Vec<Value> {
         let mut input = Vec::new();
+        let mut known_call_ids = HashSet::new();
 
         for message in messages {
             match message.role.as_str() {
@@ -208,6 +210,7 @@ impl OpenAIResponsesProvider {
 
                     if message.role == "assistant" {
                         for tool_call in tool_calls {
+                            known_call_ids.insert(tool_call.id.clone());
                             input.push(json!({
                                 "type": "function_call",
                                 "call_id": tool_call.id,
@@ -219,6 +222,13 @@ impl OpenAIResponsesProvider {
                 }
                 "tool" => {
                     let call_id = message.tool_call_id.clone().unwrap_or_default();
+                    if call_id.is_empty() || !known_call_ids.contains(&call_id) {
+                        debug!(
+                            call_id = %call_id,
+                            "Dropping orphaned function_call_output without matching function_call"
+                        );
+                        continue;
+                    }
                     input.push(json!({
                         "type": "function_call_output",
                         "call_id": call_id,
@@ -511,13 +521,31 @@ mod tests {
     }
 
     #[test]
-    fn test_build_input_for_tool_result() {
+    fn test_build_input_for_tool_result_requires_matching_function_call() {
         let messages = vec![ChatMessage::tool_result("call_1", "done")];
         let built = OpenAIResponsesProvider::build_input(&messages);
-        assert_eq!(built.len(), 1);
-        assert_eq!(built[0]["type"], "function_call_output");
+        assert!(built.is_empty());
+    }
+
+    #[test]
+    fn test_build_input_for_tool_result_after_assistant_function_call() {
+        let mut assistant = ChatMessage::assistant("");
+        assistant.tool_calls = Some(vec![ToolCallRequest {
+            id: "call_1".to_string(),
+            name: "write_file".to_string(),
+            arguments: json!({"path": "./story.txt", "content": "hello"}),
+            thought_signature: None,
+        }]);
+
+        let messages = vec![assistant, ChatMessage::tool_result("call_1", "done")];
+        let built = OpenAIResponsesProvider::build_input(&messages);
+
+        assert_eq!(built.len(), 2);
+        assert_eq!(built[0]["type"], "function_call");
         assert_eq!(built[0]["call_id"], "call_1");
-        assert_eq!(built[0]["output"], "done");
+        assert_eq!(built[1]["type"], "function_call_output");
+        assert_eq!(built[1]["call_id"], "call_1");
+        assert_eq!(built[1]["output"], "done");
     }
 
     #[test]

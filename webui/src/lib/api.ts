@@ -652,7 +652,15 @@ export function deleteSkill(name: string) {
 }
 
 export function installExternalSkill(url: string) {
-  return request<{ status: string; skill: string; message: string; skill_dir?: string }>('/skills/install-external', {
+  return request<{
+    status: string;
+    skill: string;
+    message: string;
+    evolution_id?: string;
+    files_downloaded?: number;
+    size_bytes?: number;
+    skill_dir?: string;
+  }>('/skills/install-external', {
     method: 'POST',
     body: JSON.stringify({ url }),
   });

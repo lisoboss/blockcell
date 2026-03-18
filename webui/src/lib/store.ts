@@ -421,6 +421,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
         break;
       }
 
+      case 'stream_reset': {
+        set((s) => {
+          const lastMsg = s.messages[s.messages.length - 1];
+          if (lastMsg?.role === 'assistant' && lastMsg.streaming) {
+            return { messages: s.messages.slice(0, -1) };
+          }
+          return {};
+        });
+        break;
+      }
+
       case 'thinking': {
         // 直接使用 set() 并在回调中获取最新状态，确保流式追加正确
         set((s) => {

@@ -22,8 +22,9 @@ import { SkillsPage } from './components/skills/skills-page';
 import { SetupWizard } from './components/setup-wizard';
 import { SystemEventsPanel } from './components/system-events-panel';
 import { ThemeProvider } from './components/theme-provider';
-import { useSidebarStore, useChatStore, useConnectionStore, useReminderAlertsStore } from './lib/store';
-import { wsManager } from './lib/ws';
+import { useSidebarStore, useChatStore, useConnectionStore, useReminderAlertsStore, useAgentStore } from './lib/store';
+import { wsManager, type WsEvent } from './lib/ws';
+import { WsEventBatcher } from './lib/ws-batcher';
 import { cn } from './lib/utils';
 import { registerShortcuts, handleGlobalKeyDown } from './lib/keyboard';
 
@@ -34,14 +35,18 @@ interface ConfirmDialog {
 }
 
 export default function App() {
-  const { activePage, isOpen, setActivePage } = useSidebarStore();
-  const { setConnected, handleWsEvent, setCurrentSession, setPendingReminderFocus, setSessions } = useChatStore();
+  const activePage = useSidebarStore((s) => s.activePage);
+  const isOpen = useSidebarStore((s) => s.isOpen);
+  const setActivePage = useSidebarStore((s) => s.setActivePage);
+  const setConnected = useChatStore((s) => s.setConnected);
+  const handleWsEvent = useChatStore((s) => s.handleWsEvent);
+  const setCurrentSession = useChatStore((s) => s.setCurrentSession);
+  const setPendingReminderFocus = useChatStore((s) => s.setPendingReminderFocus);
+  const setSessions = useChatStore((s) => s.setSessions);
   const chatSessions = useChatStore((s) => s.sessions);
   const reminderAlerts = useReminderAlertsStore((s) => s.alerts);
   const dismissReminderAlert = useReminderAlertsStore((s) => s.dismissAlert);
-  const selectedAgentId = typeof window === 'undefined'
-    ? 'default'
-    : (localStorage.getItem('blockcell_selected_agent') || 'default');
+  const selectedAgentId = useAgentStore((s) => s.selectedAgentId);
   const visibleReminderAlerts = reminderAlerts.filter((alert) => alert.agentId === selectedAgentId);
   const [authenticated, setAuthenticated] = useState(() => !!localStorage.getItem('blockcell_token'));
   const [confirmDialog, setConfirmDialog] = useState<ConfirmDialog | null>(null);
@@ -68,15 +73,16 @@ export default function App() {
     if (localStorage.getItem('blockcell_token')) {
       wsManager.connect();
     }
-    const offConnected = wsManager.on('_connected', () => setConnectedRef.current(true));
-    const offDisconnected = wsManager.on('_disconnected', () => setConnectedRef.current(false));
-    const offAll = wsManager.on('*', (event) => {
+    const wsEventBatcher = new WsEventBatcher<WsEvent>((event) => {
       if (event.type === 'confirm_request' && event.request_id) {
         setConfirmDialog({ requestId: event.request_id, tool: event.tool || '', paths: event.paths || [] });
       } else {
         handleWsEventRef.current(event);
       }
     });
+    const offConnected = wsManager.on('_connected', () => setConnectedRef.current(true));
+    const offDisconnected = wsManager.on('_disconnected', () => setConnectedRef.current(false));
+    const offAll = wsManager.on('*', (event) => wsEventBatcher.push(event));
     const offConnection = wsManager.onConnectionChange((state) => {
       updateConnectionRef.current(state);
 
@@ -96,6 +102,7 @@ export default function App() {
       offDisconnected();
       offAll();
       offConnection();
+      wsEventBatcher.dispose();
       wsManager.disconnect();
       window.removeEventListener('keydown', handleGlobalKeyDown);
     };

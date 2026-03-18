@@ -207,25 +207,11 @@ impl ContextBuilder {
         user_input: &str,
         disabled_skills: &HashSet<String>,
     ) -> Option<ActiveSkillContext> {
-        if user_input.is_empty() {
+        let skill_name = user_input.trim();
+        if skill_name.is_empty() {
             return None;
         }
-        let manager = self.skill_manager.as_ref()?;
-        let skill = manager.match_skill(user_input, disabled_skills)?;
-        let prompt_md = skill.load_prompt_bundle()?;
-        let inject_prompt_md =
-            !skill.path.join("SKILL.py").exists() && !skill.path.join("SKILL.rhai").exists();
-        Some(ActiveSkillContext {
-            name: skill.name.clone(),
-            prompt_md,
-            inject_prompt_md,
-            tools: skill.meta.effective_tools(),
-            fallback_message: skill
-                .meta
-                .fallback
-                .as_ref()
-                .and_then(|fallback| fallback.message.clone()),
-        })
+        self.resolve_active_skill_by_name(skill_name, disabled_skills)
     }
 
     pub fn resolve_active_skill_by_name(
@@ -245,12 +231,10 @@ impl ContextBuilder {
             return None;
         }
         let prompt_md = skill.load_prompt_bundle()?;
-        let inject_prompt_md =
-            !skill.path.join("SKILL.py").exists() && !skill.path.join("SKILL.rhai").exists();
         Some(ActiveSkillContext {
             name: skill.name.clone(),
             prompt_md,
-            inject_prompt_md,
+            inject_prompt_md: true,
             tools: skill.meta.effective_tools(),
             fallback_message: skill
                 .meta
@@ -745,7 +729,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_active_skill_by_name_disables_prompt_injection_for_script_skill() {
+    fn test_resolve_active_skill_by_name_keeps_manual_injection_for_script_skill() {
         let base =
             std::env::temp_dir().join(format!("blockcell-context-test-{}", uuid::Uuid::new_v4()));
         let paths = Paths::with_base(base);
@@ -756,8 +740,6 @@ mod tests {
             r#"
 name: structured_demo
 description: structured demo
-triggers:
-  - structured demo
 "#,
         )
         .expect("write meta");
@@ -770,7 +752,7 @@ triggers:
             .resolve_active_skill_by_name("structured_demo", &HashSet::new())
             .expect("active skill should resolve");
 
-        assert!(!ctx.inject_prompt_md);
+        assert!(ctx.inject_prompt_md);
     }
 
     #[test]
@@ -785,8 +767,6 @@ triggers:
             r#"
 name: prompt_demo
 description: prompt demo
-triggers:
-  - prompt demo
 "#,
         )
         .expect("write meta");
@@ -823,6 +803,38 @@ Prompt-only rule.
         assert!(ctx.prompt_md.contains("Shared rule."));
         assert!(ctx.prompt_md.contains("Prompt-only rule."));
         assert!(!ctx.prompt_md.contains("Planning-only rule."));
+    }
+
+    #[test]
+    fn test_resolve_active_skill_does_not_match_free_text_without_explicit_name() {
+        let base =
+            std::env::temp_dir().join(format!("blockcell-context-test-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::with_base(base);
+        let skill_dir = paths.skills_dir().join("deploy_demo");
+        fs::create_dir_all(&skill_dir).expect("create skill dir");
+        fs::write(
+            skill_dir.join("meta.yaml"),
+            r#"
+name: deploy_demo
+description: deploy demo
+"#,
+        )
+        .expect("write meta");
+        fs::write(skill_dir.join("SKILL.md"), "deploy manual").expect("write skill md");
+
+        let builder = ContextBuilder::new(paths, Config::default());
+
+        assert!(
+            builder
+                .resolve_active_skill("please deploy the release", &HashSet::new())
+                .is_none()
+        );
+        assert_eq!(
+            builder
+                .resolve_active_skill("deploy_demo", &HashSet::new())
+                .map(|ctx| ctx.name),
+            Some("deploy_demo".to_string())
+        );
     }
 
     #[test]

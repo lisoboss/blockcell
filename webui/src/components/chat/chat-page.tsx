@@ -1,6 +1,6 @@
 'use client';
 
-import { useRef, useEffect, useState } from 'react';
+import { useRef, useEffect, useState, useMemo, useCallback, memo } from 'react';
 import { Send, Loader2, Paperclip, X, FileAudio, Upload, Square } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useAgentStore, useChatStore } from '@/lib/store';
@@ -12,12 +12,17 @@ import { CommandPicker, CommandItem } from './command-picker';
 import { useT } from '@/lib/i18n';
 import { isMediaPath } from './media-attachment';
 import type { UiMessage } from '@/lib/store';
+import { computeVirtualWindow } from '@/lib/virtual-list';
 
 interface PendingFile {
   file: File;
   previewUrl: string;
   type: 'image' | 'audio' | 'video';
 }
+
+const DEFAULT_MESSAGE_HEIGHT = 148;
+const MESSAGE_GAP_PX = 16;
+const VIRTUAL_OVERSCAN_PX = 640;
 
 export function ChatPage() {
   const messages = useChatStore((s) => s.messages);
@@ -37,12 +42,57 @@ export function ChatPage() {
   const [showCommandPicker, setShowCommandPicker] = useState(false);
   const [commandQuery, setCommandQuery] = useState('');
   const hasMessages = messages.length > 0;
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewportHeight, setViewportHeight] = useState(0);
+  const [messageHeights, setMessageHeights] = useState<Record<string, number>>({});
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const inputContainerRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const selectedAgentRef = useRef(selectedAgentId);
   const currentSessionRef = useRef(currentSessionId);
+  const scrollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingFilesRef = useRef<PendingFile[]>([]);
+  const sessionMessageKeyPrefix = currentSessionId || 'draft';
+  const showLoadingIndicator = isLoading && messages[messages.length - 1]?.role !== 'assistant';
+
+  const itemHeights = useMemo(
+    () =>
+      messages.map((message) => {
+        const key = `${sessionMessageKeyPrefix}:${message.id}`;
+        return messageHeights[key] ?? DEFAULT_MESSAGE_HEIGHT;
+      }),
+    [messageHeights, messages, sessionMessageKeyPrefix],
+  );
+
+  const virtualWindow = useMemo(
+    () =>
+      computeVirtualWindow(
+        itemHeights,
+        scrollTop,
+        viewportHeight,
+        VIRTUAL_OVERSCAN_PX,
+      ),
+    [itemHeights, scrollTop, viewportHeight],
+  );
+
+  const visibleMessageIndexes = useMemo(() => {
+    if (virtualWindow.endIndex < virtualWindow.startIndex) {
+      return [];
+    }
+
+    const indexes: number[] = [];
+    for (let i = virtualWindow.startIndex; i <= virtualWindow.endIndex; i += 1) {
+      indexes.push(i);
+    }
+    return indexes;
+  }, [virtualWindow.endIndex, virtualWindow.startIndex]);
+
+  const highlightedIndex = useMemo(
+    () => messages.findIndex((message) => message.highlight),
+    [messages],
+  );
 
   useEffect(() => {
     selectedAgentRef.current = selectedAgentId;
@@ -51,6 +101,47 @@ export function ChatPage() {
   useEffect(() => {
     currentSessionRef.current = currentSessionId;
   }, [currentSessionId]);
+
+  useEffect(() => {
+    setMessageHeights({});
+    setScrollTop(0);
+  }, [sessionMessageKeyPrefix]);
+
+  useEffect(() => {
+    pendingFilesRef.current = pendingFiles;
+  }, [pendingFiles]);
+
+  useEffect(() => {
+    const container = scrollContainerRef.current;
+    if (!container) {
+      return;
+    }
+
+    const updateViewportHeight = () => {
+      setViewportHeight(container.clientHeight);
+    };
+
+    updateViewportHeight();
+
+    if (typeof ResizeObserver === 'undefined') {
+      window.addEventListener('resize', updateViewportHeight);
+      return () => window.removeEventListener('resize', updateViewportHeight);
+    }
+
+    const observer = new ResizeObserver(() => {
+      updateViewportHeight();
+    });
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      for (const pendingFile of pendingFilesRef.current) {
+        URL.revokeObjectURL(pendingFile.previewUrl);
+      }
+    };
+  }, []);
 
   // Load session history when switching sessions
   useEffect(() => {
@@ -70,17 +161,31 @@ export function ChatPage() {
     }
   }, [currentSessionId, selectedAgentId, sessions, setMessages]);
 
-  // Auto-scroll to bottom
+  // Auto-scroll to bottom — debounced to avoid layout thrashing on every streaming token
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'auto', block: 'end' });
-  }, [messages]);
+    if (scrollTimerRef.current) clearTimeout(scrollTimerRef.current);
+    scrollTimerRef.current = setTimeout(() => {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'auto', block: 'end' });
+    }, 50);
+    return () => {
+      if (scrollTimerRef.current) clearTimeout(scrollTimerRef.current);
+    };
+  }, [messages, virtualWindow.totalHeight, showLoadingIndicator]);
 
+  // Scroll to highlighted message — only runs when session changes, not on every token
   useEffect(() => {
     const highlighted = document.querySelector('[data-highlighted-message="true"]');
     if (highlighted) {
       highlighted.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      return;
     }
-  }, [messages, currentSessionId]);
+
+    if (highlightedIndex >= 0 && scrollContainerRef.current) {
+      const top = virtualWindow.offsets[highlightedIndex] ?? 0;
+      const targetTop = Math.max(0, top - Math.max(0, viewportHeight / 3));
+      scrollContainerRef.current.scrollTo({ top: targetTop, behavior: 'smooth' });
+    }
+  }, [currentSessionId, highlightedIndex, viewportHeight, virtualWindow.offsets]);
 
   // Auto-focus input
   useEffect(() => {
@@ -92,6 +197,22 @@ export function ChatPage() {
       setIsCancelling(false);
     }
   }, [isLoading]);
+
+  const handleVirtualScroll = useCallback((e: React.UIEvent<HTMLDivElement>) => {
+    setScrollTop(e.currentTarget.scrollTop);
+  }, []);
+
+  const handleMessageHeightChange = useCallback((id: string, height: number) => {
+    setMessageHeights((prev) => {
+      if (prev[id] === height) {
+        return prev;
+      }
+      return {
+        ...prev,
+        [id]: height,
+      };
+    });
+  }, []);
 
   async function loadSessionHistory(sessionId: string, agentId: string) {
     try {
@@ -347,8 +468,12 @@ export function ChatPage() {
         </div>
       )}
       {/* Messages area */}
-      <div className="flex-1 overflow-y-auto px-4 py-6">
-        <div className="max-w-3xl mx-auto space-y-4">
+      <div
+        ref={scrollContainerRef}
+        onScroll={handleVirtualScroll}
+        className="flex-1 overflow-y-auto px-4 py-6"
+      >
+        <div className="max-w-3xl mx-auto">
           {!hasMessages && (
             <div className="flex flex-col items-center pt-8 pb-4 text-muted-foreground">
               <div className="mb-3">
@@ -358,15 +483,36 @@ export function ChatPage() {
               <p className="text-sm">{t('chat.emptyHint')}</p>
             </div>
           )}
-          {messages.map((msg) => (
-            <MessageBubble key={msg.id} message={msg} />
-          ))}
-          {isLoading && messages[messages.length - 1]?.role !== 'assistant' && (
-            <div className="flex items-center gap-2 text-muted-foreground text-sm">
+
+          {hasMessages && (
+            <div
+              className="relative"
+              style={{ height: `${virtualWindow.totalHeight}px` }}
+            >
+              {visibleMessageIndexes.map((index) => {
+                const message = messages[index];
+                const scopedId = `${sessionMessageKeyPrefix}:${message.id}`;
+
+                return (
+                  <VirtualizedMessageRow
+                    key={scopedId}
+                    itemId={scopedId}
+                    top={virtualWindow.offsets[index] ?? 0}
+                    message={message}
+                    onHeightChange={handleMessageHeightChange}
+                  />
+                );
+              })}
+            </div>
+          )}
+
+          {showLoadingIndicator && (
+            <div className="mt-4 flex items-center gap-2 text-muted-foreground text-sm">
               <Loader2 size={16} className="animate-spin" />
               <span>{t('chat.thinking')}</span>
             </div>
           )}
+
           <div ref={messagesEndRef} />
         </div>
       </div>
@@ -468,3 +614,55 @@ export function ChatPage() {
     </div>
   );
 }
+
+const VirtualizedMessageRow = memo(function VirtualizedMessageRow({
+  itemId,
+  top,
+  message,
+  onHeightChange,
+}: {
+  itemId: string;
+  top: number;
+  message: UiMessage;
+  onHeightChange: (id: string, height: number) => void;
+}) {
+  const rowRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const node = rowRef.current;
+    if (!node) {
+      return;
+    }
+
+    const reportHeight = () => {
+      onHeightChange(itemId, Math.ceil(node.getBoundingClientRect().height));
+    };
+
+    reportHeight();
+
+    if (typeof ResizeObserver === 'undefined') {
+      return;
+    }
+
+    const observer = new ResizeObserver(() => {
+      reportHeight();
+    });
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [itemId, onHeightChange]);
+
+  return (
+    <div
+      ref={rowRef}
+      style={{
+        position: 'absolute',
+        top,
+        left: 0,
+        right: 0,
+        paddingBottom: `${MESSAGE_GAP_PX}px`,
+      }}
+    >
+      <MessageBubble message={message} />
+    </div>
+  );
+});

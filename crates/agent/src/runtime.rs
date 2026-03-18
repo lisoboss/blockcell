@@ -5,6 +5,7 @@ use blockcell_core::types::{
 };
 use blockcell_core::{Config, InboundMessage, OutboundMessage, Paths, Result};
 use blockcell_providers::{CallResult, Provider, ProviderPool};
+use blockcell_skills::SkillCard;
 use blockcell_storage::{AuditLogger, SessionStore};
 use blockcell_tools::{
     CapabilityRegistryHandle, CoreEvolutionHandle, EventEmitterHandle, MemoryStoreHandle,
@@ -18,8 +19,15 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
 use crate::context::{ActiveSkillContext, ContextBuilder, InteractionMode};
-use crate::history_projector::{HistoryProjectionProfile, HistoryProjector};
+use crate::error::{
+    classify_tool_failure, dangerous_exec_denied, dangerous_file_ops_denied,
+    disabled_skill_result, disabled_tool_result, estimate_messages_tokens, llm_exhausted_error,
+    scoped_tool_denied_result, ToolFailureKind,
+};
+use crate::history_projector::HistoryProjector;
 use crate::intent::{IntentCategory, IntentToolResolver};
+use crate::metrics::{ProcessingMetrics, ScopedTimer};
+use crate::skill_executor::{determine_manual_load_mode, SkillExecutionResult};
 use crate::skill_kernel::SkillRunMode;
 use crate::summary_queue::MainSessionSummaryQueue;
 use crate::system_event_orchestrator::{
@@ -27,6 +35,10 @@ use crate::system_event_orchestrator::{
 };
 use crate::system_event_store::{InMemorySystemEventStore, SystemEventStoreOps};
 use crate::task_manager::TaskManager;
+
+const TOOL_ROUND_THROTTLE_MS: u64 = 600;
+const TOOL_ROUND_THROTTLE_AFTER_RATE_LIMIT_MS: u64 = 2_500;
+const ACTIVATE_SKILL_TOOL_NAME: &str = "activate_skill";
 
 /// Adapter that wraps a Provider to implement the skills::LLMProvider trait.
 /// This allows EvolutionService to call the LLM for code generation without
@@ -169,42 +181,140 @@ fn summarize_result(result: &str) -> String {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ResolvedSkillScriptKind {
-    Rhai,
-    Python,
-    Markdown,
-}
-
-impl ResolvedSkillScriptKind {
-    fn as_runtime_kind(self) -> SkillScriptKind {
-        match self {
-            Self::Rhai => SkillScriptKind::Rhai,
-            Self::Python => SkillScriptKind::Python,
-            Self::Markdown => SkillScriptKind::Markdown,
-        }
+fn tool_round_throttle_delay(saw_rate_limit_this_turn: bool) -> std::time::Duration {
+    if saw_rate_limit_this_turn {
+        std::time::Duration::from_millis(TOOL_ROUND_THROTTLE_AFTER_RATE_LIMIT_MS)
+    } else {
+        std::time::Duration::from_millis(TOOL_ROUND_THROTTLE_MS)
     }
 }
 
-fn infer_skill_script_kind(paths: &Paths, skill_name: &str) -> Option<ResolvedSkillScriptKind> {
-    for base_dir in [paths.skills_dir(), paths.builtin_skills_dir()] {
-        let skill_dir = base_dir.join(skill_name);
-        if !skill_dir.exists() {
-            continue;
-        }
-
-        if skill_dir.join("SKILL.py").exists() {
-            return Some(ResolvedSkillScriptKind::Python);
-        }
-        if skill_dir.join("SKILL.rhai").exists() {
-            return Some(ResolvedSkillScriptKind::Rhai);
-        }
-        if skill_dir.join("SKILL.md").exists() {
-            return Some(ResolvedSkillScriptKind::Markdown);
-        }
+fn build_activate_skill_tool_schema(skill_cards: &[SkillCard]) -> Option<serde_json::Value> {
+    if skill_cards.is_empty() {
+        return None;
     }
 
-    None
+    let skill_names = skill_cards
+        .iter()
+        .map(|card| serde_json::Value::String(card.name.clone()))
+        .collect::<Vec<_>>();
+
+    Some(serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": ACTIVATE_SKILL_TOOL_NAME,
+            "description": "Activate one installed skill when it is a better fit than general tools. Do not combine this with other tool calls in the same assistant turn.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "skill_name": {
+                        "type": "string",
+                        "enum": skill_names,
+                        "description": "The installed skill name to activate."
+                    },
+                    "goal": {
+                        "type": "string",
+                        "description": "A short execution goal for the selected skill."
+                    }
+                },
+                "required": ["skill_name", "goal"],
+                "additionalProperties": false
+            }
+        }
+    }))
+}
+
+fn inject_skill_cards_into_system_prompt(
+    messages: &mut [ChatMessage],
+    skill_cards: &[SkillCard],
+    recent_skill_name: Option<&str>,
+) {
+    if skill_cards.is_empty() {
+        return;
+    }
+
+    let Some(system_message) = messages.first_mut() else {
+        return;
+    };
+    if system_message.role != "system" {
+        return;
+    }
+
+    let Some(existing_prompt) = system_message.content.as_str() else {
+        return;
+    };
+
+    let mut section = String::from(
+        "\n\n## Installed Skills\nUse `activate_skill` when one installed skill is a better fit than general tools.\nIf you call `activate_skill`, do not call any other tools in the same assistant turn.\n",
+    );
+
+    if let Some(skill_name) = recent_skill_name {
+        section.push_str(&format!(
+            "Recent active skill: `{}`. If the user is continuing that workflow, prefer re-entering the same skill.\n",
+            skill_name
+        ));
+    }
+
+    for card in skill_cards {
+        section.push_str(&format!(
+            "- `{}`: {} | 适合: {} | 输出: {}\n",
+            card.name, card.description, card.when_to_use, card.outputs
+        ));
+    }
+
+    system_message.content = serde_json::Value::String(format!("{}{}", existing_prompt, section));
+}
+
+fn normalize_selected_skill_name(raw_skill_name: &str, skill_cards: &[SkillCard]) -> Option<String> {
+    let candidates = skill_cards
+        .iter()
+        .map(|card| (card.name.clone(), card.description.clone()))
+        .collect::<Vec<_>>();
+    crate::skill_decision::SkillDecisionEngine::normalize_selected_skill_name(
+        raw_skill_name,
+        &candidates,
+    )
+}
+
+fn append_activated_skill_history(
+    history: &mut Vec<ChatMessage>,
+    activation_call_id: &str,
+    skill_name: &str,
+    goal: &str,
+    allowed_tools: &[String],
+    trace_messages: &[ChatMessage],
+    final_response: &str,
+) {
+    let mut activation_result = ChatMessage::tool_result(
+        activation_call_id,
+        &serde_json::json!({
+            "skill_name": skill_name,
+            "goal": goal,
+            "status": "completed"
+        })
+        .to_string(),
+    );
+    activation_result.name = Some(ACTIVATE_SKILL_TOOL_NAME.to_string());
+    history.push(activation_result);
+
+    push_internal_skill_trace(
+        history,
+        "skill_enter",
+        serde_json::json!({
+            "skill_name": skill_name,
+            "allowed_tools": allowed_tools,
+            "goal": goal,
+        }),
+        &serde_json::json!({
+            "skill_name": skill_name,
+            "kind": "prompt",
+            "allowed_tools": allowed_tools,
+            "goal": goal,
+        })
+        .to_string(),
+    );
+    history.extend(trace_messages.iter().cloned());
+    history.push(ChatMessage::assistant(final_response));
 }
 
 /// Compact JSON value for presentation.
@@ -350,6 +460,7 @@ fn persist_prompt_skill_history(
     history.push(ChatMessage::assistant(final_response));
 }
 
+#[allow(dead_code)]
 fn persist_script_skill_history(
     history: &mut Vec<ChatMessage>,
     user_input: &str,
@@ -376,40 +487,50 @@ fn find_recent_skill_name_from_history(history: &[ChatMessage]) -> Option<String
     HistoryProjector::new(history).analyze("").latest_skill_name
 }
 
-fn is_followup_skill_request(user_input: &str) -> bool {
-    let trimmed = user_input.trim();
+const SESSION_ACTIVE_SKILL_NAME_KEY: &str = "active_skill_name";
+
+fn active_skill_name_from_metadata(metadata: &serde_json::Value) -> Option<String> {
+    metadata
+        .get(SESSION_ACTIVE_SKILL_NAME_KEY)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn continued_skill_name(
+    metadata: &serde_json::Value,
+    history: &[ChatMessage],
+) -> Option<String> {
+    active_skill_name_from_metadata(metadata).or_else(|| find_recent_skill_name_from_history(history))
+}
+
+fn record_active_skill_name(metadata: &mut serde_json::Value, skill_name: &str) {
+    let trimmed = skill_name.trim();
     if trimmed.is_empty() {
-        return false;
+        return;
     }
 
-    if trimmed.contains('第') && trimmed.chars().any(|ch| ch.is_ascii_digit()) {
-        return true;
+    if !metadata.is_object() {
+        *metadata = serde_json::Value::Object(serde_json::Map::new());
     }
 
-    let followup_keywords = [
-        "继续",
-        "接着",
-        "接下来",
-        "然后",
-        "这个",
-        "这个结果",
-        "这个里面",
-        "那个",
-        "它",
-        "上一个",
-        "上一条",
-        "上一项",
-        "上一轮",
-        "刚才",
-        "详情",
-        "详细",
-        "展开",
-        "打开",
-        "点开",
-        "查看",
-    ];
+    if let Some(map) = metadata.as_object_mut() {
+        map.insert(
+            SESSION_ACTIVE_SKILL_NAME_KEY.to_string(),
+            serde_json::Value::String(trimmed.to_string()),
+        );
+    }
+}
 
-    followup_keywords.iter().any(|keyword| trimmed.contains(keyword))
+fn suppress_prompt_reinjection_for_continued_skill(
+    mut active_skill: ActiveSkillContext,
+    continued_skill_name: Option<&str>,
+) -> ActiveSkillContext {
+    if continued_skill_name == Some(active_skill.name.as_str()) {
+        active_skill.inject_prompt_md = false;
+    }
+    active_skill
 }
 
 struct PromptSkillLoopOutput {
@@ -467,19 +588,6 @@ fn resolve_cron_deliver_target(msg: &InboundMessage) -> Option<(String, String)>
         .filter(|value| !value.is_empty())?;
 
     Some((channel.to_string(), to.to_string()))
-}
-
-#[cfg(test)]
-fn stringify_chat_message_content(msg: &ChatMessage) -> String {
-    match &msg.content {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Array(parts) => parts
-            .iter()
-            .filter_map(|part| part.get("text").and_then(|value| value.as_str()))
-            .collect::<Vec<_>>()
-            .join(" "),
-        other => other.to_string(),
-    }
 }
 
 fn expand_history_stubs_with_cache(
@@ -546,86 +654,15 @@ fn normalize_spawn_task(task: &str) -> String {
     }
 }
 
-fn build_script_skill_argv_messages(
-    user_input: &str,
-    skill_name: &str,
-    skill_md: &str,
-    projected_history: &[ChatMessage],
-) -> Vec<ChatMessage> {
-    let mut messages = vec![
-        ChatMessage::system(&format!(
-            "你是技能脚本调度器。请根据技能 `{}` 的调用说明书，为脚本构造命令行 argv。\n\
-            如果用户这次是在引用“第 N 条”“刚才那个”“这个结果”“继续”等续接上下文，\
-            必须优先利用最近历史中的 assistant/tool 链路、隐藏字段和内部参数来解析目标。\n\
-            不要返回 `<feed_id>`、`<xsec_token>`、`<keyword>` 这类占位符。\
-            如果确实缺少必要上下文，返回 `{{\"clarify\": \"...\"}}`，直接说明缺什么。",
-            skill_name
-        )),
-        ChatMessage::system(&format!(
-            "[调用说明书]\n{}",
-            if skill_md.trim().is_empty() {
-                "(无调用说明书)"
-            } else {
-                skill_md.trim()
-            }
-        )),
-        ChatMessage::system(
-            "下面如果有最近历史，请直接利用原始消息角色和 tool_call/tool_result 链路推断参数。\
-            `argv` 只允许包含传给脚本本身的参数，绝对不要包含 `python3`、`python`、`SKILL.py`、`{baseDir}/SKILL.py` 或任何可执行文件路径。\
-            只允许输出以下 JSON 格式之一，不要输出解释：\
-            - 执行脚本：{\"argv\": [\"subcommand\", \"arg1\", ...]}\
-            - 无法确定参数，需要澄清：{\"clarify\": \"说明缺少什么\"}\
-            - 用户问题可直接从上下文回答（不需执行脚本）：{\"direct_answer\": \"直接回答内容\"}",
-        ),
-    ];
-
-    messages.extend(projected_history.iter().cloned());
-
-    messages.push(ChatMessage::user(&format!(
-        "[当前用户请求]\n{}\n\n请只输出 JSON。",
-        user_input
-    )));
-
-    messages
-}
-
-fn contains_unresolved_placeholder_arg(value: &str) -> bool {
-    let trimmed = value.trim();
-    trimmed.len() >= 3 && trimmed.starts_with('<') && trimmed.ends_with('>')
-}
-
-fn normalize_script_skill_argv(argv: Vec<String>) -> Vec<String> {
-    let mut start = 0usize;
-
-    if argv
-        .get(start)
-        .map(|value| matches!(value.as_str(), "python" | "python3"))
-        .unwrap_or(false)
-    {
-        start += 1;
-    }
-
-    if let Some(next) = argv.get(start) {
-        let lowered = next.to_ascii_lowercase();
-        if lowered == "skill.py"
-            || lowered.ends_with("/skill.py")
-            || lowered.ends_with("\\skill.py")
-            || lowered.contains("{basedir}/skill.py")
-        {
-            start += 1;
-        }
-    }
-
-    argv.into_iter().skip(start).collect()
-}
-
 /// Prepare skill result for presentation.
+#[allow(dead_code)]
 struct SkillResultPresentation {
     direct_text: Option<String>,
     llm_payload: Option<String>,
     fallback_text: String,
 }
 
+#[allow(dead_code)]
 fn prepare_skill_result_for_presentation(
     skill_name: &str,
     output: &str,
@@ -890,12 +927,7 @@ fn resolve_profile_tool_names(
         .unwrap_or_default()
 }
 
-fn scoped_tool_denied_result(tool_name: &str) -> String {
-    format!(
-        "Error: Tool '{}' is not available in the current built-in/skill scope.",
-        tool_name
-    )
-}
+// scoped_tool_denied_result moved to crate::error
 
 fn normalize_path_for_check(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
@@ -957,39 +989,24 @@ fn should_supplement_tool_schema(result: &str) -> bool {
         || lower.contains("' is required for")
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SkillScriptKind {
-    Rhai,
-    Python,
-    Markdown,
-}
-
 #[derive(Debug, Clone)]
 struct InteractionDecision {
     active_skill: Option<ActiveSkillContext>,
-    active_skill_route: Option<SkillExecutionRoute>,
     chat_intents: Vec<IntentCategory>,
     mode: InteractionMode,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SkillExecutionRoute {
-    PromptOnly,
-    Scripted,
+struct FinalResponseContext<'a> {
+    msg: &'a InboundMessage,
+    persist_session_key: &'a str,
+    history: &'a mut [ChatMessage],
+    session_metadata: &'a serde_json::Value,
+    final_response: &'a str,
+    collected_media: Vec<String>,
+    cron_deliver_target: Option<(String, String)>,
 }
 
-fn decide_skill_execution_route(
-    script_kind: Option<SkillScriptKind>,
-) -> Option<SkillExecutionRoute> {
-    match script_kind {
-        Some(SkillScriptKind::Markdown) => Some(SkillExecutionRoute::PromptOnly),
-        Some(SkillScriptKind::Python) | Some(SkillScriptKind::Rhai) => {
-            Some(SkillExecutionRoute::Scripted)
-        }
-        None => None,
-    }
-}
-
+#[cfg(test)]
 fn determine_interaction_mode(
     has_active_skill: bool,
     chat_intents: &[IntentCategory],
@@ -1930,15 +1947,25 @@ impl AgentRuntime {
                         if messages[j].role == "tool" {
                             if let Some(ref id) = messages[j].tool_call_id {
                                 if expected_ids.contains(id.as_str()) {
-                                    // Condense tool result to a short summary
+                                    // Condense tool result aggressively (#3)
                                     let tool_name = messages[j].name.as_deref().unwrap_or("tool");
                                     let result_text = match &messages[j].content {
                                         serde_json::Value::String(s) => {
-                                            let chars: String = s.chars().take(80).collect();
-                                            if s.chars().count() > 80 {
-                                                format!("{}...", chars)
+                                            if tool_result_indicates_error(s) {
+                                                // Keep error info slightly longer for context
+                                                let chars: String = s.chars().take(60).collect();
+                                                if s.chars().count() > 60 {
+                                                    format!("{}...", chars)
+                                                } else {
+                                                    chars
+                                                }
                                             } else {
-                                                chars
+                                                let chars: String = s.chars().take(40).collect();
+                                                if s.chars().count() > 40 {
+                                                    format!("{}...", chars)
+                                                } else {
+                                                    chars
+                                                }
                                             }
                                         }
                                         _ => "ok".to_string(),
@@ -2051,6 +2078,7 @@ impl AgentRuntime {
         messages: Vec<ChatMessage>,
         tools: Vec<serde_json::Value>,
         tool_names: &[String],
+        active_skill_dir: Option<PathBuf>,
     ) -> Result<PromptSkillLoopOutput> {
         let allowed_tool_names = tool_names.iter().cloned().collect::<HashSet<_>>();
         let max_iterations = self
@@ -2088,7 +2116,8 @@ impl AgentRuntime {
                         &tool_call.name,
                         &allowed_tool_names,
                     ) {
-                        self.execute_tool_call(&tool_call, msg).await
+                        self.execute_tool_call(&tool_call, msg, active_skill_dir.clone())
+                            .await
                     } else {
                         serde_json::json!({
                             "error": format!(
@@ -2127,108 +2156,63 @@ impl AgentRuntime {
         })
     }
 
-    fn resolve_skill_execution_route_for_active_skill(
-        &self,
-        active_skill: Option<&ActiveSkillContext>,
-    ) -> Option<SkillExecutionRoute> {
-        let skill_ctx = active_skill?;
-        self.context_builder
-            .skill_manager()
-            .and_then(|sm| sm.get(&skill_ctx.name))
-            .and_then(|skill| {
-                let _ = skill;
-                let script_kind = infer_skill_script_kind(&self.paths, &skill_ctx.name)
-                    .map(|kind| kind.as_runtime_kind());
-                decide_skill_execution_route(script_kind)
-            })
-    }
-
     async fn decide_interaction(
         &mut self,
         msg: &InboundMessage,
         disabled_skills: &HashSet<String>,
         classifier: &crate::intent::IntentClassifier,
         history: &[ChatMessage],
-    ) -> InteractionDecision {
-        let explicit_name = detect_explicit_skill_name(&msg.content);
-        let forced_skill_name: &str = if !explicit_name.is_empty() {
-            &explicit_name
-        } else {
-            msg.metadata
-                .get("forced_skill_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-        };
-
-        let skill_candidates: Vec<(String, String)> = self
-            .context_builder
-            .skill_manager()
-            .map(|sm| {
-                sm.match_all_skills(&msg.content, disabled_skills)
-                    .into_iter()
-                    .map(|s| (s.name.clone(), s.meta.description.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
-
+        session_metadata: &serde_json::Value,
+    ) -> Result<InteractionDecision> {
+        let forced_skill_name = msg
+            .metadata
+            .get("forced_skill_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let chat_intents = classifier.classify(&msg.content);
-        let skill_candidate_names = skill_candidates
-            .iter()
-            .map(|(name, _)| name.clone())
-            .collect::<Vec<_>>();
-
-        let mut active_skill = None;
-        let mut mode_override = None;
+        let session_skill_name = continued_skill_name(session_metadata, history);
 
         if !forced_skill_name.is_empty() {
-            active_skill = self
+            let active_skill = self
                 .context_builder
-                .resolve_active_skill_by_name(forced_skill_name, disabled_skills);
-        } else if skill_candidate_names.is_empty() && is_followup_skill_request(&msg.content) {
-            if let Some(skill_name) = find_recent_skill_name_from_history(history) {
-                active_skill = self
-                    .context_builder
-                    .resolve_active_skill_by_name(&skill_name, disabled_skills);
-                if active_skill.is_some() {
-                    mode_override = Some(InteractionMode::Skill);
-                }
-            }
-        }
+                .resolve_active_skill_by_name(forced_skill_name, disabled_skills)
+                .map(|skill| {
+                    suppress_prompt_reinjection_for_continued_skill(
+                        skill,
+                        session_skill_name.as_deref(),
+                    )
+                })
+                .ok_or_else(|| {
+                    blockcell_core::Error::Skill(format!(
+                        "Forced skill '{}' is not available",
+                        forced_skill_name
+                    ))
+                })?;
 
-        if active_skill.is_none() && mode_override.is_none() {
-            active_skill = match skill_candidates.len() {
-                0 => None,
-                1 => self
-                    .context_builder
-                    .resolve_active_skill_by_name(&skill_candidates[0].0, disabled_skills),
-                _ => {
-                    let selected = self
-                        .llm_disambiguate_skill(&msg.content, &skill_candidates)
-                        .await;
-                    self.context_builder
-                        .resolve_active_skill_by_name(&selected, disabled_skills)
-                }
-            };
-        }
+            info!(
+                mode = ?InteractionMode::Skill,
+                active_skill = %active_skill.name,
+                "Interaction mode resolved from forced skill"
+            );
 
-        let mode = mode_override
-            .unwrap_or_else(|| determine_interaction_mode(active_skill.is_some(), &chat_intents));
-        let active_skill_route =
-            self.resolve_skill_execution_route_for_active_skill(active_skill.as_ref());
+            return Ok(InteractionDecision {
+                active_skill: Some(active_skill),
+                chat_intents,
+                mode: InteractionMode::Skill,
+            });
+        }
 
         info!(
-            mode = ?mode,
-            active_skill = active_skill.as_ref().map(|s| s.name.as_str()),
-            active_skill_route = ?active_skill_route,
-            "Interaction mode resolved"
+            mode = ?InteractionMode::General,
+            intents = ?chat_intents,
+            recent_skill = session_skill_name.as_deref(),
+            "Interaction mode resolved from unified entry"
         );
-
-        InteractionDecision {
-            active_skill,
-            active_skill_route,
+        Ok(InteractionDecision {
+            active_skill: None,
             chat_intents,
-            mode,
-        }
+            mode: InteractionMode::General,
+        })
     }
 
     async fn execute_decided_skill_route(
@@ -2241,33 +2225,474 @@ impl AgentRuntime {
             return None;
         }
 
-        let skill_ctx = decision.active_skill.as_ref()?;
-        match decision.active_skill_route {
-            Some(SkillExecutionRoute::PromptOnly) => {
-                info!(
-                    skill = %skill_ctx.name,
-                    "Prompt-only skill matched — entering scoped prompt executor"
-                );
-                Some(
-                    self.dispatch_prompt_skill_for_user(&skill_ctx.name, msg, persist_session_key)
-                        .await,
-                )
-            }
-            Some(SkillExecutionRoute::Scripted) => {
-                info!(
-                    skill = %skill_ctx.name,
-                    "Script skill matched — entering controlled dispatch path"
-                );
-                Some(
-                    self.dispatch_script_skill_for_user(&skill_ctx.name, msg, persist_session_key)
-                        .await,
-                )
-            }
-            None => None,
+        let skill_ctx = decision.active_skill.as_ref()?.clone();
+        info!(
+            skill = %skill_ctx.name,
+            "Skill matched — entering unified skill executor"
+        );
+        Some(
+            self.execute_skill_for_user(&skill_ctx, msg, persist_session_key)
+                .await
+                .map(|result| result.final_response),
+        )
+    }
+
+    async fn execute_skill_for_user(
+        &mut self,
+        active_skill: &ActiveSkillContext,
+        msg: &InboundMessage,
+        persist_session_key: &str,
+    ) -> Result<SkillExecutionResult> {
+        let history = self.session_store.load(persist_session_key)?;
+        let (result, mut session_metadata, allowed_tools) = self
+            .run_skill_for_turn(active_skill, msg, &history, persist_session_key)
+            .await?;
+        record_active_skill_name(&mut session_metadata, &active_skill.name);
+        let mut updated_history = history;
+        persist_prompt_skill_history(
+            &mut updated_history,
+            &msg.content,
+            &active_skill.name,
+            &allowed_tools,
+            &result.trace_messages,
+            &result.final_response,
+        );
+        self.session_store.save_with_metadata(
+            persist_session_key,
+            &updated_history,
+            &session_metadata,
+        )?;
+        self.deliver_skill_response(msg, &result.final_response, Some("skill"))
+            .await;
+
+        Ok(result)
+    }
+
+    fn resolved_skill_tool_names(&self, active_skill: &ActiveSkillContext) -> Vec<String> {
+        let available_tools = self
+            .tool_registry
+            .tool_names()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let mut declared_tools = active_skill.tools.clone();
+        if self
+            .context_builder
+            .skill_manager()
+            .and_then(|manager| manager.get(&active_skill.name))
+            .map(blockcell_skills::SkillManager::build_skill_card)
+            .is_some_and(|card| card.supports_local_exec)
+        {
+            declared_tools.push("exec_local".to_string());
         }
+        crate::prompt_skill_executor::PromptSkillExecutor::resolve_allowed_tool_names(
+            &declared_tools,
+            &available_tools,
+        )
+    }
+
+    async fn run_skill_for_turn(
+        &mut self,
+        active_skill: &ActiveSkillContext,
+        msg: &InboundMessage,
+        history: &[ChatMessage],
+        session_key: &str,
+    ) -> Result<(SkillExecutionResult, serde_json::Value, Vec<String>)> {
+        let manual_mode = determine_manual_load_mode(&active_skill.name, history);
+        info!(
+            skill = %active_skill.name,
+            manual_mode = ?manual_mode,
+            "Unified skill executor starting"
+        );
+
+        let mut prompt_skill = active_skill.clone();
+        prompt_skill.inject_prompt_md =
+            prompt_skill.inject_prompt_md && manual_mode.should_load_manual();
+
+        let allowed_tools = self.resolved_skill_tool_names(&prompt_skill);
+        let (final_response, trace_messages, session_metadata) = self
+            .run_prompt_skill_for_session(
+                &prompt_skill,
+                msg,
+                history,
+                session_key,
+                &allowed_tools,
+            )
+            .await?;
+
+        Ok((
+            SkillExecutionResult {
+                final_response,
+                trace_messages,
+            },
+            session_metadata,
+            allowed_tools,
+        ))
+    }
+
+    async fn persist_and_deliver_final_response(
+        &mut self,
+        ctx: FinalResponseContext<'_>,
+    ) -> Result<String> {
+        let FinalResponseContext {
+            msg,
+            persist_session_key,
+            history,
+            session_metadata,
+            final_response,
+            collected_media,
+            cron_deliver_target,
+        } = ctx;
+        let final_response = strip_fake_tool_calls(final_response.trim());
+
+        if let Some(stub) = self
+            .response_cache
+            .maybe_cache_and_stub(persist_session_key, &final_response)
+        {
+            overwrite_last_assistant_message(history, &stub);
+        }
+
+        self.session_store
+            .save_with_metadata(persist_session_key, history, session_metadata)?;
+
+        if history.len() >= 6 {
+            if let Some(ref store) = self.memory_store {
+                let summary = Self::build_extractive_summary(history);
+                if !summary.is_empty() {
+                    if let Err(e) = store.upsert_session_summary(persist_session_key, &summary) {
+                        debug!(error = %e, "Failed to upsert session summary");
+                    }
+                }
+            }
+        }
+
+        if msg.channel == "cron"
+            && msg
+                .metadata
+                .get("cron_agent")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        {
+            if let Some(tx) = &self.outbound_tx {
+                let mut outbound =
+                    OutboundMessage::new(&msg.channel, &msg.chat_id, &final_response);
+                outbound.account_id = msg.account_id.clone();
+                outbound.media = collected_media.clone();
+                outbound.metadata = extract_reply_metadata(msg);
+                let _ = tx.send(outbound).await;
+            }
+
+            if let Some((channel, to)) = cron_deliver_target {
+                if channel == "ws" {
+                    if let Some(ref event_tx) = self.event_tx {
+                        let event = serde_json::json!({
+                            "type": "message_done",
+                            "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
+                            "chat_id": to,
+                            "task_id": "",
+                            "content": final_response,
+                            "tool_calls": 0,
+                            "duration_ms": 0,
+                            "media": collected_media,
+                            "background_delivery": true,
+                            "delivery_kind": "cron",
+                            "cron_kind": "agent",
+                        });
+                        let _ = event_tx.send(event.to_string());
+                    }
+                    if let Some(tx) = &self.outbound_tx {
+                        let mut outbound = OutboundMessage::new(&channel, &to, &final_response);
+                        outbound.account_id = msg.account_id.clone();
+                        outbound.media = collected_media.clone();
+                        let _ = tx.send(outbound).await;
+                    }
+                } else if let Some(tx) = &self.outbound_tx {
+                    let mut outbound = OutboundMessage::new(&channel, &to, &final_response);
+                    outbound.account_id = msg.account_id.clone();
+                    outbound.media = collected_media.clone();
+                    let _ = tx.send(outbound).await;
+                }
+            }
+
+            return Ok(final_response.to_string());
+        }
+
+        if msg.channel == "ws" {
+            if let Some(ref event_tx) = self.event_tx {
+                let event = serde_json::json!({
+                    "type": "message_done",
+                    "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
+                    "chat_id": msg.chat_id,
+                    "task_id": "",
+                    "content": final_response,
+                    "tool_calls": 0,
+                    "duration_ms": 0,
+                    "media": collected_media,
+                });
+                let _ = event_tx.send(event.to_string());
+            }
+        }
+
+        if msg.channel != "ghost" {
+            if let Some(tx) = &self.outbound_tx {
+                let mut outbound =
+                    OutboundMessage::new(&msg.channel, &msg.chat_id, &final_response);
+                outbound.account_id = msg.account_id.clone();
+                outbound.media = collected_media.clone();
+                outbound.metadata = extract_reply_metadata(msg);
+                let _ = tx.send(outbound).await;
+            }
+        }
+
+        if msg.channel == "cron" {
+            if let Some(deliver) = msg.metadata.get("deliver").and_then(|v| v.as_bool()) {
+                if deliver {
+                    if let (Some(channel), Some(to)) = (
+                        msg.metadata.get("deliver_channel").and_then(|v| v.as_str()),
+                        msg.metadata.get("deliver_to").and_then(|v| v.as_str()),
+                    ) {
+                        if let Some(tx) = &self.outbound_tx {
+                            let outbound = OutboundMessage::new(channel, to, &final_response);
+                            let _ = tx.send(outbound).await;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(final_response.to_string())
+    }
+
+    /// Extracted sub-function (#15): Call LLM with streaming and retry on transient errors.
+    /// Returns the LLM response on success, or the last error on exhaustion.
+    async fn call_llm_with_retry(
+        &mut self,
+        current_messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        msg: &InboundMessage,
+        iteration: u32,
+        saw_rate_limit_this_turn: &mut bool,
+    ) -> std::result::Result<LLMResponse, blockcell_core::Error> {
+        let max_retries = self.config.agents.defaults.llm_max_retries;
+        let base_delay_ms = self.config.agents.defaults.llm_retry_delay_ms;
+        let mut last_error = None;
+
+        for attempt in 0..=max_retries {
+            if attempt > 0 {
+                let delay_ms = base_delay_ms * (1u64 << (attempt - 1).min(4));
+                warn!(
+                    attempt,
+                    max_retries, delay_ms, iteration, "Retrying LLM call after transient error"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            let (pool_idx, provider) = match self.provider_pool.acquire() {
+                Some(p) => p,
+                None => {
+                    last_error = Some(blockcell_core::Error::Config(
+                        "ProviderPool: no healthy providers available".to_string(),
+                    ));
+                    break;
+                }
+            };
+
+            match provider.chat_stream(current_messages, tools).await {
+                Ok(mut stream_rx) => {
+                    if attempt > 0 {
+                        info!(
+                            attempt,
+                            iteration, pool_idx, "LLM stream call succeeded after retry"
+                        );
+                    }
+                    let mut accumulated_content = String::new();
+                    let mut accumulated_reasoning = String::new();
+                    let mut tool_call_accumulators: HashMap<String, ToolCallAccumulator> =
+                        HashMap::new();
+                    let mut emitted_text_delta = false;
+                    let mut stream_error: Option<blockcell_core::Error> = None;
+
+                    const STREAM_TIMEOUT_SECS: u64 = 300;
+
+                    loop {
+                        let recv_result = tokio::time::timeout(
+                            std::time::Duration::from_secs(STREAM_TIMEOUT_SECS),
+                            stream_rx.recv(),
+                        )
+                        .await;
+
+                        match recv_result {
+                            Ok(Some(chunk)) => {
+                                match chunk {
+                                    StreamChunk::TextDelta { delta } => {
+                                        accumulated_content.push_str(&delta);
+                                        emitted_text_delta = true;
+                                        if let Some(ref event_tx) = self.event_tx {
+                                            let event = serde_json::json!({
+                                                "type": "token",
+                                                "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
+                                                "chat_id": msg.chat_id.clone(),
+                                                "delta": delta,
+                                            });
+                                            let _ = event_tx.send(event.to_string());
+                                        }
+                                    }
+                                    StreamChunk::ReasoningDelta { delta } => {
+                                        accumulated_reasoning.push_str(&delta);
+                                        if let Some(ref event_tx) = self.event_tx {
+                                            let event = serde_json::json!({
+                                                "type": "thinking",
+                                                "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
+                                                "chat_id": msg.chat_id.clone(),
+                                                "content": delta,
+                                            });
+                                            let _ = event_tx.send(event.to_string());
+                                        }
+                                    }
+                                    StreamChunk::ToolCallStart { index: _, id, name } => {
+                                        let acc = tool_call_accumulators
+                                            .entry(id.clone())
+                                            .or_default();
+                                        acc.id = id.clone();
+                                        acc.name = name.clone();
+                                    }
+                                    StreamChunk::ToolCallDelta {
+                                        index: _,
+                                        id,
+                                        delta,
+                                    } => {
+                                        if let Some(acc) = tool_call_accumulators.get_mut(&id) {
+                                            acc.arguments.push_str(&delta);
+                                        }
+                                    }
+                                    StreamChunk::Done { response } => {
+                                        let final_tool_calls =
+                                            if !tool_call_accumulators.is_empty() {
+                                                tool_call_accumulators
+                                                    .drain()
+                                                    .map(|(_, acc)| acc.to_tool_call_request())
+                                                    .collect()
+                                            } else {
+                                                response.tool_calls.clone()
+                                            };
+
+                                        let final_content = if !accumulated_content.is_empty() {
+                                            Some(accumulated_content.clone())
+                                        } else {
+                                            response.content.clone()
+                                        };
+
+                                        let final_reasoning =
+                                            if !accumulated_reasoning.is_empty() {
+                                                Some(accumulated_reasoning.clone())
+                                            } else {
+                                                response.reasoning_content.clone()
+                                            };
+
+                                        return Ok(LLMResponse {
+                                            content: final_content,
+                                            reasoning_content: final_reasoning,
+                                            tool_calls: final_tool_calls,
+                                            finish_reason: response.finish_reason.clone(),
+                                            usage: response.usage.clone(),
+                                        });
+                                    }
+                                    StreamChunk::Error { message } => {
+                                        warn!(error = %message, "Stream error");
+                                        stream_error =
+                                            Some(blockcell_core::Error::Provider(message));
+                                        break;
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                break;
+                            }
+                            Err(_) => {
+                                warn!(
+                                    "Stream receive timeout after {} seconds",
+                                    STREAM_TIMEOUT_SECS
+                                );
+                                stream_error = Some(blockcell_core::Error::Provider(format!(
+                                    "Stream timeout after {} seconds",
+                                    STREAM_TIMEOUT_SECS
+                                )));
+                                break;
+                            }
+                        }
+                    }
+
+                    // Fallback: tolerate providers that close the stream cleanly without an
+                    // explicit Done event. If the stream ended with an error, retry instead of
+                    // committing a partial answer.
+                    if stream_error.is_none()
+                        && (!tool_call_accumulators.is_empty() || !accumulated_content.is_empty())
+                    {
+                        self.provider_pool.report(pool_idx, CallResult::Success);
+                        let final_tool_calls: Vec<ToolCallRequest> = tool_call_accumulators
+                            .into_values()
+                            .map(|acc| acc.to_tool_call_request())
+                            .collect();
+
+                        return Ok(LLMResponse {
+                            content: if accumulated_content.is_empty() {
+                                None
+                            } else {
+                                Some(accumulated_content)
+                            },
+                            reasoning_content: if accumulated_reasoning.is_empty() {
+                                None
+                            } else {
+                                Some(accumulated_reasoning)
+                            },
+                            tool_calls: final_tool_calls,
+                            finish_reason: "stop".to_string(),
+                            usage: serde_json::Value::Null,
+                        });
+                    }
+
+                    if emitted_text_delta {
+                        if let Some(ref event_tx) = self.event_tx {
+                            let event = serde_json::json!({
+                                "type": "stream_reset",
+                                "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
+                                "chat_id": msg.chat_id.clone(),
+                            });
+                            let _ = event_tx.send(event.to_string());
+                        }
+                    }
+
+                    let err = stream_error.unwrap_or_else(|| {
+                        blockcell_core::Error::Provider(
+                            "Stream ended unexpectedly before completion".to_string(),
+                        )
+                    });
+                    let err_str = format!("{}", err);
+                    let call_result = ProviderPool::classify_error(&err_str);
+                    if matches!(&call_result, CallResult::RateLimit) {
+                        *saw_rate_limit_this_turn = true;
+                    }
+                    self.provider_pool.report(pool_idx, call_result);
+                    last_error = Some(err);
+                }
+                Err(e) => {
+                    let err_str = format!("{}", e);
+                    warn!(error = %err_str, attempt, max_retries, iteration, pool_idx, "LLM stream call failed");
+                    let call_result = ProviderPool::classify_error(&err_str);
+                    if matches!(&call_result, CallResult::RateLimit) {
+                        *saw_rate_limit_this_turn = true;
+                    }
+                    self.provider_pool.report(pool_idx, call_result);
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            blockcell_core::Error::Provider("LLM call failed with no error details".to_string())
+        }))
     }
 
     pub async fn process_message(&mut self, msg: InboundMessage) -> Result<String> {
+        let mut metrics = ProcessingMetrics::new();
         let session_key = msg.session_key();
         let cron_deliver_target = resolve_cron_deliver_target(&msg);
         let persist_session_key = if let Some((channel, to)) = &cron_deliver_target {
@@ -2407,7 +2832,7 @@ impl AgentRuntime {
 
         // Load session history
         let mut history = self.session_store.load(&session_key)?;
-        let session_metadata = self.session_store.load_metadata(&persist_session_key)?;
+        let mut session_metadata = self.session_store.load_metadata(&persist_session_key)?;
 
         // Auto-set session display name from first user message
         if history.is_empty() {
@@ -2434,10 +2859,24 @@ impl AgentRuntime {
         // Load disabled toggles for filtering
         let disabled_tools = load_disabled_toggles(&self.paths, "tools");
         let disabled_skills = load_disabled_toggles(&self.paths, "skills");
+        let recent_skill_name = continued_skill_name(&session_metadata, &history);
+        let skill_cards = self
+            .context_builder
+            .skill_manager()
+            .map(|manager| manager.list_enabled_skill_cards(&disabled_skills))
+            .unwrap_or_default();
 
+        let decision_timer = ScopedTimer::new();
         let decision = self
-            .decide_interaction(&msg, &disabled_skills, &classifier, &history)
-            .await;
+            .decide_interaction(
+                &msg,
+                &disabled_skills,
+                &classifier,
+                &history,
+                &session_metadata,
+            )
+            .await?;
+        metrics.record_decision(decision_timer.elapsed_ms());
         if let Some(result) = self
             .execute_decided_skill_route(&decision, &msg, &persist_session_key)
             .await
@@ -2483,6 +2922,11 @@ impl AgentRuntime {
             }
         }
 
+        if !skill_cards.is_empty() && !tool_names.iter().any(|name| name == ACTIVATE_SKILL_TOOL_NAME)
+        {
+            tool_names.push(ACTIVATE_SKILL_TOOL_NAME.to_string());
+        }
+
         tool_names.sort();
         tool_names.dedup();
 
@@ -2517,7 +2961,7 @@ impl AgentRuntime {
             .get("media_pending_intent")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let messages = self.context_builder.build_messages_for_mode_with_channel(
+        let mut messages = self.context_builder.build_messages_for_mode_with_channel(
             &history,
             &msg.content,
             &msg.media,
@@ -2530,6 +2974,13 @@ impl AgentRuntime {
             &tool_names,
             &tool_prompt_rules,
         );
+        if decision.active_skill.is_none() {
+            inject_skill_cards_into_system_prompt(
+                &mut messages,
+                &skill_cards,
+                recent_skill_name.as_deref(),
+            );
+        }
 
         // Now add user message to history for session persistence
         history.push(ChatMessage::user(&msg.content));
@@ -2556,6 +3007,9 @@ impl AgentRuntime {
             }
             schemas
         };
+        if let Some(schema) = build_activate_skill_tool_schema(&skill_cards) {
+            tools.push(schema);
+        }
         info!(
             mode = ?decision.mode,
             active_skill = decision.active_skill.as_ref().map(|s| s.name.as_str()),
@@ -2571,8 +3025,15 @@ impl AgentRuntime {
         let mut final_response = String::new();
         let mut message_tool_sent_media = false;
         let mut tool_fail_counts: HashMap<String, u32> = HashMap::new();
+        let mut resource_missing_hints_sent: HashSet<String> = HashSet::new();
+        let mut should_throttle_next_tool_round = false;
+        let mut saw_rate_limit_this_turn = false;
         // Collect media paths produced by tools (screenshots, generated images, etc.)
         let mut collected_media: Vec<String> = Vec::new();
+
+        // Schema cache flag: tools are loaded once before the loop.
+        // Only dynamic supplement (below) mutates the `tools` vec — no redundant reload.
+        let mut _schema_cache_dirty = false;
 
         for iteration in 0..max_iterations {
             debug!(iteration, "LLM call iteration");
@@ -2583,223 +3044,37 @@ impl AgentRuntime {
                 "LLM loop state"
             );
 
-            // Call LLM with retry on transient errors
-            let max_retries = self.config.agents.defaults.llm_max_retries;
-            let base_delay_ms = self.config.agents.defaults.llm_retry_delay_ms;
-            let mut last_error = None;
-            let mut response_opt = None;
-
-            for attempt in 0..=max_retries {
-                if attempt > 0 {
-                    let delay_ms = base_delay_ms * (1u64 << (attempt - 1).min(4));
-                    warn!(
-                        attempt,
-                        max_retries, delay_ms, iteration, "Retrying LLM call after transient error"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                }
-                // 从 pool 中选取一个可用 provider（每次可能不同）
-                let (pool_idx, provider) = match self.provider_pool.acquire() {
-                    Some(p) => p,
-                    None => {
-                        last_error = Some(blockcell_core::Error::Config(
-                            "ProviderPool: no healthy providers available".to_string(),
-                        ));
-                        break;
-                    }
-                };
-
-                // 使用流式调用
-                match provider.chat_stream(&current_messages, &tools).await {
-                    Ok(mut stream_rx) => {
-                        if attempt > 0 {
-                            info!(
-                                attempt,
-                                iteration, pool_idx, "LLM stream call succeeded after retry"
-                            );
-                        }
-                        self.provider_pool.report(pool_idx, CallResult::Success);
-
-                        // 处理流式响应
-                        let mut accumulated_content = String::new();
-                        let mut accumulated_reasoning = String::new();
-                        let mut tool_call_accumulators: HashMap<String, ToolCallAccumulator> =
-                            HashMap::new();
-
-                        // 流接收超时：5分钟，防止恶意或 buggy provider 无限挂起
-                        const STREAM_TIMEOUT_SECS: u64 = 300;
-
-                        loop {
-                            let recv_result = tokio::time::timeout(
-                                std::time::Duration::from_secs(STREAM_TIMEOUT_SECS),
-                                stream_rx.recv(),
-                            )
-                            .await;
-
-                            match recv_result {
-                                Ok(Some(chunk)) => {
-                                    match chunk {
-                                        StreamChunk::TextDelta { delta } => {
-                                            accumulated_content.push_str(&delta);
-                                            // 发送 token 事件
-                                            if let Some(ref event_tx) = self.event_tx {
-                                                let event = serde_json::json!({
-                                                    "type": "token",
-                                                    "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
-                                                    "chat_id": msg.chat_id.clone(),
-                                                    "delta": delta,
-                                                });
-                                                let _ = event_tx.send(event.to_string());
-                                            }
-                                        }
-                                        StreamChunk::ReasoningDelta { delta } => {
-                                            accumulated_reasoning.push_str(&delta);
-                                            // 发送 thinking 事件
-                                            if let Some(ref event_tx) = self.event_tx {
-                                                let event = serde_json::json!({
-                                                    "type": "thinking",
-                                                    "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
-                                                    "chat_id": msg.chat_id.clone(),
-                                                    "content": delta,
-                                                });
-                                                let _ = event_tx.send(event.to_string());
-                                            }
-                                        }
-                                        StreamChunk::ToolCallStart { index: _, id, name } => {
-                                            let acc = tool_call_accumulators
-                                                .entry(id.clone())
-                                                .or_default();
-                                            acc.id = id.clone();
-                                            acc.name = name.clone();
-                                        }
-                                        StreamChunk::ToolCallDelta {
-                                            index: _,
-                                            id,
-                                            delta,
-                                        } => {
-                                            if let Some(acc) = tool_call_accumulators.get_mut(&id) {
-                                                acc.arguments.push_str(&delta);
-                                            }
-                                        }
-                                        StreamChunk::Done { response } => {
-                                            // 始终优先使用累积的值，响应值仅作为后备
-                                            // content 和 reasoning_content 来自流式累积
-                                            // tool_calls 来自累积器（如果有），否则用响应值
-                                            // finish_reason 和 usage 始终来自响应
-
-                                            // 构建最终的 tool_calls：优先使用累积的
-                                            let final_tool_calls =
-                                                if !tool_call_accumulators.is_empty() {
-                                                    tool_call_accumulators
-                                                        .drain()
-                                                        .map(|(_, acc)| acc.to_tool_call_request())
-                                                        .collect()
-                                                } else {
-                                                    response.tool_calls.clone()
-                                                };
-
-                                            // 优先使用累积的 content，否则用响应值
-                                            let final_content = if !accumulated_content.is_empty() {
-                                                Some(accumulated_content.clone())
-                                            } else {
-                                                response.content.clone()
-                                            };
-
-                                            // 优先使用累积的 reasoning，否则用响应值
-                                            let final_reasoning =
-                                                if !accumulated_reasoning.is_empty() {
-                                                    Some(accumulated_reasoning.clone())
-                                                } else {
-                                                    response.reasoning_content.clone()
-                                                };
-
-                                            response_opt = Some(LLMResponse {
-                                                content: final_content,
-                                                reasoning_content: final_reasoning,
-                                                tool_calls: final_tool_calls,
-                                                finish_reason: response.finish_reason.clone(),
-                                                usage: response.usage.clone(),
-                                            });
-
-                                            // 注意：message_done 事件在函数末尾统一发送（第2808-2827行）
-                                            // 这里不再重复发送，避免前端收到两次导致重复显示
-                                            break;
-                                        }
-                                        StreamChunk::Error { message } => {
-                                            warn!(error = %message, "Stream error");
-                                            last_error =
-                                                Some(blockcell_core::Error::Provider(message));
-                                            break;
-                                        }
-                                    }
-                                }
-                                Ok(None) => {
-                                    // 流正常结束（channel 关闭）
-                                    break;
-                                }
-                                Err(_) => {
-                                    // 流接收超时
-                                    warn!(
-                                        "Stream receive timeout after {} seconds",
-                                        STREAM_TIMEOUT_SECS
-                                    );
-                                    last_error = Some(blockcell_core::Error::Provider(format!(
-                                        "Stream timeout after {} seconds",
-                                        STREAM_TIMEOUT_SECS
-                                    )));
-                                    break;
-                                }
-                            }
-                        }
-
-                        // 将累积的工具调用转换为完整请求
-                        if response_opt.is_none() && !tool_call_accumulators.is_empty() {
-                            let final_tool_calls: Vec<ToolCallRequest> = tool_call_accumulators
-                                .into_values()
-                                .map(|acc| acc.to_tool_call_request())
-                                .collect();
-
-                            response_opt = Some(LLMResponse {
-                                content: if accumulated_content.is_empty() {
-                                    None
-                                } else {
-                                    Some(accumulated_content)
-                                },
-                                reasoning_content: if accumulated_reasoning.is_empty() {
-                                    None
-                                } else {
-                                    Some(accumulated_reasoning)
-                                },
-                                tool_calls: final_tool_calls,
-                                finish_reason: "stop".to_string(),
-                                usage: serde_json::Value::Null,
-                            });
-                        }
-
-                        break;
-                    }
-                    Err(e) => {
-                        let err_str = format!("{}", e);
-                        warn!(error = %err_str, attempt, max_retries, iteration, pool_idx, "LLM stream call failed");
-                        self.provider_pool
-                            .report(pool_idx, ProviderPool::classify_error(&err_str));
-                        last_error = Some(e);
-                    }
-                }
+            if should_throttle_next_tool_round {
+                let delay = tool_round_throttle_delay(saw_rate_limit_this_turn);
+                info!(
+                    iteration,
+                    delay_ms = delay.as_millis() as u64,
+                    saw_rate_limit_this_turn,
+                    "Throttling next LLM call after tool round"
+                );
+                tokio::time::sleep(delay).await;
+                should_throttle_next_tool_round = false;
             }
 
-            let response = match response_opt {
-                Some(r) => r,
-                None => {
-                    let e = last_error.unwrap();
+            // Call LLM with extracted sub-function (#15)
+            let llm_timer = ScopedTimer::new();
+            let llm_result = self
+                .call_llm_with_retry(
+                    &current_messages,
+                    &tools,
+                    &msg,
+                    iteration,
+                    &mut saw_rate_limit_this_turn,
+                )
+                .await;
+            metrics.record_llm_call(llm_timer.elapsed_ms());
+
+            let response = match llm_result {
+                Ok(r) => r,
+                Err(e) => {
+                    let max_retries = self.config.agents.defaults.llm_max_retries;
                     warn!(error = %e, iteration, retries = max_retries, "LLM call failed after all retries");
-                    final_response = format!(
-                        "抱歉，我在处理你的请求时遇到了问题（已重试 {} 次）。\n\n\
-                        错误信息：{}\n\n\
-                        这可能是临时的网络或服务问题，请稍后再试。如果问题持续，我会自动学习并改进。",
-                        max_retries, e
-                    );
-                    // 报告错误给进化服务
+                    final_response = llm_exhausted_error(max_retries, &e);
                     if let Some(evo_service) = self.context_builder.evolution_service() {
                         let _ = evo_service
                             .report_error("__llm_provider__", &format!("{}", e), None, vec![])
@@ -2827,6 +3102,11 @@ impl AgentRuntime {
                         ch.map(|s| s == msg.channel).unwrap_or(true)
                             && to.map(|s| s == msg.chat_id).unwrap_or(true)
                     });
+                let activate_skill_call = response
+                    .tool_calls
+                    .iter()
+                    .find(|call| call.name == ACTIVATE_SKILL_TOOL_NAME)
+                    .cloned();
 
                 // Add assistant message with tool calls
                 let assistant_content = response.content.as_deref().unwrap_or("");
@@ -2840,6 +3120,68 @@ impl AgentRuntime {
                 assistant_msg.tool_calls = Some(response.tool_calls.clone());
                 current_messages.push(assistant_msg.clone());
                 history.push(assistant_msg);
+
+                if let Some(skill_call) = activate_skill_call {
+                    if response.tool_calls.len() > 1 {
+                        warn!(
+                            tool_calls = response.tool_calls.len(),
+                            "activate_skill was returned with additional tool calls; only the skill activation will be executed"
+                        );
+                    }
+
+                    let raw_skill_name = skill_call
+                        .arguments
+                        .get("skill_name")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("");
+                    let skill_name = normalize_selected_skill_name(raw_skill_name, &skill_cards)
+                        .ok_or_else(|| {
+                            blockcell_core::Error::Skill(format!(
+                                "Model selected unavailable skill '{}'",
+                                raw_skill_name
+                            ))
+                        })?;
+                    let goal = skill_call
+                        .arguments
+                        .get("goal")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or(msg.content.as_str())
+                        .to_string();
+                    let skill_ctx = self
+                        .context_builder
+                        .resolve_active_skill_by_name(&skill_name, &disabled_skills)
+                        .map(|skill| {
+                            suppress_prompt_reinjection_for_continued_skill(
+                                skill,
+                                recent_skill_name.as_deref(),
+                            )
+                        })
+                        .ok_or_else(|| {
+                            blockcell_core::Error::Skill(format!(
+                                "Skill '{}' is not available",
+                                skill_name
+                            ))
+                        })?;
+                    let skill_history_seed = history[..history.len().saturating_sub(1)].to_vec();
+                    let (skill_result, updated_metadata, allowed_tools) = self
+                        .run_skill_for_turn(&skill_ctx, &msg, &skill_history_seed, &persist_session_key)
+                        .await?;
+                    session_metadata = updated_metadata;
+                    record_active_skill_name(&mut session_metadata, &skill_ctx.name);
+                    append_activated_skill_history(
+                        &mut history,
+                        &skill_call.id,
+                        &skill_ctx.name,
+                        &goal,
+                        &allowed_tools,
+                        &skill_result.trace_messages,
+                        &skill_result.final_response,
+                    );
+                    final_response = skill_result.final_response;
+                    break;
+                }
 
                 // Execute each tool call, with dynamic tool supplement for intent misclassification
                 let mut supplemented_tools = false;
@@ -2862,11 +3204,13 @@ impl AgentRuntime {
                             message_tool_sent_media = true;
                         }
                     }
+                    let tool_timer = ScopedTimer::new();
                     let result = if tool_names.iter().any(|allowed| allowed == &tool_call.name) {
-                        self.execute_tool_call(tool_call, &msg).await
+                        self.execute_tool_call(tool_call, &msg, None).await
                     } else {
                         scoped_tool_denied_result(&tool_call.name)
                     };
+                    metrics.record_tool_execution(&tool_call.name, tool_timer.elapsed_ms());
 
                     // Collect media paths from tool results for WebUI display.
                     // Skip the "message" tool — it already dispatches its own OutboundMessage
@@ -2918,16 +3262,6 @@ impl AgentRuntime {
                         }
                     }
 
-                    // Track tool failures for fallback hint injection
-                    let is_error = tool_result_indicates_error(&result);
-                    if is_error {
-                        let count = tool_fail_counts.entry(tool_call.name.clone()).or_insert(0);
-                        *count += 1;
-                    } else {
-                        // Reset on success
-                        tool_fail_counts.remove(&tool_call.name);
-                    }
-
                     // Dynamic tool supplement: if tool was not found or validation failed
                     // (e.g. lightweight schema had no params), inject full schema and retry.
                     let needs_supplement = should_supplement_tool_schema(&result);
@@ -2965,9 +3299,47 @@ impl AgentRuntime {
                                 });
                                 tools.push(schema_val);
                                 supplemented_tools = true;
+                                _schema_cache_dirty = true;
                                 info!(tool = %tool_call.name, "Dynamically supplemented tool with full schema");
+                                break;
                             }
                         }
+                    }
+
+                    // Track tool failures with transient/permanent classification (#6)
+                    let is_error = tool_result_indicates_error(&result);
+                    if is_error {
+                        let failure_kind = classify_tool_failure(&result);
+                        match failure_kind {
+                            ToolFailureKind::Permanent | ToolFailureKind::Transient => {
+                                let count =
+                                    tool_fail_counts.entry(tool_call.name.clone()).or_insert(0);
+                                *count += 1;
+
+                                if failure_kind == ToolFailureKind::Permanent && *count == 1 {
+                                    let hint = format!(
+                                        "⚠️ 工具 `{}` 遇到永久性错误（如 API key 缺失、权限不足），请不要重试，改用其他可用工具或告知用户配置问题。",
+                                        tool_call.name
+                                    );
+                                    warn!(tool = %tool_call.name, kind = ?failure_kind, "Permanent tool failure — injecting immediate hint");
+                                    current_messages.push(ChatMessage::user(&hint));
+                                }
+                            }
+                            ToolFailureKind::ResourceMissing => {
+                                tool_fail_counts.remove(&tool_call.name);
+                                if resource_missing_hints_sent.insert(tool_call.name.clone()) {
+                                    let hint = format!(
+                                        "⚠️ 工具 `{}` 报告目标资源不存在。不要重复调用同一工具重试同一个标识；直接向用户说明未找到，或请用户提供新的标识/范围。",
+                                        tool_call.name
+                                    );
+                                    current_messages.push(ChatMessage::user(&hint));
+                                }
+                            }
+                        }
+                    } else {
+                        // Reset on success
+                        tool_fail_counts.remove(&tool_call.name);
+                        resource_missing_hints_sent.remove(&tool_call.name);
                     }
 
                     let mut tool_msg = ChatMessage::tool_result(&tool_call.id, &result);
@@ -3051,11 +3423,22 @@ impl AgentRuntime {
                     current_messages.push(ChatMessage::user(&hint));
                 }
 
-                // Mid-loop compression: if accumulated messages are getting large,
-                // compress older tool interaction rounds (keep system + recent 2 rounds).
-                // This prevents multi-round tool calling from blowing up context.
-                if current_messages.len() > 20 {
+                // Mid-loop compression: trigger based on estimated token count (#3).
+                // Use token estimation instead of raw message count for more accurate
+                // context window management. Threshold ~12k tokens triggers compression.
+                let estimated_tokens = estimate_messages_tokens(&current_messages);
+                if estimated_tokens > 12_000 || current_messages.len() > 30 {
                     Self::compress_mid_loop(&mut current_messages);
+                    metrics.record_compression();
+                    info!(
+                        estimated_tokens,
+                        msg_count = current_messages.len(),
+                        "Mid-loop compression triggered"
+                    );
+                }
+
+                if iteration + 1 < max_iterations && !short_circuit_after_tools {
+                    should_throttle_next_tool_round = true;
                 }
 
                 if short_circuit_after_tools {
@@ -3133,146 +3516,16 @@ impl AgentRuntime {
             }
         }
 
-        // Trim leading/trailing whitespace — LLMs often return "\n\nContent..."
-        let final_response = final_response.trim().to_string();
-
-        // Strip fake tool call blocks — some LLMs output pseudo-tool-call syntax
-        // in plain text (e.g. [TOOL_CALL]...[/TOOL_CALL]) instead of using the
-        // real function calling mechanism. Remove these before sending to user.
-        let final_response = strip_fake_tool_calls(&final_response);
-
-        // Cache large list/table responses to prevent history token explosion.
-        // Replaces the last assistant history entry with a compact stub; full content
-        // is retrievable via the session_recall tool.
-        if let Some(stub) = self
-            .response_cache
-            .maybe_cache_and_stub(&persist_session_key, &final_response)
-        {
-            overwrite_last_assistant_message(&mut history, &stub);
-        }
-
-        // Save session
-        self.session_store
-            .save_with_metadata(&persist_session_key, &history, &session_metadata)?;
-
-        // L2 incremental session summary (P2-1):
-        // When history is long enough, build an extractive summary and store it.
-        // This is picked up by generate_brief_for_query for future context injection.
-        if history.len() >= 6 {
-            if let Some(ref store) = self.memory_store {
-                let summary = Self::build_extractive_summary(&history);
-                if !summary.is_empty() {
-                    if let Err(e) = store.upsert_session_summary(&persist_session_key, &summary) {
-                        debug!(error = %e, "Failed to upsert session summary");
-                    }
-                }
-            }
-        }
-
-        if msg.channel == "cron"
-            && msg
-                .metadata
-                .get("cron_agent")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-        {
-            if let Some(tx) = &self.outbound_tx {
-                let mut outbound =
-                    OutboundMessage::new(&msg.channel, &msg.chat_id, &final_response);
-                outbound.account_id = msg.account_id.clone();
-                outbound.media = collected_media.clone();
-                outbound.metadata = extract_reply_metadata(&msg);
-                let _ = tx.send(outbound).await;
-            }
-
-            if let Some((channel, to)) = cron_deliver_target {
-                if channel == "ws" {
-                    if let Some(ref event_tx) = self.event_tx {
-                        let event = serde_json::json!({
-                            "type": "message_done",
-                            "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
-                            "chat_id": to,
-                            "task_id": "",
-                            "content": final_response,
-                            "tool_calls": 0,
-                            "duration_ms": 0,
-                            "media": collected_media,
-                            "background_delivery": true,
-                            "delivery_kind": "cron",
-                            "cron_kind": "agent",
-                        });
-                        let _ = event_tx.send(event.to_string());
-                    }
-                    if let Some(tx) = &self.outbound_tx {
-                        let mut outbound = OutboundMessage::new(&channel, &to, &final_response);
-                        outbound.account_id = msg.account_id.clone();
-                        outbound.media = collected_media.clone();
-                        let _ = tx.send(outbound).await;
-                    }
-                } else if let Some(tx) = &self.outbound_tx {
-                    let mut outbound = OutboundMessage::new(&channel, &to, &final_response);
-                    outbound.account_id = msg.account_id.clone();
-                    outbound.media = collected_media.clone();
-                    let _ = tx.send(outbound).await;
-                }
-            }
-
-            return Ok(final_response);
-        }
-
-        // Emit message_done event to WebSocket clients.
-        // Only for "ws" channel — the bridge's outbound_to_ws_bridge skips ws-channel
-        // messages (to avoid duplicate), so we must emit directly via event_tx.
-        // For all other channels (cron, subagent, cli, etc.), the bridge will create
-        // the WS event from the outbound_tx message, preventing double-send.
-        if msg.channel == "ws" {
-            if let Some(ref event_tx) = self.event_tx {
-                let event = serde_json::json!({
-                    "type": "message_done",
-                    "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
-                    "chat_id": msg.chat_id,
-                    "task_id": "",
-                    "content": final_response,
-                    "tool_calls": 0,
-                    "duration_ms": 0,
-                    "media": collected_media,
-                });
-                let _ = event_tx.send(event.to_string());
-            }
-        }
-
-        // Send response to outbound for all channels (including CLI and cron).
-        // Skip ghost channel — ghost responses don't need CLI printing or external
-        // channel dispatch, and the ws event_tx above already handles ws display.
-        if msg.channel != "ghost" {
-            if let Some(tx) = &self.outbound_tx {
-                let mut outbound =
-                    OutboundMessage::new(&msg.channel, &msg.chat_id, &final_response);
-                outbound.account_id = msg.account_id.clone();
-                outbound.media = collected_media.clone();
-                outbound.metadata = extract_reply_metadata(&msg);
-                let _ = tx.send(outbound).await;
-            }
-        }
-
-        // For cron jobs with deliver=true, also forward to the specified external channel
-        if msg.channel == "cron" {
-            if let Some(deliver) = msg.metadata.get("deliver").and_then(|v| v.as_bool()) {
-                if deliver {
-                    if let (Some(channel), Some(to)) = (
-                        msg.metadata.get("deliver_channel").and_then(|v| v.as_str()),
-                        msg.metadata.get("deliver_to").and_then(|v| v.as_str()),
-                    ) {
-                        if let Some(tx) = &self.outbound_tx {
-                            let outbound = OutboundMessage::new(channel, to, &final_response);
-                            let _ = tx.send(outbound).await;
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(final_response)
+        self.persist_and_deliver_final_response(FinalResponseContext {
+            msg: &msg,
+            persist_session_key: &persist_session_key,
+            history: &mut history,
+            session_metadata: &session_metadata,
+            final_response: &final_response,
+            collected_media,
+            cron_deliver_target,
+        })
+        .await
     }
 
     /// Extract filesystem paths from tool call parameters.
@@ -3346,11 +3599,23 @@ impl AgentRuntime {
     }
 
     /// Check whether a resolved path falls within an already-authorized directory.
+    /// Optimized (#12): walk ancestors with O(1) HashSet lookups instead of O(n) iteration.
+    /// `authorized_dirs` stores already-canonicalized paths, so no re-canonicalization needed.
     fn is_path_authorized(&self, resolved: &std::path::Path) -> bool {
+        if self.authorized_dirs.is_empty() {
+            return false;
+        }
         let rp = canonical_or_normalized(resolved);
-        self.authorized_dirs
-            .iter()
-            .any(|dir| rp.starts_with(canonical_or_normalized(dir.as_path())))
+        let mut current = rp.as_path();
+        loop {
+            if self.authorized_dirs.contains(current) {
+                return true;
+            }
+            match current.parent() {
+                Some(parent) if parent != current => current = parent,
+                _ => return false,
+            }
+        }
     }
 
     /// Record a directory as authorized so future accesses within it are auto-approved.
@@ -3387,6 +3652,9 @@ impl AgentRuntime {
         args: &serde_json::Value,
         msg: &InboundMessage,
     ) -> bool {
+        if tool_name == "exec_local" {
+            return true;
+        }
         let raw_paths = self.extract_paths(tool_name, args);
         if raw_paths.is_empty() {
             return true;
@@ -3537,24 +3805,17 @@ impl AgentRuntime {
         &mut self,
         tool_call: &ToolCallRequest,
         msg: &InboundMessage,
+        active_skill_dir: Option<PathBuf>,
     ) -> String {
         // Hard block: reject disabled tools at execution level (not just prompt filtering)
         let disabled_tools = load_disabled_toggles(&self.paths, "tools");
         if disabled_tools.contains(&tool_call.name) {
-            return serde_json::json!({
-                "error": format!("Tool '{}' is currently disabled via toggles.", tool_call.name),
-                "tool": tool_call.name,
-                "hint": "This tool has been disabled by the user. Use toggle_manage to re-enable it, or use an alternative tool."
-            }).to_string();
+            return disabled_tool_result(&tool_call.name);
         }
         // Also block disabled skills invoked as tools (skill scripts registered as tools)
         let disabled_skills = load_disabled_toggles(&self.paths, "skills");
         if disabled_skills.contains(&tool_call.name) {
-            return serde_json::json!({
-                "error": format!("Skill '{}' is currently disabled via toggles.", tool_call.name),
-                "tool": tool_call.name,
-                "hint": "This skill has been disabled by the user. Use toggle_manage to re-enable it."
-            }).to_string();
+            return disabled_skill_result(&tool_call.name);
         }
 
         // Dangerous-operation gate: require explicit user confirmation before executing
@@ -3565,18 +3826,10 @@ impl AgentRuntime {
                     let items = vec![format!("command: {}", cmd)];
                     if self.confirm_tx.is_none() {
                         if !user_explicitly_confirms_dangerous_op(&msg.content) {
-                            return serde_json::json!({
-                                "error": "Permission denied: dangerous exec command requires explicit user confirmation.",
-                                "tool": "exec",
-                                "hint": "This channel cannot show an interactive confirm prompt. Reply with '确认执行' (or '确认重启') to proceed, otherwise I will not run kill/pkill/killall/service-stop commands."
-                            }).to_string();
+                            return dangerous_exec_denied(false);
                         }
                     } else if !self.confirm_dangerous_operation("exec", items, msg).await {
-                        return serde_json::json!({
-                            "error": "Permission denied: dangerous exec command requires explicit user confirmation.",
-                            "tool": "exec",
-                            "hint": "The command looks dangerous (e.g. kill/pkill/killall/service stop). Ask the user to confirm explicitly before running it."
-                        }).to_string();
+                        return dangerous_exec_denied(true);
                     }
                 }
             }
@@ -3620,21 +3873,13 @@ impl AgentRuntime {
             if !items.is_empty() {
                 if self.confirm_tx.is_none() {
                     if !user_explicitly_confirms_dangerous_op(&msg.content) {
-                        return serde_json::json!({
-                            "error": "Permission denied: destructive file operation requires explicit user confirmation.",
-                            "tool": "file_ops",
-                            "hint": "This channel cannot show an interactive confirm prompt. Reply with '确认执行' to proceed with recursive delete / config file modifications."
-                        }).to_string();
+                        return dangerous_file_ops_denied();
                     }
                 } else if !self
                     .confirm_dangerous_operation("file_ops", items, msg)
                     .await
                 {
-                    return serde_json::json!({
-                        "error": "Permission denied: destructive file operation requires explicit user confirmation.",
-                        "tool": "file_ops",
-                        "hint": "Deleting recursively or modifying config files is considered dangerous. Ask the user to confirm before proceeding."
-                    }).to_string();
+                    return dangerous_file_ops_denied();
                 }
             }
         }
@@ -3644,11 +3889,7 @@ impl AgentRuntime {
             .check_path_permission(&tool_call.name, &tool_call.arguments, msg)
             .await
         {
-            return serde_json::json!({
-                "error": "Permission denied: user rejected access to paths outside the safe workspace directory.",
-                "tool": tool_call.name,
-                "hint": "The requested path is outside the workspace. The user has denied this operation. Please inform the user and suggest an alternative within the workspace, or ask the user to confirm."
-            }).to_string();
+            return crate::error::path_access_denied(&tool_call.name, "outside workspace");
         }
 
         // Build TaskManager handle for tools
@@ -3671,6 +3912,7 @@ impl AgentRuntime {
         let ctx = blockcell_tools::ToolContext {
             workspace: self.paths.workspace(),
             builtin_skills_dir: Some(self.paths.builtin_skills_dir()),
+            active_skill_dir,
             session_key: msg.session_key(),
             channel: msg.channel.clone(),
             account_id: msg.account_id.clone(),
@@ -3793,12 +4035,7 @@ impl AgentRuntime {
         }
         // 报告调用结果给灰度统计
         if let Some(evo_service) = self.context_builder.evolution_service() {
-            let mut reported_name = tool_call.name.clone();
-            if let Some(sm) = self.context_builder.skill_manager() {
-                if let Some(skill) = sm.match_skill(&msg.content, &HashSet::new()) {
-                    reported_name = skill.name.clone();
-                }
-            }
+            let reported_name = tool_call.name.clone();
             evo_service
                 .report_skill_call(&reported_name, is_error)
                 .await;
@@ -3836,67 +4073,16 @@ impl AgentRuntime {
         }
     }
 
-    fn resolve_skill_script_path(
-        &self,
-        skill_name: &str,
-        file_name: &str,
-    ) -> Result<std::path::PathBuf> {
-        let user_path = self.paths.skills_dir().join(skill_name).join(file_name);
-        if user_path.exists() {
-            return Ok(user_path);
-        }
-
-        let builtin_path = self
-            .paths
-            .builtin_skills_dir()
-            .join(skill_name)
-            .join(file_name);
-        if builtin_path.exists() {
-            return Ok(builtin_path);
-        }
-
-        Err(blockcell_core::Error::Skill(format!(
-            "{} not found for skill '{}' (checked {} and {})",
-            file_name,
-            skill_name,
-            user_path.display(),
-            builtin_path.display()
-        )))
-    }
-
     async fn run_prompt_skill_for_session(
         &mut self,
-        skill_name: &str,
+        active_skill: &ActiveSkillContext,
         msg: &InboundMessage,
         history: &[ChatMessage],
         session_key: &str,
+        tool_names: &[String],
     ) -> Result<(String, Vec<ChatMessage>, serde_json::Value)> {
         let disabled_skills = load_disabled_toggles(&self.paths, "skills");
         let disabled_tools = load_disabled_toggles(&self.paths, "tools");
-        let active_skill = self
-            .context_builder
-            .resolve_active_skill_by_name(skill_name, &disabled_skills)
-            .ok_or_else(|| {
-                blockcell_core::Error::Skill(format!("Skill '{}' not found", skill_name))
-            })?;
-
-        if !active_skill.inject_prompt_md {
-            return Err(blockcell_core::Error::Skill(format!(
-                "Skill '{}' is not a prompt-only markdown skill",
-                skill_name
-            )));
-        }
-
-        let available_tools = self
-            .tool_registry
-            .tool_names()
-            .into_iter()
-            .collect::<HashSet<_>>();
-        let tool_names =
-            crate::prompt_skill_executor::PromptSkillExecutor::resolve_allowed_tool_names(
-                &active_skill.tools,
-                &available_tools,
-            );
 
         let mode_names = vec![format!("Skill:{}", active_skill.name)];
         let prompt_ctx = blockcell_tools::PromptContext {
@@ -3921,12 +4107,12 @@ impl AgentRuntime {
             &msg.content,
             &msg.media,
             InteractionMode::Skill,
-            Some(&active_skill),
+            Some(active_skill),
             &disabled_skills,
             &disabled_tools,
             &msg.channel,
             pending_intent,
-            &tool_names,
+            tool_names,
             &tool_prompt_rules,
         );
 
@@ -3950,7 +4136,16 @@ impl AgentRuntime {
         }
 
         let prompt_result = self
-            .run_prompt_skill_loop(msg, messages, tools, &tool_names)
+            .run_prompt_skill_loop(
+                msg,
+                messages,
+                tools,
+                tool_names,
+                self.context_builder
+                    .skill_manager()
+                    .and_then(|manager| manager.get(&active_skill.name))
+                    .map(|skill| skill.path.clone()),
+            )
             .await?;
 
         Ok((
@@ -4021,43 +4216,7 @@ impl AgentRuntime {
         }
     }
 
-    async fn dispatch_prompt_skill_for_user(
-        &mut self,
-        skill_name: &str,
-        msg: &InboundMessage,
-        persist_session_key: &str,
-    ) -> Result<String> {
-        let history = self.session_store.load(persist_session_key)?;
-        let (final_response, trace_messages, session_metadata) = self
-            .run_prompt_skill_for_session(skill_name, msg, &history, persist_session_key)
-            .await?;
-
-        let mut updated_history = history;
-        let allowed_tools = self
-            .context_builder
-            .skill_manager()
-            .and_then(|sm| sm.get(skill_name))
-            .map(|skill| skill.meta.effective_tools())
-            .unwrap_or_default();
-        persist_prompt_skill_history(
-            &mut updated_history,
-            &msg.content,
-            skill_name,
-            &allowed_tools,
-            &trace_messages,
-            &final_response,
-        );
-        self.session_store.save_with_metadata(
-            persist_session_key,
-            &updated_history,
-            &session_metadata,
-        )?;
-        self.deliver_skill_response(msg, &final_response, Some("script"))
-            .await;
-
-        Ok(final_response)
-    }
-
+    #[allow(dead_code)]
     async fn run_rhai_script_with_context(
         &self,
         rhai_path: &std::path::Path,
@@ -4146,6 +4305,7 @@ impl AgentRuntime {
                 let ctx = blockcell_tools::ToolContext {
                     workspace: paths.workspace(),
                     builtin_skills_dir: Some(paths.builtin_skills_dir()),
+                    active_skill_dir: None,
                     session_key: session_key.clone(),
                     channel: channel.clone(),
                     account_id: None,
@@ -4236,524 +4396,6 @@ impl AgentRuntime {
             warn!(skill = %skill_name, error = %err, "SKILL.rhai cron execution failed");
             Err(blockcell_core::Error::Skill(err))
         }
-    }
-
-    /// Helper: run a SKILL.py script with explicit command-line arguments.
-    async fn run_python_script_with_argv(
-        &self,
-        py_path: &std::path::Path,
-        skill_name: &str,
-        argv: &[String],
-    ) -> Result<String> {
-        use std::process::Stdio;
-
-        let python_bin = if which::which("python3").is_ok() {
-            "python3"
-        } else if which::which("python").is_ok() {
-            "python"
-        } else {
-            return Err(blockcell_core::Error::Skill(
-                "Python runtime not found (python3/python)".to_string(),
-            ));
-        };
-
-        let timeout_secs = self.config.tools.exec.timeout.clamp(1, 600) as u64;
-        let mut cmd = tokio::process::Command::new(python_bin);
-        cmd.arg(py_path);
-        for arg in argv {
-            cmd.arg(arg);
-        }
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        if let Some(parent) = py_path.parent() {
-            cmd.current_dir(parent);
-        }
-
-        let child = cmd.spawn().map_err(|e| {
-            blockcell_core::Error::Skill(format!(
-                "Failed to spawn {} for {}: {}",
-                python_bin,
-                py_path.display(),
-                e
-            ))
-        })?;
-
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            child.wait_with_output(),
-        )
-        .await
-        .map_err(|_| {
-            blockcell_core::Error::Skill(format!(
-                "SKILL.py execution timed out after {}s",
-                timeout_secs
-            ))
-        })?
-        .map_err(|e| blockcell_core::Error::Skill(format!("SKILL.py execution failed: {}", e)))?;
-
-        let max_output_chars = 10_000;
-        let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        if stdout.len() > max_output_chars {
-            stdout = format!(
-                "{}\n... (output truncated)",
-                truncate_str(&stdout, max_output_chars)
-            );
-        }
-        if stderr.len() > max_output_chars {
-            stderr = format!(
-                "{}\n... (stderr truncated)",
-                truncate_str(&stderr, max_output_chars)
-            );
-        }
-
-        if !output.status.success() {
-            let code = output
-                .status
-                .code()
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| "terminated".to_string());
-            // Python scripts often print error messages to stdout then sys.exit(1);
-            // prefer stderr, fall back to stdout so the caller sees the actual message.
-            let detail = if !stderr.trim().is_empty() {
-                stderr.trim().to_string()
-            } else if !stdout.trim().is_empty() {
-                stdout.trim().to_string()
-            } else {
-                String::new()
-            };
-            let err = if detail.is_empty() {
-                format!("SKILL.py exited with status {}", code)
-            } else {
-                format!("SKILL.py exited with status {}: {}", code, detail)
-            };
-            warn!(skill = %skill_name, argv = ?argv, exit_code = %code, detail = %detail, "SKILL.py script execution failed");
-            return Err(blockcell_core::Error::Skill(err));
-        }
-
-        let output_text = if stdout.trim().is_empty() {
-            "Python skill executed successfully (no output)".to_string()
-        } else {
-            stdout.trim().to_string()
-        };
-
-        info!(
-            skill = %skill_name,
-            argv = ?argv,
-            "SKILL.py script execution succeeded"
-        );
-        Ok(output_text)
-    }
-
-    /// Expand response-cache stubs in session history so argv planning can access
-    /// the full list data. Messages like `[已缓存N条结果，ID: ref:XXXXXXXX]` are
-    /// replaced with the original cached content.
-    fn expand_stubs_in_history(
-        &self,
-        session_key: &str,
-        history: &[ChatMessage],
-    ) -> Vec<ChatMessage> {
-        history
-            .iter()
-            .map(|msg| {
-                let content_str = msg.content.as_str().unwrap_or("");
-                if content_str.contains("ref:") {
-                    // Extract ref_id: look for "ref:" followed by hex chars
-                    if let Some(ref_pos) = content_str.find("ref:") {
-                        let after = &content_str[ref_pos + 4..];
-                        let ref_id: String = after
-                            .chars()
-                            .take_while(|c| c.is_ascii_hexdigit())
-                            .collect();
-                        if !ref_id.is_empty() {
-                            if let Some(full) = self.response_cache.recall(session_key, &ref_id) {
-                                let mut expanded = msg.clone();
-                                expanded.content =
-                                    serde_json::Value::String(full);
-                                return expanded;
-                            }
-                        }
-                    }
-                }
-                msg.clone()
-            })
-            .collect()
-    }
-
-    fn script_planning_history_budget(&self) -> usize {
-        let max_context = self.config.agents.defaults.max_context_tokens as usize;
-        let reserved_output = self.config.agents.defaults.max_tokens as usize;
-        max_context
-            .saturating_sub(reserved_output)
-            .saturating_sub(4_000)
-            .max(4_000)
-    }
-
-    /// Script skill dispatch for user-initiated messages.
-    ///
-    /// The runtime uses `SKILL.md` as the invocation manual, asks the model to
-    /// construct a concrete `argv`, executes the script once, then summarizes
-    /// the raw result back to the user.
-    async fn dispatch_script_skill_for_user(
-        &mut self,
-        skill_name: &str,
-        msg: &InboundMessage,
-        persist_session_key: &str,
-    ) -> Result<String> {
-        let (planning_md, summary_md) = {
-            let sm = self.context_builder.skill_manager().ok_or_else(|| {
-                blockcell_core::Error::Skill("SkillManager not available".to_string())
-            })?;
-            let skill = sm.get(skill_name).ok_or_else(|| {
-                blockcell_core::Error::Skill(format!("Skill '{}' not found", skill_name))
-            })?;
-            (
-                skill.load_planning_bundle().unwrap_or_default(),
-                skill.load_summary_bundle().unwrap_or_default(),
-            )
-        };
-
-        let history = self.session_store.load(persist_session_key)?;
-        let session_metadata = self.session_store.load_metadata(persist_session_key)?;
-
-        let runtime_kind = match infer_skill_script_kind(&self.paths, skill_name) {
-            Some(ResolvedSkillScriptKind::Python) => "python".to_string(),
-            Some(ResolvedSkillScriptKind::Rhai) => "rhai".to_string(),
-            Some(ResolvedSkillScriptKind::Markdown) => {
-                return Err(blockcell_core::Error::Skill(format!(
-                    "Skill '{}' is a prompt skill, not a script skill",
-                    skill_name
-                )));
-            }
-            None => {
-                return Err(blockcell_core::Error::Skill(format!(
-                    "Skill '{}' has no executable script",
-                    skill_name
-                )));
-            }
-        };
-
-        // Expand any response-cache stubs in history so argv planning can access full list data.
-        let expanded_history = self.expand_stubs_in_history(persist_session_key, &history);
-        let history_projection = HistoryProjector::new(&expanded_history).project(
-            &msg.content,
-            HistoryProjectionProfile::ScriptPlanning,
-            self.script_planning_history_budget(),
-        );
-        let argv_messages = build_script_skill_argv_messages(
-            &msg.content,
-            skill_name,
-            &planning_md,
-            &history_projection.messages,
-        );
-        info!(
-            skill = %skill_name,
-            history_messages = history.len(),
-            history_rounds_total = history_projection.rounds_total,
-            history_rounds_embedded = history_projection.rounds_embedded,
-            history_messages_embedded = history_projection.messages_embedded,
-            reference_round = ?history_projection.reference_round,
-            llm_messages = argv_messages.len(),
-            "Script skill argv planning messages prepared"
-        );
-        let argv_result = if let Some((pidx, provider)) = self.provider_pool.acquire() {
-            let r = provider.chat(&argv_messages, &[]).await;
-            match &r {
-                Ok(_) => self.provider_pool.report(pidx, CallResult::Success),
-                Err(e) => self
-                    .provider_pool
-                    .report(pidx, ProviderPool::classify_error(&format!("{}", e))),
-            }
-            r
-        } else {
-            return Err(blockcell_core::Error::Config(
-                "ProviderPool: no healthy providers".to_string(),
-            ));
-        }?;
-
-        let argv_text = argv_result.content.unwrap_or_default();
-        let argv_json: serde_json::Value = {
-            let cleaned = extract_json_from_text(&argv_text);
-            serde_json::from_str(&cleaned).map_err(|e| {
-                blockcell_core::Error::Skill(format!(
-                    "LLM argv planning returned invalid JSON ({}): {}",
-                    e,
-                    truncate_str(&argv_text, 200)
-                ))
-            })?
-        };
-        // Handle clarify / direct_answer — both short-circuit script execution.
-        let short_circuit = argv_json
-            .get("direct_answer")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                argv_json
-                    .get("clarify")
-                    .and_then(|v| v.as_str())
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-            });
-        if let Some(answer) = short_circuit {
-            let final_response = answer.to_string();
-            let mut updated_history = history;
-            updated_history.push(ChatMessage::user(&msg.content));
-            updated_history.push(ChatMessage::assistant(&final_response));
-            self.session_store.save_with_metadata(
-                persist_session_key,
-                &updated_history,
-                &session_metadata,
-            )?;
-            self.deliver_skill_response(msg, &final_response, Some("script"))
-                .await;
-            return Ok(final_response);
-        }
-        let argv = argv_json
-            .get("argv")
-            .and_then(|value| value.as_array())
-            .ok_or_else(|| {
-                blockcell_core::Error::Skill(format!(
-                    "LLM argv planning for '{}' did not return an argv array",
-                    skill_name
-                ))
-            })?
-            .iter()
-            .map(|value| {
-                value.as_str().map(str::to_string).ok_or_else(|| {
-                    blockcell_core::Error::Skill(format!(
-                        "LLM argv planning for '{}' returned a non-string argv item",
-                        skill_name
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let argv = normalize_script_skill_argv(argv);
-        if argv.is_empty() {
-            return Err(blockcell_core::Error::Skill(format!(
-                "LLM argv planning for '{}' returned an empty argv array",
-                skill_name
-            )));
-        }
-        if argv
-            .iter()
-            .any(|value| contains_unresolved_placeholder_arg(value))
-        {
-            let final_response =
-                "缺少继续执行所需的内部定位信息，请先重新执行上一步列表/搜索，或明确指定要查看的对象。"
-                    .to_string();
-            let mut updated_history = history;
-            updated_history.push(ChatMessage::user(&msg.content));
-            updated_history.push(ChatMessage::assistant(&final_response));
-            self.session_store.save_with_metadata(
-                persist_session_key,
-                &updated_history,
-                &session_metadata,
-            )?;
-            self.deliver_skill_response(msg, &final_response, Some("script"))
-                .await;
-            return Ok(final_response);
-        }
-        let method_name = argv
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "run".to_string());
-
-        info!(
-            skill = %skill_name,
-            method = %method_name,
-            argv = ?argv,
-            runtime_kind = %runtime_kind,
-            "Script skill dispatch: executing script"
-        );
-
-        let script_result = match runtime_kind.as_str() {
-            "python" => {
-                let py_path = self.resolve_skill_script_path(skill_name, "SKILL.py")?;
-                self.run_python_script_with_argv(&py_path, skill_name, &argv)
-                    .await
-            }
-            "rhai" => {
-                let rhai_path = self.resolve_skill_script_path(skill_name, "SKILL.rhai")?;
-                let rhai_context = serde_json::json!({
-                    "argv": argv,
-                    "skill_name": skill_name,
-                    "user_input": msg.content,
-                    "channel": msg.channel,
-                    "chat_id": msg.chat_id,
-                    "metadata": msg.metadata.clone(),
-                });
-                self.run_rhai_script_with_context(&rhai_path, skill_name, msg, Some(rhai_context))
-                    .await
-            }
-            other => Err(blockcell_core::Error::Skill(format!(
-                "Script skill '{}' has unsupported runtime kind '{}'",
-                skill_name, other
-            ))),
-        };
-
-        let internal_tool_name = match runtime_kind.as_str() {
-            "python" => "skill_invoke_python",
-            "rhai" => "skill_invoke_rhai",
-            _ => "skill_invoke_script",
-        };
-        let mut raw_script_output_for_history: Option<String> = None;
-
-        // 9. Summarize script output with LLM
-        let final_response = match script_result {
-            Ok(output) => {
-                raw_script_output_for_history = Some(output.clone());
-                let presentation = prepare_skill_result_for_presentation(skill_name, &output);
-                if let Some(text) = presentation.direct_text.clone() {
-                    text
-                } else {
-                    let summarize_messages = vec![
-                        ChatMessage::system(
-                            "你是技能结果整理助手。脚本已执行完成，请将结果整理为友好的回复。\
-                            优先依据技能说明组织输出。不要调用任何工具，不要编造未提供的信息。",
-                        ),
-                        ChatMessage::user(&build_script_skill_summary_prompt(
-                            &msg.content,
-                            skill_name,
-                            &method_name,
-                            &summary_md,
-                            presentation.llm_payload.as_deref().unwrap_or(&output),
-                        )),
-                    ];
-                    if let Some((pidx, provider)) = self.provider_pool.acquire() {
-                        let r = provider.chat(&summarize_messages, &[]).await;
-                        match &r {
-                            Ok(_) => self.provider_pool.report(pidx, CallResult::Success),
-                            Err(e) => self
-                                .provider_pool
-                                .report(pidx, ProviderPool::classify_error(&format!("{}", e))),
-                        }
-                        match r {
-                            Ok(resp) => resp.content.unwrap_or(output),
-                            Err(e) => {
-                                warn!(
-                                    skill = %skill_name,
-                                    error = %e,
-                                    "Summarization LLM call failed, returning raw output"
-                                );
-                                presentation.fallback_text.clone()
-                            }
-                        }
-                    } else {
-                        presentation.fallback_text.clone()
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(
-                    skill = %skill_name,
-                    method = %method_name,
-                    error = %e,
-                    "Script skill execution failed"
-                );
-                self.context_builder
-                    .skill_manager()
-                    .and_then(|sm| sm.get(skill_name))
-                    .and_then(|s| s.meta.fallback.as_ref())
-                    .and_then(|fb| fb.message.as_ref())
-                    .cloned()
-                    .unwrap_or_else(|| format!("[{}] 执行失败: {}", skill_name, e))
-            }
-        };
-
-        // 10. Persist user message + assistant response to session history
-        let mut updated_history = history;
-        if let Some(raw_output) = raw_script_output_for_history.as_deref() {
-            persist_script_skill_history(
-                &mut updated_history,
-                &msg.content,
-                skill_name,
-                internal_tool_name,
-                &argv,
-                raw_output,
-                &final_response,
-            );
-        } else {
-            updated_history.push(ChatMessage::user(&msg.content));
-            updated_history.push(ChatMessage::assistant(&final_response));
-        }
-        let _ = self.session_store.save_with_metadata(
-            persist_session_key,
-            &updated_history,
-            &session_metadata,
-        );
-
-        // 11. Deliver response via outbound channel
-        self.deliver_skill_response(msg, &final_response, Some("script"))
-            .await;
-
-        Ok(final_response)
-    }
-
-    /// Stateless LLM call to pick the best skill from multiple trigger-matched candidates.
-    /// No chat history is passed — only skill names, descriptions, and the user query.
-    async fn llm_disambiguate_skill(
-        &mut self,
-        user_input: &str,
-        candidates: &[(String, String)],
-    ) -> String {
-        if candidates.is_empty() {
-            return String::new();
-        }
-        if candidates.len() == 1 {
-            return candidates[0].0.clone();
-        }
-
-        let skills_desc = candidates
-            .iter()
-            .map(|(name, desc)| format!("- {}: {}", name, desc))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let prompt = format!(
-            "根据用户请求，从以下技能中选择最合适的一个。\n\n\
-            可用技能：\n{}\n\n\
-            用户请求：{}\n\n\
-            请直接输出技能名称，不要有任何额外说明。",
-            skills_desc, user_input
-        );
-
-        let messages = vec![ChatMessage::user(&prompt)];
-
-        if let Some((pidx, provider)) = self.provider_pool.acquire() {
-            let r = provider.chat(&messages, &[]).await;
-            match &r {
-                Ok(_) => self.provider_pool.report(pidx, CallResult::Success),
-                Err(e) => self
-                    .provider_pool
-                    .report(pidx, ProviderPool::classify_error(&format!("{}", e))),
-            }
-            if let Ok(resp) = r {
-                let selected = resp.content.unwrap_or_default();
-                let selected = selected.trim();
-                if let Some(normalized) =
-                    crate::skill_decision::SkillDecisionEngine::normalize_selected_skill_name(
-                        selected, candidates,
-                    )
-                {
-                    info!(
-                        selected = %normalized,
-                        candidates = candidates.len(),
-                        "LLM disambiguated skill"
-                    );
-                    return normalized;
-                }
-            }
-        }
-
-        // Fallback: first candidate
-        warn!(
-            candidates = candidates.len(),
-            "Skill disambiguation failed, falling back to first candidate"
-        );
-        candidates[0].0.clone()
     }
 
     pub async fn run_loop(
@@ -5045,46 +4687,10 @@ impl AgentRuntime {
     }
 }
 
-/// Detect explicit skill invocation patterns in user input and return the skill name.
-/// Recognised patterns: "用技能 X", "使用技能 X", "调用技能 X", "call skill X", "run skill X".
-fn detect_explicit_skill_name(text: &str) -> String {
-    let cn_patterns = ["用技能 ", "使用技能 ", "调用技能 ", "执行技能 "];
-    let en_patterns = ["call skill ", "run skill ", "use skill ", "using skill "];
-
-    for pat in &cn_patterns {
-        if let Some(pos) = text.find(pat) {
-            let rest = &text[pos + pat.len()..];
-            let name = extract_skill_token(rest.trim_start());
-            if !name.is_empty() {
-                return name;
-            }
-        }
-    }
-
-    let lower = text.to_lowercase();
-    for pat in &en_patterns {
-        if let Some(pos) = lower.find(pat) {
-            let rest = &text[pos + pat.len()..];
-            let name = extract_skill_token(rest.trim_start());
-            if !name.is_empty() {
-                return name;
-            }
-        }
-    }
-
-    String::new()
-}
-
-/// Extract a skill-name token: alphanumerics, hyphens, underscores, dots, @.
-fn extract_skill_token(s: &str) -> String {
-    s.chars()
-        .take_while(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '@'))
-        .collect()
-}
-
 /// Extract the first JSON object from potentially markdown-wrapped LLM output.
 /// Handles ```json...```, ```...```, `<tool_call>` XML with `<parameter=argv>`,
 /// bare `{...}` objects, and bare `[...]` arrays (wrapped as `{"argv":[...]}`).  
+#[allow(dead_code)]
 fn extract_json_from_text(text: &str) -> String {
     // Try ```json ... ``` blocks first
     if let Some(start) = text.find("```json") {
@@ -5139,6 +4745,7 @@ fn extract_json_from_text(text: &str) -> String {
     text.trim().to_string()
 }
 
+#[allow(dead_code)]
 fn build_script_skill_summary_prompt(
     user_question: &str,
     skill_name: &str,
@@ -5452,6 +5059,364 @@ fn extract_reply_metadata(msg: &InboundMessage) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use blockcell_core::types::LLMResponse;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    struct TestProvider;
+    struct StreamingRetryProvider {
+        attempts: AtomicUsize,
+    }
+    struct StreamingCloseProvider;
+    struct UnifiedEntryProvider {
+        calls: AtomicUsize,
+    }
+
+    fn extract_active_skill_name(system_text: &str) -> Option<String> {
+        let marker = "## Active Skill: ";
+        let start = system_text.find(marker)?;
+        let rest = &system_text[start + marker.len()..];
+        let skill_name = rest.lines().next()?.trim();
+        if skill_name.is_empty() {
+            None
+        } else {
+            Some(skill_name.to_string())
+        }
+    }
+
+    fn drain_ws_events(event_rx: &mut broadcast::Receiver<String>) -> Vec<serde_json::Value> {
+        let mut events = Vec::new();
+        loop {
+            match event_rx.try_recv() {
+                Ok(payload) => {
+                    events.push(
+                        serde_json::from_str::<serde_json::Value>(&payload)
+                            .expect("parse ws event"),
+                    );
+                }
+                Err(broadcast::error::TryRecvError::Empty)
+                | Err(broadcast::error::TryRecvError::Closed) => break,
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+            }
+        }
+        events
+    }
+
+    fn collect_event_types(events: &[serde_json::Value]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| event.get("type").and_then(|value| value.as_str()))
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn contains_event_subsequence(events: &[String], expected: &[&str]) -> bool {
+        let mut cursor = 0usize;
+        for event in events {
+            if cursor < expected.len() && event == expected[cursor] {
+                cursor += 1;
+            }
+        }
+        cursor == expected.len()
+    }
+
+    #[async_trait::async_trait]
+    impl blockcell_providers::Provider for TestProvider {
+        async fn chat(
+            &self,
+            messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+        ) -> blockcell_core::Result<LLMResponse> {
+            let system_text = messages
+                .first()
+                .map(chat_message_text)
+                .unwrap_or_default();
+            let user_text = messages
+                .iter()
+                .rev()
+                .find(|msg| msg.role == "user")
+                .map(chat_message_text)
+                .unwrap_or_default();
+            let latest_tool_text = messages
+                .iter()
+                .rev()
+                .find(|msg| msg.role == "tool")
+                .map(chat_message_text);
+            let active_skill_name = extract_active_skill_name(&system_text);
+
+            let response = if matches!(
+                active_skill_name.as_deref(),
+                Some("local_demo" | "legacy_script_demo" | "cli_demo")
+            ) && latest_tool_text.is_none()
+            {
+                let (path, args) = match active_skill_name.as_deref() {
+                    Some("cli_demo") => ("bin/cli.sh", vec!["demo"]),
+                    _ => ("scripts/hello.sh", vec!["skill"]),
+                };
+                LLMResponse {
+                    content: Some("准备调用本地脚本".to_string()),
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCallRequest {
+                        id: "test-exec-local".to_string(),
+                        name: "exec_local".to_string(),
+                        arguments: serde_json::json!({
+                            "path": path,
+                            "runner": "sh",
+                            "args": args,
+                            "cwd_mode": "skill"
+                        }),
+                        thought_signature: None,
+                    }],
+                    finish_reason: "tool_calls".to_string(),
+                    usage: serde_json::Value::Null,
+                }
+            } else if matches!(
+                active_skill_name.as_deref(),
+                Some("local_demo" | "legacy_script_demo" | "cli_demo")
+            ) {
+                let stdout = latest_tool_text
+                    .as_deref()
+                    .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                    .and_then(|value| value.get("stdout").and_then(|value| value.as_str()).map(str::trim).map(str::to_string))
+                    .unwrap_or_default();
+                LLMResponse {
+                    content: Some(format!("local exec result: {}", stdout)),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    finish_reason: "stop".to_string(),
+                    usage: serde_json::Value::Null,
+                }
+            } else {
+                LLMResponse {
+                    content: Some(format!("mock answer: {}", user_text)),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    finish_reason: "stop".to_string(),
+                    usage: serde_json::Value::Null,
+                }
+            };
+
+            Ok(response)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl blockcell_providers::Provider for StreamingRetryProvider {
+        async fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+        ) -> blockcell_core::Result<LLMResponse> {
+            Ok(LLMResponse {
+                content: Some("unexpected non-stream call".to_string()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                finish_reason: "stop".to_string(),
+                usage: serde_json::Value::Null,
+            })
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+        ) -> blockcell_core::Result<mpsc::Receiver<StreamChunk>> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            let (tx, rx) = mpsc::channel(8);
+
+            tokio::spawn(async move {
+                if attempt == 0 {
+                    let _ = tx
+                        .send(StreamChunk::TextDelta {
+                            delta: "partial".to_string(),
+                        })
+                        .await;
+                    let _ = tx
+                        .send(StreamChunk::Error {
+                            message: "temporary stream failure".to_string(),
+                        })
+                        .await;
+                    return;
+                }
+
+                let response = LLMResponse {
+                    content: Some("final answer".to_string()),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    finish_reason: "stop".to_string(),
+                    usage: serde_json::Value::Null,
+                };
+                let _ = tx
+                    .send(StreamChunk::TextDelta {
+                        delta: "final answer".to_string(),
+                    })
+                    .await;
+                let _ = tx.send(StreamChunk::Done { response }).await;
+            });
+
+            Ok(rx)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl blockcell_providers::Provider for StreamingCloseProvider {
+        async fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+        ) -> blockcell_core::Result<LLMResponse> {
+            Ok(LLMResponse {
+                content: Some("unexpected non-stream call".to_string()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                finish_reason: "stop".to_string(),
+                usage: serde_json::Value::Null,
+            })
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+        ) -> blockcell_core::Result<mpsc::Receiver<StreamChunk>> {
+            let (tx, rx) = mpsc::channel(8);
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(StreamChunk::TextDelta {
+                        delta: "closed answer".to_string(),
+                    })
+                    .await;
+            });
+            Ok(rx)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl blockcell_providers::Provider for UnifiedEntryProvider {
+        async fn chat(
+            &self,
+            messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+        ) -> blockcell_core::Result<LLMResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+
+            let system_text = messages
+                .first()
+                .map(chat_message_text)
+                .unwrap_or_default();
+            let user_text = messages
+                .iter()
+                .rev()
+                .find(|msg| msg.role == "user")
+                .map(chat_message_text)
+                .unwrap_or_default();
+            let latest_tool_msg = messages.iter().rev().find(|msg| msg.role == "tool");
+            let latest_tool_name = latest_tool_msg
+                .and_then(|msg| msg.name.as_deref())
+                .unwrap_or_default()
+                .to_string();
+            let latest_tool_text = latest_tool_msg.map(chat_message_text);
+            let active_skill_name = extract_active_skill_name(&system_text);
+
+            let response = if matches!(active_skill_name.as_deref(), Some("local_demo"))
+                && latest_tool_name != "exec_local"
+            {
+                LLMResponse {
+                    content: Some("进入 local_demo".to_string()),
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCallRequest {
+                        id: "skill-exec-local".to_string(),
+                        name: "exec_local".to_string(),
+                        arguments: serde_json::json!({
+                            "path": "scripts/hello.sh",
+                            "runner": "sh",
+                            "args": ["skill"],
+                            "cwd_mode": "skill"
+                        }),
+                        thought_signature: None,
+                    }],
+                    finish_reason: "tool_calls".to_string(),
+                    usage: serde_json::Value::Null,
+                }
+            } else if matches!(active_skill_name.as_deref(), Some("local_demo")) {
+                let stdout = latest_tool_text
+                    .as_deref()
+                    .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                    .and_then(|value| {
+                        value
+                            .get("stdout")
+                            .and_then(|value| value.as_str())
+                            .map(str::trim)
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_default();
+                LLMResponse {
+                    content: Some(format!("local exec result: {}", stdout)),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    finish_reason: "stop".to_string(),
+                    usage: serde_json::Value::Null,
+                }
+            } else if latest_tool_name == "list_dir" {
+                let path = latest_tool_text
+                    .as_deref()
+                    .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                    .and_then(|value| {
+                        value.get("path").and_then(|value| value.as_str()).map(str::to_string)
+                    })
+                    .unwrap_or_else(|| ".".to_string());
+                LLMResponse {
+                    content: Some(format!("目录内容：{}", path)),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    finish_reason: "stop".to_string(),
+                    usage: serde_json::Value::Null,
+                }
+            } else if user_text.contains("查看当前目录下文件") {
+                LLMResponse {
+                    content: Some("先列目录".to_string()),
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCallRequest {
+                        id: "general-list-dir".to_string(),
+                        name: "list_dir".to_string(),
+                        arguments: serde_json::json!({ "path": "." }),
+                        thought_signature: None,
+                    }],
+                    finish_reason: "tool_calls".to_string(),
+                    usage: serde_json::Value::Null,
+                }
+            } else if user_text.contains("运行本地脚本") {
+                LLMResponse {
+                    content: Some("改用 skill".to_string()),
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCallRequest {
+                        id: "activate-skill-local-demo".to_string(),
+                        name: ACTIVATE_SKILL_TOOL_NAME.to_string(),
+                        arguments: serde_json::json!({
+                            "skill_name": "local_demo",
+                            "goal": "运行本地脚本"
+                        }),
+                        thought_signature: None,
+                    }],
+                    finish_reason: "tool_calls".to_string(),
+                    usage: serde_json::Value::Null,
+                }
+            } else {
+                LLMResponse {
+                    content: Some(format!("mock answer: {}", user_text)),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    finish_reason: "stop".to_string(),
+                    usage: serde_json::Value::Null,
+                }
+            };
+
+            Ok(response)
+        }
+    }
+
 
     #[test]
     fn test_core_tools_contains_toggle_manage() {
@@ -5484,66 +5449,6 @@ mod tests {
     fn test_tool_result_indicates_error_does_not_use_failed_substring() {
         let result = "Task succeeded, previous attempt failed but recovered.";
         assert!(!tool_result_indicates_error(result));
-    }
-
-    #[test]
-    fn test_infer_skill_script_kind_prefers_python_then_rhai_then_markdown() {
-        let base = std::env::temp_dir().join(format!(
-            "blockcell-runtime-skill-kind-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let paths = Paths::with_base(base.clone());
-        let skill_name = "dual_runtime_skill";
-        let skill_dir = paths.skills_dir().join(skill_name);
-        std::fs::create_dir_all(&skill_dir).expect("create skill dir");
-        std::fs::write(skill_dir.join("SKILL.py"), "print('python')\n").expect("write py");
-        std::fs::write(skill_dir.join("SKILL.rhai"), "print(\"rhai\")").expect("write rhai");
-        std::fs::write(skill_dir.join("SKILL.md"), "# manual\n").expect("write md");
-
-        let inferred = infer_skill_script_kind(&paths, skill_name);
-        assert_eq!(inferred, Some(ResolvedSkillScriptKind::Python));
-
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn test_route_active_skill_to_prompt_python_and_rhai_kinds() {
-        let base = std::env::temp_dir().join(format!(
-            "blockcell-runtime-route-kind-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let paths = Paths::with_base(base.clone());
-
-        let prompt_dir = paths.skills_dir().join("prompt_only");
-        std::fs::create_dir_all(&prompt_dir).expect("create prompt skill dir");
-        std::fs::write(prompt_dir.join("SKILL.md"), "# prompt\n").expect("write prompt md");
-
-        let python_dir = paths.skills_dir().join("python_skill");
-        std::fs::create_dir_all(&python_dir).expect("create python skill dir");
-        std::fs::write(python_dir.join("SKILL.py"), "print('python')\n").expect("write py");
-
-        let rhai_dir = paths.skills_dir().join("rhai_skill");
-        std::fs::create_dir_all(&rhai_dir).expect("create rhai skill dir");
-        std::fs::write(rhai_dir.join("SKILL.rhai"), "print(\"rhai\")").expect("write rhai");
-
-        let prompt_kind = infer_skill_script_kind(&paths, "prompt_only").map(|kind| kind.as_runtime_kind());
-        let python_kind = infer_skill_script_kind(&paths, "python_skill").map(|kind| kind.as_runtime_kind());
-        let rhai_kind = infer_skill_script_kind(&paths, "rhai_skill").map(|kind| kind.as_runtime_kind());
-
-        assert_eq!(
-            decide_skill_execution_route(prompt_kind),
-            Some(SkillExecutionRoute::PromptOnly)
-        );
-        assert_eq!(
-            decide_skill_execution_route(python_kind),
-            Some(SkillExecutionRoute::Scripted)
-        );
-        assert_eq!(
-            decide_skill_execution_route(rhai_kind),
-            Some(SkillExecutionRoute::Scripted)
-        );
-
-        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
@@ -5719,6 +5624,7 @@ mod tests {
         let ctx = ToolContext {
             workspace: PathBuf::from("/tmp/workspace"),
             builtin_skills_dir: None,
+            active_skill_dir: None,
             session_key: "cli:test".to_string(),
             channel: "cli".to_string(),
             account_id: None,
@@ -5758,68 +5664,6 @@ mod tests {
         assert_eq!(exact.as_deref(), Some("xiaohongshu"));
         assert_eq!(partial.as_deref(), Some("xiaohongshu"));
         assert_eq!(missing, None);
-    }
-
-    #[test]
-    fn test_build_script_skill_argv_messages_uses_manual_and_user_input() {
-        let messages = build_script_skill_argv_messages(
-            "搜索 openclaw 最新信息",
-            "tavily",
-            "# 调用说明书\n- argv[0] 必须是 action\n- 支持 search",
-            &[],
-        );
-
-        assert_eq!(messages[0].role, "system");
-        assert!(stringify_chat_message_content(&messages[0]).contains("tavily"));
-        assert!(stringify_chat_message_content(&messages[1]).contains("调用说明书"));
-        assert_eq!(messages.last().map(|msg| msg.role.as_str()), Some("user"));
-        assert!(
-            stringify_chat_message_content(messages.last().unwrap()).contains("openclaw")
-        );
-        assert!(stringify_chat_message_content(&messages[2]).contains("\"argv\""));
-    }
-
-    #[test]
-    fn test_build_script_skill_argv_messages_include_recent_tool_history_for_followup() {
-        let mut history = Vec::new();
-        persist_script_skill_history(
-            &mut history,
-            "搜小红书咖啡",
-            "xiaohongshu",
-            "skill_invoke_python",
-            &["search".to_string(), "咖啡".to_string(), "--json".to_string()],
-            r#"{"items":[{"index":21,"feed_id":"feed-21","xsec_token":"token-21","title":"咖啡笔记"}]}"#,
-            "这里是整理后的搜索结果",
-        );
-
-        let messages = build_script_skill_argv_messages(
-            "查看第21条",
-            "xiaohongshu",
-            "# 调用说明书\n- detail 需要 feed_id 和 xsec_token",
-            &history,
-        );
-
-        let internal_tool_call = messages
-            .iter()
-            .find(|msg| msg.role == "assistant" && msg.tool_calls.is_some())
-            .expect("assistant tool call message missing");
-        let tool_result = messages
-            .iter()
-            .find(|msg| {
-                msg.role == "tool"
-                    && stringify_chat_message_content(msg).contains("feed-21")
-                    && stringify_chat_message_content(msg).contains("token-21")
-            })
-            .expect("tool result message missing");
-
-        assert_eq!(
-            internal_tool_call.tool_calls.as_ref().unwrap()[0].name,
-            "skill_invoke_python"
-        );
-        assert!(stringify_chat_message_content(tool_result).contains("feed-21"));
-        assert!(stringify_chat_message_content(tool_result).contains("token-21"));
-        assert_eq!(messages.last().map(|msg| msg.role.as_str()), Some("user"));
-        assert!(stringify_chat_message_content(messages.last().unwrap()).contains("查看第21条"));
     }
 
     #[test]
@@ -5941,25 +5785,351 @@ mod tests {
         assert!(tool_names.is_empty());
     }
 
-    #[test]
-    fn test_process_message_routes_prompt_skill_to_prompt_executor() {
-        let route = decide_skill_execution_route(Some(SkillScriptKind::Markdown));
+    #[tokio::test]
+    async fn test_prompt_skill_executes_through_unified_skill_executor() {
+        let mut runtime = test_runtime();
+        let skill_dir = runtime.paths.skills_dir().join("prompt_demo");
+        std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+        std::fs::write(
+            skill_dir.join("meta.yaml"),
+            r#"
+name: prompt_demo
+description: prompt demo
+"#,
+        )
+        .expect("write meta");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            r#"# Prompt Demo
 
-        assert_eq!(route, Some(SkillExecutionRoute::PromptOnly));
+## Shared {#shared}
+你是一个简洁的整理助手。
+
+## Prompt {#prompt}
+直接整理用户输入，不需要调用工具。
+"#,
+        )
+        .expect("write skill md");
+        runtime.context_builder.reload_skills();
+
+        let msg = InboundMessage {
+            channel: "cli".to_string(),
+            account_id: None,
+            sender_id: "user".to_string(),
+            chat_id: "chat-1".to_string(),
+            content: "请帮我整理这句话".to_string(),
+            media: vec![],
+            metadata: serde_json::json!({
+                "forced_skill_name": "prompt_demo",
+            }),
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        };
+
+        let result = runtime.process_message(msg).await.expect("process message");
+        assert!(result.contains("请帮我整理这句话"));
+
+        let session_key = blockcell_core::build_session_key("cli", "chat-1");
+        let history = runtime
+            .session_store
+            .load(&session_key)
+            .expect("load session history");
+        assert!(history.iter().any(|message| {
+            message
+                .tool_calls
+                .as_ref()
+                .map(|calls| {
+                    calls.iter().any(|call| {
+                        call.name == "skill_enter"
+                            && call.arguments["skill_name"].as_str() == Some("prompt_demo")
+                    })
+                })
+                .unwrap_or(false)
+        }));
     }
 
-    #[test]
-    fn test_process_message_routes_python_skill_to_script_executor() {
-        let route = decide_skill_execution_route(Some(SkillScriptKind::Python));
+    #[tokio::test]
+    async fn test_prompt_skill_can_use_exec_local_inside_skill_scope() {
+        let mut runtime = test_runtime();
+        runtime
+            .tool_registry
+            .register(Arc::new(blockcell_tools::exec_local::ExecLocalTool));
+        let skill_dir = runtime.paths.skills_dir().join("local_demo");
+        let scripts_dir = skill_dir.join("scripts");
+        std::fs::create_dir_all(&scripts_dir).expect("create scripts dir");
+        std::fs::write(
+            skill_dir.join("meta.yaml"),
+            r#"
+name: local_demo
+description: local demo
+"#,
+        )
+        .expect("write meta");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            r#"# Local Demo
 
-        assert_eq!(route, Some(SkillExecutionRoute::Scripted));
+## Shared {#shared}
+适合执行 skill 目录内的本地脚本。
+
+## Prompt {#prompt}
+如果要运行本地脚本，使用 exec_local。
+"#,
+        )
+        .expect("write skill md");
+        std::fs::write(scripts_dir.join("hello.sh"), "#!/bin/sh\necho local-skill-$1\n")
+            .expect("write script");
+        runtime.context_builder.reload_skills();
+
+        let msg = InboundMessage {
+            channel: "cli".to_string(),
+            account_id: None,
+            sender_id: "user".to_string(),
+            chat_id: "chat-local".to_string(),
+            content: "运行本地脚本".to_string(),
+            media: vec![],
+            metadata: serde_json::json!({
+                "forced_skill_name": "local_demo",
+            }),
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        };
+
+        let result = runtime.process_message(msg).await.expect("process message");
+        let session_key = blockcell_core::build_session_key("cli", "chat-local");
+        let history = runtime
+            .session_store
+            .load(&session_key)
+            .expect("load session history");
+        assert!(
+            result.contains("local-skill-skill"),
+            "unexpected skill result: {}; history: {:?}",
+            result,
+            history
+        );
+        assert!(history.iter().any(|message| {
+            message
+                .tool_calls
+                .as_ref()
+                .map(|calls| calls.iter().any(|call| call.name == "exec_local"))
+                .unwrap_or(false)
+        }));
     }
 
-    #[test]
-    fn test_rhai_script_skill_routes_to_script_executor() {
-        let route = decide_skill_execution_route(Some(SkillScriptKind::Rhai));
+    #[tokio::test]
+    async fn test_skill_executor_uses_manual_not_file_type_to_choose_local_exec() {
+        let mut runtime = test_runtime();
+        runtime
+            .tool_registry
+            .register(Arc::new(blockcell_tools::exec_local::ExecLocalTool));
+        let skill_dir = runtime.paths.skills_dir().join("legacy_script_demo");
+        let scripts_dir = skill_dir.join("scripts");
+        std::fs::create_dir_all(&scripts_dir).expect("create scripts dir");
+        std::fs::write(
+            skill_dir.join("meta.yaml"),
+            r#"
+name: legacy_script_demo
+description: legacy script demo
+"#,
+        )
+        .expect("write meta");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            r#"# Legacy Script Demo
 
-        assert_eq!(route, Some(SkillExecutionRoute::Scripted));
+## Shared {#shared}
+适合执行 skill 目录内的本地脚本。
+
+## Prompt {#prompt}
+如果需要运行本地脚本，使用 exec_local 调用 `scripts/hello.sh`。
+"#,
+        )
+        .expect("write skill md");
+        std::fs::write(skill_dir.join("SKILL.py"), "print('legacy path should not run')\n")
+            .expect("write legacy py");
+        std::fs::write(scripts_dir.join("hello.sh"), "#!/bin/sh\necho local-skill-$1\n")
+            .expect("write script");
+        runtime.context_builder.reload_skills();
+
+        let msg = InboundMessage {
+            channel: "cli".to_string(),
+            account_id: None,
+            sender_id: "user".to_string(),
+            chat_id: "chat-legacy".to_string(),
+            content: "运行这个技能".to_string(),
+            media: vec![],
+            metadata: serde_json::json!({
+                "forced_skill_name": "legacy_script_demo",
+            }),
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        };
+
+        let result = runtime.process_message(msg).await.expect("process message");
+        let session_key = blockcell_core::build_session_key("cli", "chat-legacy");
+        let history = runtime
+            .session_store
+            .load(&session_key)
+            .expect("load session history");
+        assert!(
+            result.contains("local-skill-skill"),
+            "unexpected skill result: {}; history: {:?}",
+            result,
+            history
+        );
+        assert!(history.iter().any(|message| {
+            message
+                .tool_calls
+                .as_ref()
+                .map(|calls| calls.iter().any(|call| call.name == "exec_local"))
+                .unwrap_or(false)
+        }));
+    }
+
+    #[tokio::test]
+    async fn test_cli_style_skill_runs_via_exec_local() {
+        let mut runtime = test_runtime();
+        runtime
+            .tool_registry
+            .register(Arc::new(blockcell_tools::exec_local::ExecLocalTool));
+        let skill_dir = runtime.paths.skills_dir().join("cli_demo");
+        let bin_dir = skill_dir.join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("create bin dir");
+        std::fs::write(
+            skill_dir.join("meta.yaml"),
+            r#"
+name: cli_demo
+description: cli demo
+"#,
+        )
+        .expect("write meta");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            r#"# CLI Demo
+
+## Shared {#shared}
+适合执行 skill 目录中的 CLI 脚本。
+
+## Prompt {#prompt}
+当用户要求执行 CLI 时，使用 exec_local 调用 `bin/cli.sh`。
+"#,
+        )
+        .expect("write skill md");
+        std::fs::write(bin_dir.join("cli.sh"), "#!/bin/sh\necho local-cli-$1\n")
+            .expect("write cli script");
+        runtime.context_builder.reload_skills();
+
+        let msg = InboundMessage {
+            channel: "cli".to_string(),
+            account_id: None,
+            sender_id: "user".to_string(),
+            chat_id: "chat-cli".to_string(),
+            content: "执行 CLI".to_string(),
+            media: vec![],
+            metadata: serde_json::json!({
+                "forced_skill_name": "cli_demo",
+            }),
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        };
+
+        let result = runtime.process_message(msg).await.expect("process message");
+        assert!(result.contains("local-cli-demo"), "unexpected cli result: {}", result);
+    }
+
+    #[tokio::test]
+    async fn test_unified_entry_calls_general_tool_without_extra_planning_roundtrip() {
+        let provider = Arc::new(UnifiedEntryProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let mut runtime = test_runtime_with_provider(provider.clone());
+
+        let msg = InboundMessage {
+            channel: "cli".to_string(),
+            account_id: None,
+            sender_id: "user".to_string(),
+            chat_id: "chat-general-tool".to_string(),
+            content: "查看当前目录下文件".to_string(),
+            media: vec![],
+            metadata: serde_json::Value::Null,
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        };
+
+        let result = runtime.process_message(msg).await.expect("process message");
+        assert!(result.contains("目录内容"));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_unified_entry_can_activate_skill_without_forced_skill_metadata() {
+        let provider = Arc::new(UnifiedEntryProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let mut runtime = test_runtime_with_provider(provider.clone());
+        runtime
+            .tool_registry
+            .register(Arc::new(blockcell_tools::exec_local::ExecLocalTool));
+        let skill_dir = runtime.paths.skills_dir().join("local_demo");
+        let scripts_dir = skill_dir.join("scripts");
+        std::fs::create_dir_all(&scripts_dir).expect("create scripts dir");
+        std::fs::write(
+            skill_dir.join("meta.yaml"),
+            r#"
+name: local_demo
+description: local demo
+"#,
+        )
+        .expect("write meta");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            r#"# Local Demo
+
+## Shared {#shared}
+适合执行 skill 目录内的本地脚本。
+
+## Prompt {#prompt}
+如果需要运行本地脚本，使用 exec_local 调用 `scripts/hello.sh`。
+"#,
+        )
+        .expect("write skill md");
+        std::fs::write(scripts_dir.join("hello.sh"), "#!/bin/sh\necho local-skill-$1\n")
+            .expect("write script");
+        runtime.context_builder.reload_skills();
+
+        let msg = InboundMessage {
+            channel: "cli".to_string(),
+            account_id: None,
+            sender_id: "user".to_string(),
+            chat_id: "chat-activate-skill".to_string(),
+            content: "运行本地脚本".to_string(),
+            media: vec![],
+            metadata: serde_json::Value::Null,
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        };
+
+        let result = runtime.process_message(msg).await.expect("process message");
+        let session_key = blockcell_core::build_session_key("cli", "chat-activate-skill");
+        let history = runtime
+            .session_store
+            .load(&session_key)
+            .expect("load session history");
+
+        assert!(
+            result.contains("local exec result: local-skill-skill"),
+            "unexpected result: {}",
+            result
+        );
+        assert!(history.iter().any(|message| {
+            message
+                .tool_calls
+                .as_ref()
+                .map(|calls| calls.iter().any(|call| call.name == ACTIVATE_SKILL_TOOL_NAME))
+                .unwrap_or(false)
+        }));
+        assert!(history.iter().any(|message| {
+            message
+                .tool_calls
+                .as_ref()
+                .map(|calls| calls.iter().any(|call| call.name == "skill_enter"))
+                .unwrap_or(false)
+        }));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
     }
 
     #[test]
@@ -6121,10 +6291,76 @@ mod tests {
     }
 
     #[test]
-    fn test_is_followup_skill_request_detects_ordinal_reference() {
-        assert!(is_followup_skill_request("查看第4条"));
-        assert!(is_followup_skill_request("继续这个"));
-        assert!(!is_followup_skill_request("帮我查一下今天北京天气"));
+    fn test_active_skill_name_metadata_roundtrip() {
+        let mut metadata = serde_json::Value::Null;
+        record_active_skill_name(&mut metadata, "ppt-generator");
+
+        assert_eq!(
+            active_skill_name_from_metadata(&metadata).as_deref(),
+            Some("ppt-generator")
+        );
+    }
+
+    #[test]
+    fn test_continued_skill_name_prefers_metadata_and_falls_back_to_history() {
+        let mut history = Vec::new();
+        persist_prompt_skill_history(
+            &mut history,
+            "帮我深度分析 BTC",
+            "deep_analysis",
+            &["web_search".to_string()],
+            &[],
+            "整理后的最终回答",
+        );
+
+        assert_eq!(
+            continued_skill_name(&serde_json::json!({"active_skill_name":"ppt-generator"}), &history)
+                .as_deref(),
+            Some("ppt-generator")
+        );
+        assert_eq!(
+            continued_skill_name(&serde_json::Value::Null, &history).as_deref(),
+            Some("deep_analysis")
+        );
+    }
+
+    #[test]
+    fn test_continued_skill_suppresses_prompt_reinjection_for_same_skill() {
+        let active_skill = crate::context::ActiveSkillContext {
+            name: "ppt-generator".to_string(),
+            prompt_md: "manual".to_string(),
+            inject_prompt_md: true,
+            tools: vec!["write_file".to_string()],
+            fallback_message: None,
+        };
+
+        let continued = suppress_prompt_reinjection_for_continued_skill(
+            active_skill.clone(),
+            Some("ppt-generator"),
+        );
+        assert!(!continued.inject_prompt_md);
+
+        let other = suppress_prompt_reinjection_for_continued_skill(
+            active_skill,
+            Some("weather"),
+        );
+        assert!(other.inject_prompt_md);
+    }
+
+    #[test]
+    fn test_tool_round_throttle_delay_uses_base_delay_without_rate_limit() {
+        assert_eq!(
+            tool_round_throttle_delay(false),
+            std::time::Duration::from_millis(600)
+        );
+    }
+
+    #[test]
+    fn test_tool_round_throttle_delay_uses_longer_delay_after_rate_limit() {
+        assert_eq!(
+            tool_round_throttle_delay(true),
+            std::time::Duration::from_millis(2500)
+        );
     }
 
     #[test]
@@ -6133,18 +6369,69 @@ mod tests {
         assert_eq!(extract_json_from_text(text), "{\"argv\":[\"search\",\"btc\"]}");
     }
 
-    #[test]
-    fn test_contains_unresolved_placeholder_arg_detects_angle_brackets() {
-        assert!(contains_unresolved_placeholder_arg("<feed_id>"));
-        assert!(contains_unresolved_placeholder_arg("<xsec_token>"));
-        assert!(!contains_unresolved_placeholder_arg("feed_id"));
-        assert!(!contains_unresolved_placeholder_arg("--json"));
+    #[tokio::test]
+    async fn test_stream_retry_emits_reset_before_retrying_ws_response() {
+        let mut runtime = test_runtime_with_provider(Arc::new(StreamingRetryProvider {
+            attempts: AtomicUsize::new(0),
+        }));
+        let (event_tx, mut event_rx) = broadcast::channel(32);
+        runtime.set_event_tx(event_tx);
+
+        let msg = InboundMessage {
+            channel: "ws".to_string(),
+            account_id: None,
+            sender_id: "user".to_string(),
+            chat_id: "stream-retry".to_string(),
+            content: "hello retry".to_string(),
+            media: vec![],
+            metadata: serde_json::Value::Null,
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        };
+
+        let result = runtime.process_message(msg).await.expect("process message");
+        assert_eq!(result, "final answer");
+
+        let events = drain_ws_events(&mut event_rx);
+        let event_types = collect_event_types(&events);
+        assert!(
+            contains_event_subsequence(
+                &event_types,
+                &["token", "stream_reset", "token", "message_done"]
+            ),
+            "unexpected event order: {:?}",
+            event_types
+        );
+        let final_event = events
+            .iter()
+            .rev()
+            .find(|event| event["type"] == "message_done")
+            .expect("message_done event missing");
+        assert_eq!(final_event["content"], "final answer");
+    }
+
+    #[tokio::test]
+    async fn test_stream_close_without_done_returns_accumulated_response() {
+        let mut runtime = test_runtime_with_provider(Arc::new(StreamingCloseProvider));
+
+        let msg = InboundMessage {
+            channel: "cli".to_string(),
+            account_id: None,
+            sender_id: "user".to_string(),
+            chat_id: "stream-close".to_string(),
+            content: "hello close".to_string(),
+            media: vec![],
+            metadata: serde_json::Value::Null,
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        };
+
+        let result = runtime.process_message(msg).await.expect("process message");
+        assert_eq!(result, "closed answer");
     }
 
     fn test_runtime() -> AgentRuntime {
         let mut config = Config::default();
-        config.agents.defaults.model = "ollama/llama3".to_string();
-        config.agents.defaults.provider = Some("ollama".to_string());
+        config.agents.defaults.model = "test/mock".to_string();
+        config.agents.defaults.provider = Some("test".to_string());
 
         let base = std::env::temp_dir().join(format!(
             "blockcell-system-event-runtime-{}",
@@ -6152,8 +6439,33 @@ mod tests {
         ));
         std::fs::create_dir_all(&base).expect("create temp runtime dir");
         let paths = Paths::with_base(base);
-        let provider_pool =
-            blockcell_providers::ProviderPool::from_config(&config).expect("build provider pool");
+        test_runtime_with_provider_and_paths(paths, Arc::new(TestProvider), config)
+    }
+
+    fn test_runtime_with_provider(provider: Arc<dyn Provider>) -> AgentRuntime {
+        let mut config = Config::default();
+        config.agents.defaults.model = "test/mock".to_string();
+        config.agents.defaults.provider = Some("test".to_string());
+
+        let base = std::env::temp_dir().join(format!(
+            "blockcell-system-event-runtime-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&base).expect("create temp runtime dir");
+        let paths = Paths::with_base(base);
+        test_runtime_with_provider_and_paths(paths, provider, config)
+    }
+
+    fn test_runtime_with_provider_and_paths(
+        paths: Paths,
+        provider: Arc<dyn Provider>,
+        config: Config,
+    ) -> AgentRuntime {
+        let provider_pool = blockcell_providers::ProviderPool::from_single_provider(
+            "test/mock",
+            "test",
+            provider,
+        );
 
         let mut runtime = AgentRuntime::new(
             config,
@@ -6264,8 +6576,13 @@ mod tests {
             .expect("process cron message");
         assert!(!result.is_empty());
 
-        let payload = event_rx.recv().await.expect("receive ws event");
-        let json: serde_json::Value = serde_json::from_str(&payload).expect("parse ws event");
+        let json = loop {
+            let payload = event_rx.recv().await.expect("receive ws event");
+            let event: serde_json::Value = serde_json::from_str(&payload).expect("parse ws event");
+            if event["type"] == "message_done" {
+                break event;
+            }
+        };
         assert_eq!(json["type"], "message_done");
         assert_eq!(json["chat_id"], "webui-chat-1");
         assert_eq!(json["content"], result);

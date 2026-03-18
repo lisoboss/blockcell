@@ -192,7 +192,7 @@ pub(super) async fn handle_hub_skill_install(
     }))
 }
 
-/// POST /v1/skills/install-external — install OpenClaw-compatible external skill
+/// POST /v1/skills/install-external — import an external skill package and queue evolution
 #[derive(Deserialize)]
 pub(super) struct InstallExternalRequest {
     url: String,
@@ -902,11 +902,14 @@ pub(super) async fn handle_skill_install_external(
         let desc = fm_description
             .as_deref()
             .unwrap_or("External skill (evolving)");
-        let meta_content = format!(
-            "name: {}\ndescription: {}\ntriggers:\n  - {}\npermissions: []\n",
-            display_name, desc, skill_name
-        );
-        std::fs::write(skill_dir.join("meta.yaml"), &meta_content).ok();
+        let meta_value = serde_json::json!({
+            "name": display_name,
+            "description": desc,
+            "tools": [],
+        });
+        if let Ok(meta_content) = serde_yaml::to_string(&meta_value) {
+            std::fs::write(skill_dir.join("meta.yaml"), meta_content).ok();
+        }
     }
 
     // ── Step 4: Build evolution context and trigger the self-evolution pipeline
@@ -935,13 +938,15 @@ pub(super) async fn handle_skill_install_external(
             Skill name: {}\n\
             {}\n\
             \n\
-            Generate a COMPLETE SKILL.py and a compatible meta.yaml.\n\
+            Generate a COMPLETE SKILL.py and a minimal compatible meta.yaml.\n\
             Blockcell Python runtime contract:\n\
             - Script is executed as `python3 SKILL.py`\n\
             - User input is provided from stdin as plain text\n\
             - Additional JSON context is available in env `BLOCKCELL_SKILL_CONTEXT`\n\
             - Output final user-facing result to stdout\n\
             - Do NOT require command-line JSON arguments\n\
+            - meta.yaml should stay minimal: keep `name`, `description`, and only add `tools`/`requires`/`permissions`/`fallback` when truly needed\n\
+            - Do NOT generate any legacy routing or formatting fields\n\
             \n\
             Reuse useful logic from legacy OpenClaw scripts (e.g. scripts/*.py),\n\
             but adapt the entrypoint and output format to Blockcell style.\n\
@@ -959,8 +964,10 @@ pub(super) async fn handle_skill_install_external(
             Skill name: {}\n\
             {}\n\
             \n\
-            Generate a COMPLETE SKILL.rhai and a compatible meta.yaml.\n\
+            Generate a COMPLETE SKILL.rhai and a minimal compatible meta.yaml.\n\
             Use Blockcell tool-call style and produce clear user-facing output.\n\
+            meta.yaml should stay minimal: keep `name`, `description`, and only add `tools`/`requires`/`permissions`/`fallback` when truly needed.\n\
+            Do NOT generate any legacy routing or formatting fields.\n\
             \n\
             {}",
             fm_name.as_deref().unwrap_or(&skill_name),
@@ -977,7 +984,8 @@ pub(super) async fn handle_skill_install_external(
             \n\
             Generate an improved SKILL.md that describes how the AI agent should handle requests\n\
             for this skill, including: goal, tools to use, step-by-step scenarios, and fallback strategy.\n\
-            Also generate meta.yaml with name/description/triggers/permissions fields.\n\
+            Also generate a minimal meta.yaml with `name`, `description`, and optional `tools`/`requires`/`permissions`/`fallback` only when needed.\n\
+            Do NOT generate any legacy routing or formatting fields.\n\
             Base the content on the OpenClaw SKILL.md instructions below.\n\
             \n\
             {}",
@@ -1035,7 +1043,7 @@ pub(super) async fn handle_skill_install_external(
         "evolution_id": evolution_id,
         "files_downloaded": downloaded_files.len(),
         "size_bytes": total_bytes,
-        "message": "技能已进入自进化流程，系统将自动将其转换为 Blockcell 格式并部署"
+        "message": "技能包已导入 staging，并已加入自进化队列；系统会按当前 Blockcell skill 规范整理后再部署"
     }))
 }
 

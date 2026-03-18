@@ -34,10 +34,21 @@ const advancedNavItems = [
 ];
 
 export function Sidebar() {
-  const { isOpen, activePage, toggle, setActivePage } = useSidebarStore();
-  const { sessions, setSessions, currentSessionId, setCurrentSession, isConnected } = useChatStore();
-  const { theme, setTheme } = useThemeStore();
-  const { selectedAgentId, agents, setSelectedAgent, setAgents } = useAgentStore();
+  const isOpen = useSidebarStore((s) => s.isOpen);
+  const activePage = useSidebarStore((s) => s.activePage);
+  const toggle = useSidebarStore((s) => s.toggle);
+  const setActivePage = useSidebarStore((s) => s.setActivePage);
+  const sessions = useChatStore((s) => s.sessions);
+  const setSessions = useChatStore((s) => s.setSessions);
+  const currentSessionId = useChatStore((s) => s.currentSessionId);
+  const setCurrentSession = useChatStore((s) => s.setCurrentSession);
+  const isConnected = useChatStore((s) => s.isConnected);
+  const theme = useThemeStore((s) => s.theme);
+  const setTheme = useThemeStore((s) => s.setTheme);
+  const selectedAgentId = useAgentStore((s) => s.selectedAgentId);
+  const agents = useAgentStore((s) => s.agents);
+  const setSelectedAgent = useAgentStore((s) => s.setSelectedAgent);
+  const setAgents = useAgentStore((s) => s.setAgents);
   const t = useT();
   const [loadingSessions, setLoadingSessions] = useState(false);
   const [loadingMoreSessions, setLoadingMoreSessions] = useState(false);

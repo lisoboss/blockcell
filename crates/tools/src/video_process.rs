@@ -850,6 +850,7 @@ mod tests {
         let ctx = ToolContext {
             workspace: std::path::PathBuf::from("/tmp/workspace"),
             builtin_skills_dir: None,
+            active_skill_dir: None,
             session_key: String::new(),
             channel: String::new(),
             account_id: None,

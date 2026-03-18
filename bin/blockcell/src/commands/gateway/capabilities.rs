@@ -71,15 +71,8 @@ pub(super) async fn handle_skills(State(state): State<GatewayState>) -> impl Int
                     if let Ok(content) = std::fs::read_to_string(&meta_path) {
                         // Parse meta.yaml properly via serde_yaml, then convert to JSON value
                         if let Ok(parsed) = serde_yaml::from_str::<serde_json::Value>(&content) {
-                            // Expose triggers at top-level for easy frontend access
-                            if let Some(triggers) = parsed.get("triggers") {
-                                skill_info["triggers"] = triggers.clone();
-                            }
                             if let Some(desc) = parsed.get("description") {
                                 skill_info["description"] = desc.clone();
-                            }
-                            if let Some(always) = parsed.get("always") {
-                                skill_info["always"] = always.clone();
                             }
                             skill_info["meta"] = parsed;
                         }
@@ -120,14 +113,8 @@ pub(super) async fn handle_skills(State(state): State<GatewayState>) -> impl Int
                 if meta_path.exists() {
                     if let Ok(content) = std::fs::read_to_string(&meta_path) {
                         if let Ok(parsed) = serde_yaml::from_str::<serde_json::Value>(&content) {
-                            if let Some(triggers) = parsed.get("triggers") {
-                                skill_info["triggers"] = triggers.clone();
-                            }
                             if let Some(desc) = parsed.get("description") {
                                 skill_info["description"] = desc.clone();
-                            }
-                            if let Some(always) = parsed.get("always") {
-                                skill_info["always"] = always.clone();
                             }
                             skill_info["meta"] = parsed;
                         }
@@ -175,22 +162,16 @@ pub(super) async fn handle_skills_search(
             matched_fields.push("name".to_string());
         }
 
-        // Match against meta.yaml content (triggers, description, dependencies)
+        // Match against meta.yaml text, with description treated as the strongest signal.
         let mut meta_val = serde_json::Value::Null;
         let mut description = String::new();
-        let mut triggers_str = String::new();
         if meta_path.exists() {
             if let Ok(content) = std::fs::read_to_string(&meta_path) {
-                // Extract triggers
-                for line in content.lines() {
-                    let trimmed = line.trim().trim_start_matches("- ");
-                    if trimmed.to_lowercase().contains(&query) {
-                        score += 5;
-                        if !matched_fields.contains(&"triggers".to_string()) {
-                            matched_fields.push("triggers".to_string());
-                        }
-                    }
+                if content.to_lowercase().contains(&query) {
+                    score += 2;
+                    matched_fields.push("meta".to_string());
                 }
+
                 // Extract description line
                 for line in content.lines() {
                     if line.starts_with("description:") {
@@ -200,29 +181,6 @@ pub(super) async fn handle_skills_search(
                             matched_fields.push("description".to_string());
                         }
                         break;
-                    }
-                }
-                // Collect triggers for display
-                let mut in_triggers = false;
-                for line in content.lines() {
-                    if line.starts_with("triggers:") {
-                        in_triggers = true;
-                        continue;
-                    }
-                    if in_triggers {
-                        if line.starts_with("  - ") || line.starts_with("- ") {
-                            let t = line
-                                .trim()
-                                .trim_start_matches("- ")
-                                .trim_matches('"')
-                                .trim_matches('\'');
-                            if !triggers_str.is_empty() {
-                                triggers_str.push_str(", ");
-                            }
-                            triggers_str.push_str(t);
-                        } else if !line.starts_with(' ') && !line.is_empty() {
-                            in_triggers = false;
-                        }
                     }
                 }
                 // Try parse as JSON for meta field
@@ -255,7 +213,6 @@ pub(super) async fn handle_skills_search(
             "has_py": has_py,
             "has_md": has_md,
             "description": description,
-            "triggers": triggers_str,
             "score": score,
             "matched_fields": matched_fields,
             "meta": meta_val,
@@ -707,7 +664,7 @@ pub(super) async fn handle_evolution_test(
         }
     };
 
-    let tool_registry = ToolRegistry::with_defaults();
+    let tool_registry = state.tool_registry.as_ref().clone();
     let mut runtime = match AgentRuntime::new(
         state.config.clone(),
         state.paths.clone(),
@@ -771,68 +728,56 @@ pub(super) async fn handle_evolution_test_suggest(
     State(state): State<GatewayState>,
     Json(req): Json<EvolutionTestSuggestRequest>,
 ) -> impl IntoResponse {
-    let skill_dir = state.paths.skills_dir().join(&req.skill_name);
-    let builtin_dir = state.paths.builtin_skills_dir().join(&req.skill_name);
+    let mut skill_manager = blockcell_skills::SkillManager::new();
+    if let Err(err) = skill_manager.load_from_paths(&state.paths) {
+        return Json(serde_json::json!({
+            "error": format!("Failed to load skills: {}", err),
+        }));
+    }
 
-    let base_dir = if skill_dir.exists() {
-        skill_dir
-    } else if builtin_dir.exists() {
-        builtin_dir
-    } else {
+    let Some(skill) = skill_manager.get(&req.skill_name) else {
         return Json(serde_json::json!({
             "error": format!("Skill '{}' not found", req.skill_name),
         }));
     };
 
-    // Read skill context files
-    let skill_md = std::fs::read_to_string(base_dir.join("SKILL.md")).unwrap_or_default();
-    let meta_yaml = std::fs::read_to_string(base_dir.join("meta.yaml")).unwrap_or_default();
-    let skill_rhai = std::fs::read_to_string(base_dir.join("SKILL.rhai")).ok();
-    let skill_py = std::fs::read_to_string(base_dir.join("SKILL.py")).ok();
+    let meta_yaml = serde_yaml::to_string(&skill.meta).unwrap_or_default();
+    let skill_card = blockcell_skills::SkillManager::build_skill_card(skill);
+    let prompt_bundle = skill
+        .load_prompt_bundle()
+        .or_else(|| skill.load_md())
+        .unwrap_or_default();
 
-    // Build a concise context for the LLM
     let mut context = format!(
-        "Skill name: {}\n\n## meta.yaml\n{}\n\n## SKILL.md\n{}",
-        req.skill_name, meta_yaml, skill_md
+        "Skill name: {}\nDescription: {}\nWhen to use: {}\nOutputs: {}\nAllowed tools: {}\nSupports local execution: {}\n\n## meta.yaml\n{}\n\n## Prompt bundle\n{}",
+        skill_card.name,
+        skill_card.description,
+        skill_card.when_to_use,
+        skill_card.outputs,
+        if skill_card.allowed_tools.is_empty() {
+            "(none)".to_string()
+        } else {
+            skill_card.allowed_tools.join(", ")
+        },
+        skill_card.supports_local_exec,
+        meta_yaml,
+        prompt_bundle
     );
-    if let Some(rhai) = &skill_rhai {
-        // Include first 80 lines of rhai for context (function signatures, comments)
-        let rhai_preview: String = rhai.lines().take(80).collect::<Vec<_>>().join("\n");
-        context.push_str(&format!("\n\n## SKILL.rhai (preview)\n{}", rhai_preview));
-    }
-    if let Some(py) = &skill_py {
-        let py_preview: String = py.lines().take(80).collect::<Vec<_>>().join("\n");
-        context.push_str(&format!("\n\n## SKILL.py (preview)\n{}", py_preview));
+    if skill_card.supports_local_exec {
+        context.push_str(
+            "\n\n## Notes\nThis skill may execute local scripts through `exec_local`, but test input generation should still be based on the manual and the user-visible skill contract.",
+        );
     }
 
-    // 提取 triggers 列表，注入到 system prompt 要求生成的建议必须包含 trigger 关键词
-    let triggers: Vec<String> = serde_yaml::from_str::<serde_json::Value>(&meta_yaml)
-        .ok()
-        .and_then(|v| v.get("triggers").and_then(|t| t.as_array()).cloned())
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-        .collect();
-
-    let trigger_rule = if triggers.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\n6. CRITICAL: The test input MUST contain one of these trigger keywords (these are the exact phrases that activate this skill): [{}]. Without a trigger keyword, the skill will NOT be activated in real chat.",
-            triggers.iter().take(5).map(|s| format!("\"{}\"", s)).collect::<Vec<_>>().join(", ")
-        )
-    };
-
-    let system_prompt = format!(
+    let system_prompt =
         "You are a test case generation assistant. Based on the provided skill description, generate a specific, ready-to-use test input.\n\
         Requirements:\n\
         1. Only output the test input text itself, no explanations, titles, or formatting\n\
         2. The test input should be natural language a user would actually say\n\
         3. Choose the most core functionality scenario of the skill\n\
         4. Input should be specific, including necessary parameters (e.g. city name, stock ticker)\n\
-        5. Output in the same language as the skill's trigger keywords (Chinese if triggers are Chinese){}",
-        trigger_rule
-    );
+        5. Output in the same language as the skill description and SKILL.md manual"
+            .to_string();
 
     let user_prompt = format!(
         "Based on the following skill information, generate an appropriate test input:\n\n{}\n\nOutput the test input text directly:",

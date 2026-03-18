@@ -78,6 +78,30 @@ pub struct ProviderPool {
 }
 
 impl ProviderPool {
+    /// Build a pool from a single already-constructed provider.
+    /// Useful for tests and for embedding a deterministic provider in local flows.
+    pub fn from_single_provider(
+        model: impl Into<String>,
+        provider_name: impl Into<String>,
+        provider: Arc<dyn Provider>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            entries: vec![BuiltEntry {
+                model: model.into(),
+                provider_name: provider_name.into(),
+                weight: 1,
+                priority: 1,
+                provider,
+            }],
+            state: Mutex::new(PoolState {
+                health: HashMap::from([(0, EntryHealth::Healthy)]),
+                stats: HashMap::new(),
+            }),
+            fail_threshold: 3,
+            cooldown: Duration::from_secs(60),
+        })
+    }
+
     /// 从 config 构建 ProviderPool。
     ///
     /// - 如果 `config.agents.defaults.model_pool` 非空，使用 pool 配置。

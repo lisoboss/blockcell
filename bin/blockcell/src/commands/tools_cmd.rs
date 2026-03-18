@@ -164,6 +164,7 @@ pub async fn test(tool_name: &str, params_json: &str) -> anyhow::Result<()> {
     let ctx = blockcell_tools::ToolContext {
         workspace: paths.workspace(),
         builtin_skills_dir: Some(paths.builtin_skills_dir()),
+        active_skill_dir: None,
         config: blockcell_core::Config::load_or_default(&paths)?,
         session_key: "cli:test".to_string(),
         channel: String::new(),
