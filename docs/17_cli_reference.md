@@ -16,17 +16,82 @@ blockcell [OPTIONS] <COMMAND>
 
 ---
 
-## onboard — 初始化配置
+## setup — 交互式配置向导（推荐）
+
+```
+blockcell setup [OPTIONS]
+```
+
+首次使用时推荐运行，通过交互式向导完成 LLM provider 和可选渠道的配置。相比 `onboard`，`setup` 提供更友好的引导流程和自动验证。
+
+| 选项 | 说明 |
+|------|------|
+| `--force` | 重置现有配置为默认值后再开始设置 |
+| `--provider <NAME>` | 指定 LLM provider（deepseek/openai/kimi/anthropic/gemini/zhipu/minimax/ollama） |
+| `--api-key <KEY>` | 指定 provider 的 API key |
+| `--model <MODEL>` | 指定模型名（如 deepseek-chat、moonshot-v1-8k、claude-sonnet-4-20250514） |
+| `--channel <NAME>` | 可选渠道配置（telegram/feishu/wecom/dingtalk/lark/none；`skip` 也兼容） |
+| `--skip-provider-test` | 跳过保存后的 provider 配置验证 |
+
+**支持的 provider:**
+- `deepseek` - 推荐，性价比高
+- `openai` - GPT-4o 等模型
+- `kimi` (moonshot) - 国内访问稳定
+- `anthropic` (claude) - Claude 系列
+- `gemini` - Google Gemini
+- `zhipu` - 智谱 GLM
+- `minimax` - MiniMax
+- `ollama` - 本地模型，免费
+
+**支持的渠道:**
+- `telegram` - Telegram Bot
+- `feishu` - 飞书机器人
+- `wecom` - 企业微信
+- `dingtalk` - 钉钉
+- `lark` - Lark
+- `skip` - 跳过渠道配置（仅使用 WebUI）
+
+**示例：**
+```bash
+# 交互式向导（推荐）
+blockcell setup
+
+# 非交互式，直接指定 provider
+blockcell setup --provider deepseek --api-key sk-xxx --model deepseek-chat
+
+# 同时配置渠道
+blockcell setup --provider kimi --api-key sk-xxx --channel telegram
+
+# 重置配置后重新设置
+blockcell setup --force
+
+# 跳过验证（加快设置速度）
+blockcell setup --provider ollama --skip-provider-test
+```
+
+**向导流程：**
+1. 选择 LLM provider（或输入 skip 跳过）
+2. 输入 API key（ollama 除外）
+3. 选择或确认模型名称
+4. 可选：配置一个消息渠道
+5. 自动验证 provider 配置（除非使用 `--skip-provider-test`）
+6. 如渠道 owner 缺失，自动绑定到 `default` agent
+7. 显示配置摘要和下一步操作提示
+
+---
+
+## onboard — 初始化配置（传统方式）
 
 ```
 blockcell onboard [OPTIONS]
 ```
 
-首次使用时运行，创建配置文件和工作区目录。
+创建配置文件和工作区目录。相比 `setup`，`onboard` 更适合脚本化部署或已熟悉配置结构的用户。
 
 | 选项 | 说明 |
 |------|------|
 | `--force` | 强制覆盖已有配置 |
+| `--interactive` | 交互式向导模式 |
 | `--provider <NAME>` | 指定 LLM provider（如 deepseek、openai、kimi、anthropic） |
 | `--api-key <KEY>` | 指定 provider 的 API key |
 | `--model <MODEL>` | 指定模型名（如 deepseek-chat、moonshot-v1-8k） |
@@ -34,7 +99,7 @@ blockcell onboard [OPTIONS]
 
 **示例：**
 ```bash
-# 交互式向导（默认）
+# 创建默认配置
 blockcell onboard
 
 # 非交互式，直接指定 provider
@@ -43,6 +108,8 @@ blockcell onboard --provider deepseek --api-key sk-xxx --model deepseek-chat
 # 仅重新配置渠道
 blockcell onboard --channels-only
 ```
+
+**注意：** 新用户推荐使用 `blockcell setup` 而非 `onboard`，前者提供更友好的引导体验。
 
 ---
 
@@ -57,7 +124,8 @@ blockcell agent [OPTIONS]
 | 选项 | 短写 | 默认值 | 说明 |
 |------|------|--------|------|
 | `--message <TEXT>` | `-m` | — | 发送单条消息后退出 |
-| `--session <ID>` | `-s` | `cli:default` | 会话 ID |
+| `--agent <ID>` | `-a` | `default` | 指定运行的 agent |
+| `--session <ID>` | `-s` | `cli:<agent>` | 会话 ID |
 | `--model <MODEL>` | — | — | 临时覆盖 LLM 模型 |
 | `--provider <NAME>` | — | — | 临时覆盖 LLM provider |
 
@@ -66,14 +134,17 @@ blockcell agent [OPTIONS]
 # 进入交互模式
 blockcell agent
 
+# 使用指定 agent
+blockcell agent --agent ops
+
 # 发送单条消息
-blockcell agent -m "帮我查询 BTC 价格"
+blockcell agent -a ops -m "帮我查询 BTC 价格"
 
 # 指定会话 ID（便于管理多个会话）
-blockcell agent -s work:finance
+blockcell agent -a ops -s work:finance
 
 # 临时使用不同模型
-blockcell agent --model gpt-4o --provider openai
+blockcell agent --agent ops --model gpt-4o --provider openai
 ```
 
 **交互模式内置命令：**
@@ -118,6 +189,60 @@ blockcell gateway --port 8080 --host 127.0.0.1
 | `GET  /v1/health` | 健康检查（不需要认证） |
 | `GET  /v1/tasks` | 列出后台任务 |
 | `GET  /v1/ws` | WebSocket 连接 |
+| `GET  /v1/channels/status` | 查看渠道连接状态 |
+| `GET  /v1/channel-owners` | 查看渠道 owner 绑定 |
+
+---
+
+## mcp — 管理 MCP 服务器
+
+```
+blockcell mcp <SUBCOMMAND>
+```
+
+用于管理独立的 MCP 配置文件：`~/.blockcell/mcp.json` 与 `~/.blockcell/mcp.d/*.json`。
+
+| 子命令 | 说明 |
+|------|------|
+| `list` | 列出全部 MCP server |
+| `show <NAME>` | 查看某个 MCP server 的合并后配置 |
+| `add <TEMPLATE>` | 从模板添加 MCP server，如 `github`、`sqlite`、`filesystem`、`postgres`、`puppeteer` |
+| `add <NAME> --raw ...` | 直接按底层 `command/args/env/cwd` 写入配置 |
+| `enable <NAME>` | 启用某个 MCP server |
+| `disable <NAME>` | 禁用某个 MCP server |
+| `remove <NAME>` | 删除某个 MCP server 配置 |
+| `edit [NAME]` | 打开 `mcp.json` 或某个 `mcp.d/<name>.json` |
+
+**示例：**
+```bash
+blockcell mcp list
+blockcell mcp add github
+blockcell mcp add sqlite --db-path /tmp/notes.db
+blockcell mcp add custom --raw --name custom --command uvx --arg my-mcp-server
+blockcell mcp disable github
+```
+
+**说明：** MCP 配置文件是独立的 `mcp.json` / `mcp.d/*.json`（当前为严格 JSON，不是 JSON5）；配置变更默认在重启 `blockcell agent` 或 `blockcell gateway` 后生效。
+
+---
+
+## 后台事件与主动摘要（Phase 1）
+
+当前版本没有单独的 `system-event` CLI 子命令，但 `agent` / `gateway` 运行时已经默认启用后台事件编排：
+
+- `TaskManager` 会为后台子任务发出结构化事件
+- `CronService` 会为定时任务派发发出结构化事件
+- `AgentRuntime` 的 tick 会把这些事件聚合为：
+  - 即时通知（如关键失败）
+  - 主会话摘要（如任务完成、定时任务成功派发）
+
+使用要点：
+
+- 生效入口是 `blockcell agent` / `blockcell gateway` 进程本身，不需要额外命令开关
+- 升级到包含该特性的版本后，**重启进程即可生效**
+- 当前只支持每个 agent 的“最近活跃主会话”
+- 当前只做进程内内存聚合；进程重启后，未发出的摘要不会保留
+- 当前只接入 `TaskManager` 与 `CronService`，Ghost 还没有接入这一轮事件生产
 
 ---
 
@@ -127,7 +252,7 @@ blockcell gateway --port 8080 --host 127.0.0.1
 blockcell status
 ```
 
-显示当前配置状态（provider、模型、API key 是否配置、渠道状态等）。
+显示当前配置状态（provider、模型、API key 是否配置、agent → intent profile、渠道 owner 等）。
 
 ---
 
@@ -137,7 +262,7 @@ blockcell status
 blockcell doctor
 ```
 
-检查运行环境，包括依赖工具（ffmpeg、chrome、python3 等）是否安装、API key 是否有效等。
+检查运行环境，包括依赖工具（ffmpeg、chrome、python3 等）是否安装、API key 是否有效、`intentRouter` / `channelOwners` / `channelAccountOwners` 是否通过校验等。
 
 ---
 
@@ -149,7 +274,7 @@ blockcell config <SUBCOMMAND>
 
 ### config show
 
-显示当前完整配置（JSON 格式）。
+显示当前完整配置（以 pretty-printed JSON 形式输出；配置文件本身可写为 JSON5）。
 
 ```bash
 blockcell config show
@@ -180,7 +305,7 @@ blockcell config get network.proxy
 
 ### config set
 
-按点分隔路径设置配置项（自动识别 JSON 类型）。
+按点分隔路径设置配置项（自动识别 JSON5 / 标量类型；解析失败时回退为字符串）。
 
 ```bash
 blockcell config set <KEY> <VALUE>
@@ -281,37 +406,38 @@ blockcell run <SUBCOMMAND>
 
 ### run tool
 
-直接运行工具（与 `tools test` 等价）。
+直接运行工具（与 `tools test` 等价）。支持通过 `--agent/-a` 指定目标 agent。
 
 ```bash
-blockcell run tool <TOOL_NAME> '<JSON_PARAMS>'
+blockcell run tool <TOOL_NAME> '<JSON_PARAMS>' [--agent <ID>]
+```
+
+| 选项 | 短写 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--agent <ID>` | `-a` | `default` | 指定运行的 agent |
+
+**示例：**
+```bash
+blockcell run tool read_file '{"path":"README.md"}' -a ops
 ```
 
 ### run msg
 
-通过 Agent 发送消息（等同于 `agent -m`）。
+通过 Agent 发送消息（等同于 `agent -m`）。支持通过 `--agent/-a` 指定目标 agent。
 
 ```bash
-blockcell run msg <MESSAGE> [--session <ID>]
+blockcell run msg <MESSAGE> [--session <ID>] [--agent <ID>]
 ```
 
 | 选项 | 短写 | 默认值 | 说明 |
 |------|------|--------|------|
 | `--session <ID>` | `-s` | `cli:run` | 会话 ID |
+| `--agent <ID>` | `-a` | `default` | 指定运行的 agent |
 
----
-
-## tasks — 管理后台任务
-
+**示例：**
+```bash
+blockcell run msg "你好" -a ops
 ```
-blockcell tasks <SUBCOMMAND>
-```
-
-| 子命令 | 说明 |
-|--------|------|
-| `list` | 列出所有后台任务 |
-| `show <TASK_ID>` | 显示指定任务详情（支持 ID 前缀匹配） |
-| `cancel <TASK_ID>` | 取消运行中的任务（支持 ID 前缀匹配） |
 
 ---
 
@@ -324,7 +450,17 @@ blockcell channels <SUBCOMMAND>
 | 子命令 | 说明 |
 |--------|------|
 | `status` | 显示所有渠道连接状态 |
-| `login <CHANNEL>` | 登录指定渠道（如 WhatsApp 需扫码） |
+| `login <CHANNEL>` | 登录指定渠道（当前主要用于 WhatsApp 扫码） |
+| `owner list` | 列出渠道 fallback owner 与账号级 owner 覆盖 |
+| `owner set --channel <NAME> [--account <ACCOUNT_ID>] --agent <ID>` | 设置渠道或账号 owner |
+| `owner clear --channel <NAME> [--account <ACCOUNT_ID>]` | 清除渠道或账号 owner |
+
+**示例：**
+```bash
+blockcell channels owner set --channel telegram --agent default
+blockcell channels owner set --channel telegram --account bot2 --agent ops
+blockcell channels owner clear --channel telegram --account bot2
+```
 
 ---
 

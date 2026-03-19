@@ -20,16 +20,6 @@ const FILE_META: Record<string, { label: string; desc: string; placeholder: stri
     desc: '关于用户的背景、偏好和习惯信息',
     placeholder: '# 用户信息\n\n## 基本信息\n- 姓名：\n- 职业：\n\n## 偏好\n- \n\n## 工作习惯\n- ',
   },
-  'CONTEXT.md': {
-    label: '上下文背景',
-    desc: '项目背景、环境信息和长期记忆',
-    placeholder: '# 背景信息\n\n## 项目概述\n\n## 技术栈\n\n## 重要约束\n',
-  },
-  'STYLE.md': {
-    label: '输出风格',
-    desc: '回复格式、语言风格和输出偏好',
-    placeholder: '# 输出风格\n\n## 语言\n- 默认使用中文\n\n## 格式\n- \n\n## 长度\n- ',
-  },
 };
 
 // Per-file quick prompts — each scoped to that file's purpose
@@ -52,18 +42,6 @@ const FILE_QUICK_PROMPTS: Record<string, string[]> = {
     '整理为结构化 Markdown，方便 AI 读取',
     '从头生成一份用户信息模板',
   ],
-  'CONTEXT.md': [
-    '精简背景信息，去掉冗余，保留关键约束',
-    '补充技术栈和项目目标说明',
-    '整理为分节结构，提升 AI 读取效率',
-    '从头生成上下文背景模板',
-  ],
-  'STYLE.md': [
-    '优化为简洁风格：短句、无废话',
-    '调整为中英文双语输出规范',
-    '加强 Markdown 格式约束',
-    '从头生成一份输出风格规范',
-  ],
 };
 
 // Per-file AI system prompt — strict scope so each file stays focused
@@ -80,14 +58,6 @@ const FILE_SYSTEM_PROMPTS: Record<string, string> = {
 该文件只应包含：用户的基本信息、职业背景、偏好、工作习惯、沟通风格。
 严禁写入：Agent 的行为规则、性格设定——那些属于其他文件。
 输出要求：结构化、字段清晰、专注描述用户而非 Agent。`,
-  'CONTEXT.md': `你是 AI Agent 配置专家。当前任务：优化 CONTEXT.md 文件。
-该文件只应包含：项目背景、技术栈、环境信息、当前阶段、重要约束和长期记忆。
-严禁写入：角色定义、性格描述、用户信息——那些属于其他文件。
-输出要求：信息密度高、结构清晰、帮助 Agent 快速理解工作上下文。`,
-  'STYLE.md': `你是 AI Agent 配置专家。当前任务：优化 STYLE.md 文件。
-该文件只应包含：回复语言、格式规范（如 Markdown/纯文本）、长度偏好、代码块规范等输出风格要求。
-严禁写入：角色设定、性格、用户信息——那些属于其他文件。
-输出要求：规则明确、可执行、Agent 可直接按规则输出。`,
 };
 
 const DEFAULT_QUICK_PROMPTS = [
@@ -382,9 +352,9 @@ ${activeContent || '（文件为空，请生成初始内容）'}
             onClick={handleSave}
             disabled={!isDirty || saving}
             className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
-              saveStatus === 'saved' ? 'bg-cyber/10 text-cyber border border-cyber/30'
+              saveStatus === 'saved' ? 'bg-[hsl(var(--brand-green)/0.10)] text-[hsl(var(--brand-green))] border border-[hsl(var(--brand-green)/0.28)]'
               : saveStatus === 'error' ? 'bg-destructive/10 text-destructive border border-destructive/30'
-              : 'bg-rust text-white hover:bg-rust/90'
+              : 'bg-[hsl(var(--brand-green)/0.12)] text-[hsl(var(--brand-green))] hover:bg-[hsl(var(--brand-green-strong))] border border-[hsl(var(--brand-green)/0.28)]'
             }`}
           >
             {saving ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />}
@@ -439,8 +409,8 @@ ${activeContent || '（文件为空，请生成初始内容）'}
                   disabled={aiStreaming}
                   className={`flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium rounded-lg border transition-colors disabled:opacity-50 ${
                     showAiPanel
-                      ? 'bg-cyber/15 border-cyber/40 text-cyber'
-                      : 'bg-cyber/8 border-cyber/25 text-cyber hover:bg-cyber/15'
+                      ? 'bg-[hsl(var(--brand-green)/0.12)] border-[hsl(var(--brand-green)/0.30)] text-[hsl(var(--brand-green))]'
+                      : 'bg-[hsl(var(--brand-green)/0.06)] border-[hsl(var(--brand-green)/0.18)] text-[hsl(var(--brand-green))] hover:bg-[hsl(var(--brand-green)/0.10)]'
                   }`}
                 >
                   <Sparkles size={11} />
@@ -486,15 +456,15 @@ ${activeContent || '（文件为空，请生成初始内容）'}
           {/* ── AI streaming overlay — covers the entire editor column ── */}
           {aiStreaming && (
             <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-black/10">
-              <div className="bg-card border border-cyber/30 rounded-2xl shadow-2xl px-12 py-8 flex flex-col items-center gap-4 w-1/2 max-w-none">
+              <div className="bg-card border border-[hsl(var(--brand-green)/0.24)] rounded-2xl shadow-2xl px-12 py-8 flex flex-col items-center gap-4 w-1/2 max-w-none">
                 <div className="flex items-center gap-2">
-                  <span className="w-2 h-2 rounded-full bg-cyber animate-pulse" />
-                  <span className="text-sm text-cyber font-semibold">{t('persona.aiOptimizing')}</span>
+                  <span className="w-2 h-2 rounded-full bg-[hsl(var(--brand-green))] animate-pulse" />
+                  <span className="text-sm text-[hsl(var(--brand-green))] font-semibold">{t('persona.aiOptimizing')}</span>
                 </div>
                 <div className="w-full space-y-1.5 px-1">
                   <div className="h-1.5 bg-border rounded-full overflow-hidden">
                     <div
-                      className="h-full bg-cyber rounded-full transition-all duration-300"
+                      className="h-full bg-[hsl(var(--brand-green))] rounded-full transition-all duration-300"
                       style={{ width: `${Math.min(aiProgress, 100)}%` }}
                     />
                   </div>
@@ -506,7 +476,7 @@ ${activeContent || '（文件为空，请生成初始内容）'}
 
           {/* ── AI Optimization Panel (inline, below editor) ── */}
           {showAiPanel && (
-            <div className="border-t border-cyber/20 bg-cyber/5 px-4 py-3 space-y-2.5 shrink-0">
+            <div className="border-t border-[hsl(var(--brand-green)/0.18)] bg-[hsl(var(--brand-green)/0.04)] px-4 py-3 space-y-2.5 shrink-0">
               {/* Quick prompts */}
               <div className="flex flex-wrap gap-1.5">
                 {(FILE_QUICK_PROMPTS[activeFile] || DEFAULT_QUICK_PROMPTS).map(q => (
@@ -516,7 +486,7 @@ ${activeContent || '（文件为空，请生成初始内容）'}
                     disabled={aiStreaming}
                     className={`text-[11px] px-2 py-1 rounded-md border transition-colors disabled:opacity-50 ${
                       aiPrompt === q
-                        ? 'bg-cyber/15 border-cyber/40 text-cyber'
+                        ? 'bg-[hsl(var(--brand-green)/0.12)] border-[hsl(var(--brand-green)/0.28)] text-[hsl(var(--brand-green))]'
                         : 'bg-muted/40 border-border hover:bg-accent text-muted-foreground'
                     }`}
                   >
@@ -535,13 +505,13 @@ ${activeContent || '（文件为空，请生成初始内容）'}
                   placeholder={t('persona.aiPlaceholder')}
                   disabled={aiStreaming}
                   rows={3}
-                  className="flex-1 px-3 py-2 text-xs bg-background border border-border rounded-lg resize-none focus:outline-none focus:ring-1 focus:ring-cyber disabled:opacity-50"
+                  className="flex-1 px-3 py-2 text-xs bg-background border border-border rounded-lg resize-none focus:outline-none focus:ring-1 focus:ring-[hsl(var(--brand-green)/0.35)] disabled:opacity-50"
                   style={{ minHeight: '4.5rem' }}
                 />
                 <button
                   onClick={handleAiGenerate}
                   disabled={!aiPrompt.trim() || aiStreaming}
-                  className="flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg bg-cyber text-black hover:bg-cyber/90 disabled:opacity-40 disabled:cursor-not-allowed transition-colors shrink-0"
+                  className="flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg bg-[hsl(var(--brand-green))] text-white hover:bg-[hsl(var(--brand-green-strong))] disabled:opacity-40 disabled:cursor-not-allowed transition-colors shrink-0"
                 >
                   {aiStreaming
                     ? <Loader2 size={13} className="animate-spin" />

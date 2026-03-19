@@ -20,11 +20,15 @@ impl MessageBus {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     pub fn split(
         self,
     ) -> (
         (mpsc::Sender<InboundMessage>, mpsc::Receiver<InboundMessage>),
-        (mpsc::Sender<OutboundMessage>, mpsc::Receiver<OutboundMessage>),
+        (
+            mpsc::Sender<OutboundMessage>,
+            mpsc::Receiver<OutboundMessage>,
+        ),
     ) {
         (
             (self.inbound_tx, self.inbound_rx),

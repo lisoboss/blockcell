@@ -14,6 +14,8 @@ use tracing::{debug, error, warn};
 pub struct CdpClient {
     /// Sender to write messages to the WebSocket.
     ws_tx: mpsc::Sender<String>,
+    /// WebSocket endpoint URL for diagnostics.
+    ws_url: String,
     /// Pending command responses, keyed by request ID.
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
     /// Auto-incrementing command ID.
@@ -32,6 +34,8 @@ impl CdpClient {
         use futures::{SinkExt, StreamExt};
         use tokio_tungstenite::connect_async;
         use tokio_tungstenite::tungstenite::Message;
+
+        debug!(ws_url = %ws_url, "Connecting to CDP WebSocket endpoint");
 
         let (ws_stream, _) = connect_async(ws_url)
             .await
@@ -53,16 +57,18 @@ impl CdpClient {
         let events_clone = event_listeners.clone();
 
         // Writer task: owns the sink, forwards messages from channel
+        let writer_ws_url = ws_url.to_string();
         let writer_handle = tokio::spawn(async move {
             while let Some(msg) = ws_rx.recv().await {
                 if let Err(e) = ws_sink.send(Message::Text(msg)).await {
-                    error!("CDP WebSocket write error: {}", e);
+                    error!(ws_url = %writer_ws_url, error = %e.to_string(), "CDP WebSocket write error");
                     break;
                 }
             }
         });
 
         // Reader task: reads from WebSocket, dispatches responses and events
+        let reader_ws_url = ws_url.to_string();
         let reader_handle = tokio::spawn(async move {
             while let Some(msg_result) = ws_stream_read.next().await {
                 match msg_result {
@@ -79,10 +85,7 @@ impl CdpClient {
                                 // This is an event
                                 let listeners = events_clone.lock().await;
                                 if let Some(senders) = listeners.get(method) {
-                                    let params = val
-                                        .get("params")
-                                        .cloned()
-                                        .unwrap_or(Value::Null);
+                                    let params = val.get("params").cloned().unwrap_or(Value::Null);
                                     for tx in senders {
                                         let _ = tx.try_send(params.clone());
                                     }
@@ -91,11 +94,11 @@ impl CdpClient {
                         }
                     }
                     Ok(Message::Close(_)) => {
-                        debug!("CDP WebSocket closed by server");
+                        debug!(ws_url = %reader_ws_url, "CDP WebSocket closed by server");
                         break;
                     }
                     Err(e) => {
-                        warn!("CDP WebSocket read error: {}", e);
+                        warn!(ws_url = %reader_ws_url, error = %e.to_string(), "CDP WebSocket read error");
                         break;
                     }
                     _ => {}
@@ -105,6 +108,7 @@ impl CdpClient {
 
         Ok(Self {
             ws_tx,
+            ws_url: ws_url.to_string(),
             pending,
             next_id: AtomicU64::new(1),
             event_listeners,
@@ -114,18 +118,28 @@ impl CdpClient {
     }
 
     /// Send a CDP command and wait for the response.
-    pub async fn send_command(
-        &self,
-        method: &str,
-        params: Value,
-    ) -> Result<Value, String> {
+    pub async fn send_command(&self, method: &str, params: Value) -> Result<Value, String> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let params_preview = params.to_string();
+        let params_preview = if params_preview.len() > 400 {
+            format!("{}...", &params_preview[..400])
+        } else {
+            params_preview
+        };
 
         let msg = json!({
             "id": id,
             "method": method,
             "params": params,
         });
+
+        debug!(
+            ws_url = %self.ws_url,
+            command_id = id,
+            method = method,
+            params = %params_preview,
+            "Sending CDP command"
+        );
 
         let (tx, rx) = oneshot::channel();
         {
@@ -143,16 +157,38 @@ impl CdpClient {
         match timeout.await {
             Ok(Ok(response)) => {
                 if let Some(error) = response.get("error") {
+                    warn!(
+                        ws_url = %self.ws_url,
+                        command_id = id,
+                        method = method,
+                        error = %error,
+                        "CDP command returned error"
+                    );
                     Err(format!("CDP error: {}", error))
                 } else {
                     Ok(response.get("result").cloned().unwrap_or(Value::Null))
                 }
             }
-            Ok(Err(_)) => Err("CDP response channel closed".to_string()),
+            Ok(Err(_)) => {
+                warn!(
+                    ws_url = %self.ws_url,
+                    command_id = id,
+                    method = method,
+                    "CDP response channel closed before reply"
+                );
+                Err("CDP response channel closed".to_string())
+            }
             Err(_) => {
                 // Remove from pending
                 let mut pending = self.pending.lock().await;
                 pending.remove(&id);
+                warn!(
+                    ws_url = %self.ws_url,
+                    command_id = id,
+                    method = method,
+                    params = %params_preview,
+                    "CDP command timed out"
+                );
                 Err(format!("CDP command '{}' timed out after 30s", method))
             }
         }
@@ -241,11 +277,7 @@ impl CdpClient {
         let ids = result
             .get("nodeIds")
             .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_i64())
-                    .collect()
-            })
+            .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
             .unwrap_or_default();
         Ok(ids)
     }
@@ -329,21 +361,13 @@ impl CdpClient {
 
     /// Insert text (bypasses key events, good for filling forms).
     pub async fn insert_text(&self, text: &str) -> Result<(), String> {
-        self.send_command(
-            "Input.insertText",
-            json!({"text": text}),
-        )
-        .await?;
+        self.send_command("Input.insertText", json!({"text": text}))
+            .await?;
         Ok(())
     }
 
     /// Set cookies.
-    pub async fn set_cookie(
-        &self,
-        name: &str,
-        value: &str,
-        domain: &str,
-    ) -> Result<(), String> {
+    pub async fn set_cookie(&self, name: &str, value: &str, domain: &str) -> Result<(), String> {
         self.send_command(
             "Network.setCookie",
             json!({
@@ -369,7 +393,12 @@ impl CdpClient {
     }
 
     /// Set viewport/device metrics.
-    pub async fn set_viewport(&self, width: i32, height: i32, device_scale_factor: f64) -> Result<(), String> {
+    pub async fn set_viewport(
+        &self,
+        width: i32,
+        height: i32,
+        device_scale_factor: f64,
+    ) -> Result<(), String> {
         self.send_command(
             "Emulation.setDeviceMetricsOverride",
             json!({
@@ -486,12 +515,17 @@ impl CdpClient {
     // ─── Dialog handling ──────────────────────────────────────────────
 
     /// Handle a JavaScript dialog (alert/confirm/prompt/beforeunload).
-    pub async fn handle_dialog(&self, accept: bool, prompt_text: Option<&str>) -> Result<(), String> {
+    pub async fn handle_dialog(
+        &self,
+        accept: bool,
+        prompt_text: Option<&str>,
+    ) -> Result<(), String> {
         let mut params = json!({"accept": accept});
         if let Some(text) = prompt_text {
             params["promptText"] = json!(text);
         }
-        self.send_command("Page.handleJavaScriptDialog", params).await?;
+        self.send_command("Page.handleJavaScriptDialog", params)
+            .await?;
         Ok(())
     }
 

@@ -6,8 +6,8 @@ import {
   PackageOpen, ChevronDown, User, Cpu, Plug, Puzzle,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { useSidebarStore, useChatStore, useThemeStore } from '@/lib/store';
-import { getSessionsPage, deleteSession, logout, type SessionInfo } from '@/lib/api';
+import { useSidebarStore, useChatStore, useThemeStore, useAgentStore, type AgentOption } from '@/lib/store';
+import { getSessionsPage, deleteSession, getConfig, logout, type SessionInfo } from '@/lib/api';
 import { useT } from '@/lib/i18n';
 import { BlockcellLogo } from './blockcell-logo';
 
@@ -34,33 +34,80 @@ const advancedNavItems = [
 ];
 
 export function Sidebar() {
-  const { isOpen, activePage, toggle, setActivePage } = useSidebarStore();
-  const { sessions, setSessions, currentSessionId, setCurrentSession, isConnected } = useChatStore();
-  const { theme, setTheme } = useThemeStore();
+  const isOpen = useSidebarStore((s) => s.isOpen);
+  const activePage = useSidebarStore((s) => s.activePage);
+  const toggle = useSidebarStore((s) => s.toggle);
+  const setActivePage = useSidebarStore((s) => s.setActivePage);
+  const sessions = useChatStore((s) => s.sessions);
+  const setSessions = useChatStore((s) => s.setSessions);
+  const currentSessionId = useChatStore((s) => s.currentSessionId);
+  const setCurrentSession = useChatStore((s) => s.setCurrentSession);
+  const isConnected = useChatStore((s) => s.isConnected);
+  const theme = useThemeStore((s) => s.theme);
+  const setTheme = useThemeStore((s) => s.setTheme);
+  const selectedAgentId = useAgentStore((s) => s.selectedAgentId);
+  const agents = useAgentStore((s) => s.agents);
+  const setSelectedAgent = useAgentStore((s) => s.setSelectedAgent);
+  const setAgents = useAgentStore((s) => s.setAgents);
   const t = useT();
   const [loadingSessions, setLoadingSessions] = useState(false);
   const [loadingMoreSessions, setLoadingMoreSessions] = useState(false);
   const [nextCursor, setNextCursor] = useState<number | null>(0);
   const sessionsRef = useRef<SessionInfo[]>(sessions);
+  const selectedAgentRef = useRef(selectedAgentId);
   const [deleteConfirm, setDeleteConfirm] = useState<{ id: string; name: string } | null>(null);
   const [logoutConfirm, setLogoutConfirm] = useState(false);
 
   sessionsRef.current = sessions;
+  selectedAgentRef.current = selectedAgentId;
+
+  useEffect(() => {
+    loadAgents();
+  }, []);
 
   useEffect(() => {
     loadSessions();
-  }, []);
+  }, [selectedAgentId]);
+
+  async function loadAgents() {
+    try {
+      const config = await getConfig();
+      const derivedAgents: AgentOption[] = [
+        { id: 'default', name: 'default' },
+        ...((config?.agents?.list || [])
+          .filter((agent: any) => agent?.enabled !== false && typeof agent?.id === 'string' && agent.id.trim() && agent.id !== 'default')
+          .map((agent: any) => ({ id: agent.id.trim(), name: agent.name?.trim() || agent.id.trim() }))),
+      ];
+      setAgents(derivedAgents);
+      if (!derivedAgents.some((agent) => agent.id === selectedAgentId)) {
+        setSelectedAgent('default');
+        setCurrentSession('');
+      }
+    } catch {
+      setAgents([{ id: 'default', name: 'default' }]);
+    }
+  }
 
   async function loadSessions() {
+    const agentId = selectedAgentId;
     setLoadingSessions(true);
     try {
-      const data = await getSessionsPage({ limit: 12, cursor: 0 });
+      const data = await getSessionsPage({ limit: 12, cursor: 0, agent: agentId });
+      if (selectedAgentRef.current !== agentId) {
+        return;
+      }
       setSessions(data.sessions);
+      const currentId = useChatStore.getState().currentSessionId;
+      if (!currentId && data.sessions.length > 0) {
+        setCurrentSession(data.sessions[0].id);
+      }
       setNextCursor(data.next_cursor);
     } catch {
       // ignore
     } finally {
-      setLoadingSessions(false);
+      if (selectedAgentRef.current === agentId) {
+        setLoadingSessions(false);
+      }
     }
   }
 
@@ -68,9 +115,14 @@ export function Sidebar() {
     if (loadingMoreSessions) return;
     if (nextCursor === null) return;
 
+    const agentId = selectedAgentId;
+    const cursor = nextCursor;
     setLoadingMoreSessions(true);
     try {
-      const data = await getSessionsPage({ limit: 12, cursor: nextCursor });
+      const data = await getSessionsPage({ limit: 12, cursor, agent: agentId });
+      if (selectedAgentRef.current !== agentId) {
+        return;
+      }
       if (data.sessions?.length) {
         setSessions([...sessionsRef.current, ...data.sessions]);
       }
@@ -78,7 +130,9 @@ export function Sidebar() {
     } catch {
       // ignore
     } finally {
-      setLoadingMoreSessions(false);
+      if (selectedAgentRef.current === agentId) {
+        setLoadingMoreSessions(false);
+      }
     }
   }
 
@@ -98,10 +152,11 @@ export function Sidebar() {
     if (!deleteConfirm) return;
     const id = deleteConfirm.id;
     try {
-      await deleteSession(id);
+      await deleteSession(id, selectedAgentId);
       setSessions(sessions.filter((s) => s.id !== id));
       if (currentSessionId === id) {
-        setCurrentSession(`ws_${Date.now()}`);
+        const remaining = sessions.filter((s) => s.id !== id);
+        setCurrentSession(remaining[0]?.id || '');
       }
     } catch {
       // ignore
@@ -111,7 +166,7 @@ export function Sidebar() {
   }
 
   function handleNewChat() {
-    setCurrentSession(`ws_${Date.now()}`);
+    setCurrentSession('');
     setActivePage('chat');
   }
 
@@ -128,9 +183,9 @@ export function Sidebar() {
           <div className="flex items-center gap-2.5">
             <BlockcellLogo size="xs" className="shrink-0" />
             <span className="font-bold text-sm tracking-wider">
-              BLOCK<span className="text-cyber">CELL</span>
+              BLOCK<span className="text-[hsl(var(--brand-green))]">CELL</span>
             </span>
-            <span className={cn('w-2 h-2 rounded-full', isConnected ? 'bg-cyber' : 'bg-red-500')} />
+            <span className={cn('w-2 h-2 rounded-full', isConnected ? 'bg-[hsl(var(--brand-green))]' : 'bg-red-500')} />
           </div>
         ) : (
           <div className="mx-auto shrink-0">
@@ -144,6 +199,29 @@ export function Sidebar() {
 
       {/* Navigation */}
       <nav className="flex-1 overflow-y-auto py-2">
+        {isOpen && (
+          <div className="px-3 pb-3">
+            <div className="mb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+              {t('common.agent')}
+            </div>
+            <select
+              value={selectedAgentId}
+              onChange={(e) => {
+                const nextAgentId = e.target.value;
+                setSelectedAgent(nextAgentId);
+                setSessions([]);
+                setCurrentSession('');
+              }}
+              className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring"
+            >
+              {agents.map((agent) => (
+                <option key={agent.id} value={agent.id}>
+                  {agent.name}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
         {/* Primary nav items */}
         {primaryNavItems.map((item) => (
           <NavButton key={item.id} item={item} activePage={activePage} isOpen={isOpen} setActivePage={setActivePage} t={t} />
@@ -214,7 +292,7 @@ export function Sidebar() {
         {isOpen ? (
           <>
             <div className="flex items-center gap-1 text-xs text-muted-foreground">
-              {isConnected ? <Wifi size={12} className="text-cyber" /> : <WifiOff size={12} className="text-red-500" />}
+              {isConnected ? <Wifi size={12} className="text-[hsl(var(--brand-green))]" /> : <WifiOff size={12} className="text-red-500" />}
               <span>{isConnected ? t('sidebar.connected') : t('sidebar.disconnected')}</span>
             </div>
             <div className="flex items-center gap-0.5">

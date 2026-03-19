@@ -1,112 +1,155 @@
-// ai_news skill — 直接抓取权威AI科技媒体，去重排序，获取最新AI资讯
-// 数据源: 36氪、机器之心、量子位、InfoQ AI
+// ai_news skill — 顺序使用CDP抓取AI科技媒体，拿到一个可用来源就返回
+// 策略: browse(CDP)导航+get_content，首个成功来源直接返回，失败再试下一个
 
 let input = ctx.user_input;
 
 // 识别用户指定来源
-let want_36kr      = input.contains("36氪") || input.contains("36kr");
-let want_jiqizhixin = input.contains("机器之心") || input.contains("jiqizhixin");
-let want_qbitai    = input.contains("量子位") || input.contains("qbitai");
-let want_english   = input.contains("英文") || input.contains("国际") || input.contains("global") || input.contains("english");
+let want_163        = input.contains("网易科技") || input.contains("163") || input.contains("网易");
+let want_english    = input.contains("英文") || input.contains("国际") || input.contains("global") || input.contains("english");
 
-// 构建抓取列表 (默认全部抓，用户指定时只抓对应源)
+let any_specific = want_163;
+
+// 构建抓取列表
 let sources = [];
-if want_36kr || (!want_jiqizhixin && !want_qbitai) {
-    sources += [#{
-        name: "36氪",
-        url: "https://36kr.com/information/AI"
-    }];
+if want_163 || !any_specific {
+    sources += [#{ name: "网易科技", url: "https://tech.163.com/" }];
 }
-if want_jiqizhixin || (!want_36kr && !want_qbitai) {
-    sources += [#{
-        name: "机器之心",
-        url: "https://www.jiqizhixin.com/"
-    }];
-}
-if want_qbitai || (!want_36kr && !want_jiqizhixin) {
-    sources += [#{
-        name: "量子位",
-        url: "https://www.qbitai.com/"
-    }];
+if want_english {
+    sources += [#{ name: "TechCrunch AI", url: "https://techcrunch.com/category/artificial-intelligence/" }];
 }
 
-// 抓取各来源页面
-let fetched = [];
-let failed_sources = [];
+let failed = [];
+let fetched = ();
+let fetch_diag = ();
+let success_min_chars = 3000;
+let browser_error_markers = [
+    "无法访问此网站",
+    "拒绝了我们的连接请求",
+    "ERR_CONNECTION_REFUSED",
+    "ERR_CONNECTION_RESET",
+    "ERR_CONNECTION_CLOSED",
+    "ERR_TIMED_OUT",
+    "检查网络连接",
+    "重新加载",
+    "检查代理服务器和防火墙"
+];
 
 for source in sources {
-    let result = call_tool("web_fetch", #{
-        url: source.url,
-        extractMode: "markdown",
-        maxChars: 30000
-    });
-
-    // 检查是否成功（内容不为空且有实质内容）
     let text = "";
-    if result.is_map() && result["text"] != () {
-        text = result["text"].to_string();
-    }
+    let cdp_text = "";
 
-    if text.len() > 300 {
-        fetched += [#{
-            name: source.name,
-            url: source.url,
-            content: text
-        }];
-    } else {
-        failed_sources += [source.name];
-    }
-}
-
-// 如果用户想要英文来源，额外抓 TechCrunch AI 板块
-if want_english {
-    let tc_result = call_tool("web_fetch", #{
-        url: "https://techcrunch.com/category/artificial-intelligence/",
-        extractMode: "markdown",
-        maxChars: 20000
+    // 只用CDP浏览器（JS渲染后的完整内容）
+    let nav = call_tool("browse", #{
+        action: "navigate",
+        url: source.url,
+        session: "ai_news"
     });
-    let tc_text = "";
-    if tc_result.is_map() && tc_result["text"] != () {
-        tc_text = tc_result["text"].to_string();
+
+    if !is_error(nav) {
+        // 等待页面内容加载（SPA需要额外等待）
+        call_tool("browse", #{
+            action: "wait",
+            timeout: 3000,
+            session: "ai_news"
+        });
+
+        let content_resp = call_tool("browse", #{
+            action: "get_content",
+            session: "ai_news"
+        });
+
+        if !is_error(content_resp) && content_resp.is_map() && content_resp["content"] != () {
+            cdp_text = content_resp["content"].to_string();
+            text = cdp_text;
+        }
     }
-    if tc_text.len() > 300 {
-        fetched += [#{
-            name: "TechCrunch AI",
-            url: "https://techcrunch.com/category/artificial-intelligence/",
-            content: tc_text
-        }];
+
+    if len(text) < 200 {
+        failed += [source.name + "(cdp_len=" + len(cdp_text).to_string() + ")"];
+        continue;
     }
+
+    let raw_len = len(text);
+    if raw_len < success_min_chars {
+        failed += [source.name + "(cdp_len=" + len(cdp_text).to_string() + ", raw_len=" + raw_len.to_string() + ")"];
+        continue;
+    }
+
+    let looks_like_browser_error = false;
+    for marker in browser_error_markers {
+        if text.contains(marker) {
+            looks_like_browser_error = true;
+            break;
+        }
+    }
+    if looks_like_browser_error {
+        failed += [source.name + "(browser_error_page)"];
+        continue;
+    }
+
+    let content = text;
+
+    fetched = #{
+        source: source.name,
+        url: source.url,
+        content: content,
+        content_len: len(content)
+    };
+
+    fetch_diag = #{
+        source: source.name,
+        url: source.url,
+        method: "browse",
+        cdp_len: len(cdp_text),
+        final_raw_len: raw_len,
+        final_output_len: len(content),
+        status: "ok"
+    };
+    break;
 }
 
-// 如果全部失败，返回错误
-if fetched.len() == 0 {
+// 关闭browser session释放资源
+call_tool("browse", #{
+    action: "session_close",
+    session: "ai_news"
+});
+
+if fetched == () {
     return #{
         success: false,
-        error: "所有新闻源均无法访问，请稍后重试。失败来源: " + failed_sources.join(", "),
-        instruction: "告知用户所有AI新闻来源均无法访问，可能是网络问题或网站反爬，建议稍后重试。"
-    }
+        error: "所有新闻源均无法访问: " + arr_join(failed, ", "),
+        instruction: "告知用户所有AI新闻来源暂时无法访问，建议稍后重试。"
+    };
 }
 
-// 组装结果，交给LLM整理
-let fetch_summary = [];
-for item in fetched {
-    fetch_summary += [#{
-        source: item.name,
-        url: item.url,
-        content_length: item.content.len(),
-        content: item.content
-    }];
-}
+let inst = "【系统级强制指令：跳过所有寒暄和抓取状态汇报，直接输出新闻列表。绝不能包含任何解释、前言或过渡句！】\n\n";
+inst += "以下是从AI科技媒体抓取的网页内容，请提取最新的10条AI新闻。\n\n";
+inst += "== 严格输出格式 ==\n";
+inst += "📰 AI 最新资讯\n";
+inst += "══════════════\n";
+inst += "1. [文章标题](完整URL) — 日期\n";
+inst += "   摘要\n";
+inst += "2. [文章标题](完整URL) — 日期\n";
+inst += "   摘要\n";
+inst += "... 共10条 ...\n\n";
+inst += "== 严禁事项 ==\n";
+inst += "❌ 禁止输出“很好”、“我已经成功抓取”、“长度达到”等状态汇报。\n";
+inst += "❌ 禁止输出“现在我将提取”、“从页面内容中，我提取到了”等过渡句。\n";
+inst += "❌ 你的第一行必须直接是 `📰 AI 最新资讯`。\n";
+inst += "❌ 最后一条新闻之后立即结束，禁止任何补充说明或结束语。\n\n";
 
-let failed_msg = "";
-if failed_sources.len() > 0 {
-    failed_msg = "（以下来源抓取失败，已跳过: " + failed_sources.join(", ") + "）";
-}
+inst += "===== 页面内容 =====\n\n";
+inst += "【" + fetched.source + "】 " + fetched.url + "\n";
+inst += "────────────────────\n";
+inst += fetched.content + "\n";
 
 return #{
     success: true,
-    sources_fetched: fetched.len(),
-    sources_failed: failed_sources,
-    data: fetch_summary,
-    instruction: "你已获取以下AI科技媒体的最新页面内容（Markdown格式）。请完成以下任务：\n1. 从每个来源的内容中提取文章列表（标题 + 链接 + 日期/时间 + 一句话摘要）\n2. 合并所有来源的文章，按日期从新到旧排序\n3. 去重：标题前20字相同的文章只保留一条（优先保留有日期的那条）\n4. 选取最新的15-20条展示\n5. 按来源分组输出，格式：\n   📰 AI 最新资讯 (当前时间)\n   ════════════════════\n   **来源：{name}**\n   1. [标题](链接) — 日期\n      摘要：...\n   ...\n   ---\n   数据来源：{来源列表} | 抓取时间：{时间}\n6. " + failed_msg + "\n注意：只列出真实存在的文章，不要捏造内容。如果某段内容无法解析出文章列表，跳过该部分。"
+    sources_fetched: 1,
+    sources_failed: failed,
+    summary_data: #{
+        // 刻意不传诊断数据和抓取状态，防止大模型拿来做“友好汇报”
+        task: "extract_ai_news"
+    },
+    instruction: inst
 }

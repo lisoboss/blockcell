@@ -1,61 +1,63 @@
-use std::collections::HashMap;
-use std::sync::Arc;
 use blockcell_core::{Error, Result};
 use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::Arc;
 use tracing::{debug, warn};
 
-use crate::{Tool, ToolContext};
-use crate::fs::{ReadFileTool, WriteFileTool, EditFileTool, ListDirTool};
-use crate::exec::ExecTool;
-use crate::web::{WebSearchTool, WebFetchTool};
-use crate::message::MessageTool;
-use crate::spawn::SpawnTool;
-use crate::cron::CronTool;
-use crate::tasks::ListTasksTool;
-use crate::browser::BrowseTool;
-use crate::memory::{MemoryQueryTool, MemoryUpsertTool, MemoryForgetTool};
-use crate::skills::ListSkillsTool;
-use crate::system_info::{SystemInfoTool, CapabilityEvolveTool};
-use crate::camera::CameraCaptureTool;
-
-use crate::app_control::AppControlTool;
-use crate::file_ops::FileOpsTool;
-use crate::data_process::DataProcessTool;
-use crate::http_request::HttpRequestTool;
-use crate::email::EmailTool;
-use crate::audio_transcribe::AudioTranscribeTool;
-use crate::chart_generate::ChartGenerateTool;
-use crate::office_write::OfficeWriteTool;
-use crate::calendar_api::CalendarApiTool;
-use crate::iot_control::IotControlTool;
-use crate::tts::TtsTool;
-use crate::ocr::OcrTool;
-use crate::image_understand::ImageUnderstandTool;
-use crate::social_media::SocialMediaTool;
-use crate::notification::NotificationTool;
-use crate::cloud_api::CloudApiTool;
-use crate::git_api::GitApiTool;
-use crate::finance_api::FinanceApiTool;
-use crate::video_process::VideoProcessTool;
-use crate::health_api::HealthApiTool;
-use crate::map_api::MapApiTool;
-use crate::contacts::ContactsTool;
-use crate::encrypt::EncryptTool;
-use crate::network_monitor::NetworkMonitorTool;
-use crate::knowledge_graph::KnowledgeGraphTool;
-use crate::stream_subscribe::StreamSubscribeTool;
+use crate::agent_status::AgentStatusTool;
 use crate::alert_rule::AlertRuleTool;
-use crate::blockchain_rpc::BlockchainRpcTool;
-use crate::exchange_api::ExchangeApiTool;
-use crate::blockchain_tx::BlockchainTxTool;
-use crate::contract_security::ContractSecurityTool;
-use crate::bridge_api::BridgeApiTool;
-use crate::nft_market::NftMarketTool;
-use crate::multisig::MultisigTool;
+use crate::app_control::AppControlTool;
+use crate::audio_transcribe::AudioTranscribeTool;
+use crate::browser::BrowseTool;
+use crate::camera::CameraCaptureTool;
+use crate::chart_generate::ChartGenerateTool;
 use crate::community_hub::CommunityHubTool;
+use crate::cron::CronTool;
+use crate::data_process::DataProcessTool;
+use crate::email::EmailTool;
+use crate::encrypt::EncryptTool;
+use crate::exec::ExecTool;
+use crate::exec_local::ExecLocalTool;
+use crate::file_ops::FileOpsTool;
+use crate::fs::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool};
+use crate::http_request::HttpRequestTool;
+use crate::image_understand::ImageUnderstandTool;
+use crate::knowledge_graph::KnowledgeGraphTool;
+use crate::memory::{MemoryForgetTool, MemoryQueryTool, MemoryUpsertTool};
 use crate::memory_maintenance::MemoryMaintenanceTool;
-use crate::toggle_manage::ToggleManageTool;
+use crate::message::MessageTool;
+use crate::network_monitor::NetworkMonitorTool;
+use crate::ocr::OcrTool;
+use crate::office_write::OfficeWriteTool;
+use crate::skills::ListSkillsTool;
+use crate::spawn::SpawnTool;
+use crate::stream_subscribe::StreamSubscribeTool;
+use crate::system_info::{CapabilityEvolveTool, SystemInfoTool};
+use crate::session_recall::SessionRecallTool;
+use crate::tasks::ListTasksTool;
 use crate::termux_api::TermuxApiTool;
+use crate::toggle_manage::ToggleManageTool;
+use crate::tts::TtsTool;
+use crate::video_process::VideoProcessTool;
+use crate::web::{WebFetchTool, WebSearchTool};
+use crate::{Tool, ToolContext};
+
+pub const GLOBAL_CORE_TOOL_NAMES: &[&str] = &[
+    "memory_query",
+    "memory_upsert",
+    "memory_forget",
+    "spawn",
+    "list_tasks",
+    "agent_status",
+    "list_skills",
+    "cron",
+    "toggle_manage",
+    "web_fetch",
+];
+
+pub fn global_core_tool_names() -> &'static [&'static str] {
+    GLOBAL_CORE_TOOL_NAMES
+}
 
 #[derive(Clone)]
 pub struct ToolRegistry {
@@ -71,162 +73,116 @@ impl ToolRegistry {
 
     pub fn with_defaults() -> Self {
         let mut registry = Self::new();
-        
+
         // File system tools
         registry.register(Arc::new(ReadFileTool));
         registry.register(Arc::new(WriteFileTool));
         registry.register(Arc::new(EditFileTool));
         registry.register(Arc::new(ListDirTool));
-        
+
         // Exec tool
         registry.register(Arc::new(ExecTool));
-        
+        registry.register(Arc::new(ExecLocalTool));
+
         // Web tools
         registry.register(Arc::new(WebSearchTool));
         registry.register(Arc::new(WebFetchTool));
-        
+
         // Communication tools
         registry.register(Arc::new(MessageTool));
         registry.register(Arc::new(SpawnTool));
-        
+
         // Task management
         registry.register(Arc::new(ListTasksTool));
-        
+
         // Browser tools
         registry.register(Arc::new(BrowseTool));
-        
+
         // Scheduler tools
         registry.register(Arc::new(CronTool));
-        
+
         // Memory tools
         registry.register(Arc::new(MemoryQueryTool));
         registry.register(Arc::new(MemoryUpsertTool));
         registry.register(Arc::new(MemoryForgetTool));
-        
+
         // Skill evolution tools
         registry.register(Arc::new(ListSkillsTool));
-        
+
         // System info & capability evolution tools
         registry.register(Arc::new(SystemInfoTool));
+        registry.register(Arc::new(AgentStatusTool));
         registry.register(Arc::new(CapabilityEvolveTool));
-        
+
         // Camera tools
         registry.register(Arc::new(CameraCaptureTool));
-        
+
         // General app control (any macOS app)
         registry.register(Arc::new(AppControlTool));
-        
+
         // File operations (delete, rename, move, copy, compress, decompress, PDF)
         registry.register(Arc::new(FileOpsTool));
-        
+
         // Structured data processing (CSV, stats, query, transform)
         registry.register(Arc::new(DataProcessTool));
-        
+
         // Generic HTTP/REST API requests
         registry.register(Arc::new(HttpRequestTool));
-        
+
         // Email (SMTP/IMAP)
         registry.register(Arc::new(EmailTool));
-        
+
         // Audio transcription (Whisper CLI / API)
         registry.register(Arc::new(AudioTranscribeTool));
-        
+
         // Chart generation (matplotlib / plotly)
         registry.register(Arc::new(ChartGenerateTool));
-        
+
         // Office document generation (PPTX / DOCX / XLSX)
         registry.register(Arc::new(OfficeWriteTool));
-        
-        // Business APIs (Calendar, Notion, CRM, Ticketing)
-        registry.register(Arc::new(CalendarApiTool));
-        
-        // IoT / Smart Home (Home Assistant, MQTT, generic)
-        registry.register(Arc::new(IotControlTool));
-        
+
         // Text-to-speech
         registry.register(Arc::new(TtsTool));
-        
+
         // OCR (image text recognition)
         registry.register(Arc::new(OcrTool));
-        
+
         // Multimodal image understanding
         registry.register(Arc::new(ImageUnderstandTool));
-        
-        // Social media (Twitter/Medium/WordPress)
-        registry.register(Arc::new(SocialMediaTool));
-        
-        // Multi-channel notifications (SMS/Push/Webhook/Desktop)
-        registry.register(Arc::new(NotificationTool));
-        
-        // Cloud platform management (AWS/GCP/Azure)
-        registry.register(Arc::new(CloudApiTool));
-        
-        // Git/GitHub integration
-        registry.register(Arc::new(GitApiTool));
-        
-        // Financial data (stocks/crypto/forex)
-        registry.register(Arc::new(FinanceApiTool));
-        
+
         // Video processing (ffmpeg)
         registry.register(Arc::new(VideoProcessTool));
-        
-        // Health data (Apple Health/Fitbit/Google Fit)
-        registry.register(Arc::new(HealthApiTool));
-        
-        // Map and navigation (Google Maps / Amap)
-        registry.register(Arc::new(MapApiTool));
-        
-        // Contacts management (macOS / Google / CardDAV)
-        registry.register(Arc::new(ContactsTool));
-        
+
         // Encryption and security utilities
         registry.register(Arc::new(EncryptTool));
-        
+
         // Network monitoring and diagnostics
         registry.register(Arc::new(NetworkMonitorTool));
-        
+
         // Knowledge graph (SQLite-backed)
         registry.register(Arc::new(KnowledgeGraphTool));
-        
+
         // Real-time data streams (WebSocket/SSE)
         registry.register(Arc::new(StreamSubscribeTool));
-        
+
         // Conditional alert rules
         registry.register(Arc::new(AlertRuleTool));
-        
-        // Blockchain RPC (EVM JSON-RPC + ABI encoding/decoding)
-        registry.register(Arc::new(BlockchainRpcTool));
-        
-        // CEX trading (Binance/OKX/Bybit)
-        registry.register(Arc::new(ExchangeApiTool));
-        
-        // Blockchain transactions (sign & send)
-        registry.register(Arc::new(BlockchainTxTool));
-        
-        // Contract & token security (GoPlus API)
-        registry.register(Arc::new(ContractSecurityTool));
-        
-        // Cross-chain bridge (LI.FI / Stargate / LayerZero)
-        registry.register(Arc::new(BridgeApiTool));
-        
-        // NFT marketplace (OpenSea / Reservoir)
-        registry.register(Arc::new(NftMarketTool));
-        
-        // Multisig wallet (Gnosis Safe)
-        registry.register(Arc::new(MultisigTool));
-        
+
         // Community Hub (social interactions, skill discovery)
         registry.register(Arc::new(CommunityHubTool));
-        
+
         // Memory maintenance (Ghost Agent memory gardening)
         registry.register(Arc::new(MemoryMaintenanceTool));
-        
+
         // Toggle management (enable/disable skills and capabilities)
         registry.register(Arc::new(ToggleManageTool));
-        
+
         // Termux API (Android device control via Termux)
         registry.register(Arc::new(TermuxApiTool));
-        
+
+        // Session response cache recall
+        registry.register(Arc::new(SessionRecallTool));
+
         registry
     }
 
@@ -237,7 +193,10 @@ impl ToolRegistry {
     }
 
     /// Register all tools exposed by an MCP server provider.
-    pub async fn register_mcp_provider(&mut self, provider: &crate::mcp::provider::McpToolProvider) {
+    pub async fn register_mcp_provider(
+        &mut self,
+        provider: &crate::mcp::provider::McpToolProvider,
+    ) {
         let tools = provider.tools().await;
         for tool in tools {
             let schema = tool.schema();
@@ -288,8 +247,9 @@ impl ToolRegistry {
     }
 
     /// Get tiered schemas: full schemas for core tools, lightweight (name+description only) for others.
-    /// Core tools get complete parameter schemas; non-core tools get just name+description
-    /// so the LLM knows they exist but we save ~500 tokens per non-core tool.
+    /// Core tools and any tools with required parameters get complete parameter schemas;
+    /// non-core tools without required parameters get just name+description so the LLM
+    /// knows they exist but we save ~500 tokens per low-risk tool.
     /// When the LLM tries to call a lightweight tool, the runtime dynamically supplements
     /// the full schema and retries.
     pub fn get_tiered_schemas(&self, names: &[&str], core_tools: &[&str]) -> Vec<Value> {
@@ -298,8 +258,14 @@ impl ToolRegistry {
             .filter(|(name, _)| names.contains(&name.as_str()))
             .map(|(name, tool)| {
                 let schema = tool.schema();
-                if core_tools.contains(&name.as_str()) {
-                    // Full schema for core tools
+                let has_required_params = schema
+                    .parameters
+                    .get("required")
+                    .and_then(|required| required.as_array())
+                    .is_some_and(|required| !required.is_empty());
+                if core_tools.contains(&name.as_str()) || has_required_params {
+                    // Full schema for core tools and tools that cannot be called safely
+                    // without required parameters present in the model-visible schema.
                     json!({
                         "type": "function",
                         "function": {
@@ -309,19 +275,12 @@ impl ToolRegistry {
                         }
                     })
                 } else {
-                    // Lightweight schema: name + first sentence of description, no parameters
-                    let desc = schema.description;
-                    let short_desc = desc.split_once(". ")
-                        .map(|(first, _)| format!("{}.", first))
-                        .unwrap_or_else(|| {
-                            let chars: String = desc.chars().take(120).collect();
-                            if desc.chars().count() > 120 { format!("{}...", chars) } else { chars }
-                        });
+                    // Lightweight schema: keep the full description but omit parameters.
                     json!({
                         "type": "function",
                         "function": {
                             "name": schema.name,
-                            "description": short_desc,
+                            "description": schema.description,
                             "parameters": { "type": "object", "properties": {} }
                         }
                     })
@@ -335,10 +294,23 @@ impl ToolRegistry {
         self.tools.keys().cloned().collect()
     }
 
+    /// Collect prompt rules from loaded tools.
+    /// Returns a sorted list of markdown rule strings for tools that provide them.
+    pub fn get_prompt_rules(&self, names: &[&str], ctx: &crate::PromptContext) -> Vec<String> {
+        let mut rules: Vec<(String, String)> = self
+            .tools
+            .iter()
+            .filter(|(name, _)| names.contains(&name.as_str()))
+            .filter_map(|(name, tool)| tool.prompt_rule(ctx).map(|rule| (name.clone(), rule)))
+            .collect();
+        rules.sort_by(|a, b| a.0.cmp(&b.0));
+        rules.into_iter().map(|(_, rule)| rule).collect()
+    }
+
     pub async fn execute(&self, name: &str, ctx: ToolContext, params: Value) -> Result<Value> {
-        let tool = self.get(name).ok_or_else(|| {
-            Error::Tool(format!("Unknown tool: {}", name))
-        })?;
+        let tool = self
+            .get(name)
+            .ok_or_else(|| Error::Tool(format!("Unknown tool: {}", name)))?;
 
         // Validate parameters
         if let Err(e) = tool.validate(&params) {
@@ -370,6 +342,38 @@ impl Default for ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use blockcell_core::Result;
+    use serde_json::json;
+
+    struct NoRequiredTool;
+
+    #[async_trait]
+    impl Tool for NoRequiredTool {
+        fn schema(&self) -> crate::ToolSchema {
+            crate::ToolSchema {
+                name: "no_required_tool",
+                description: "Tool without required parameters",
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "optional_value": {
+                            "type": "string",
+                            "description": "Optional value"
+                        }
+                    }
+                }),
+            }
+        }
+
+        fn validate(&self, _params: &Value) -> Result<()> {
+            Ok(())
+        }
+
+        async fn execute(&self, _ctx: ToolContext, _params: Value) -> Result<Value> {
+            Ok(json!({"ok": true}))
+        }
+    }
 
     #[test]
     fn test_registry_new_empty() {
@@ -387,7 +391,7 @@ mod tests {
         assert!(names.contains(&"exec".to_string()));
         assert!(names.contains(&"web_search".to_string()));
         assert!(names.contains(&"browse".to_string()));
-        assert!(names.contains(&"blockchain_rpc".to_string()));
+        assert!(names.contains(&"http_request".to_string()));
         assert!(names.contains(&"toggle_manage".to_string()));
     }
 
@@ -431,5 +435,85 @@ mod tests {
         reg.register(Arc::new(crate::exec::ExecTool));
         assert!(reg.get("exec").is_some());
         assert_eq!(reg.tool_names().len(), 1);
+    }
+
+    #[test]
+    fn test_tiered_schemas_keep_web_fetch_full_parameters() {
+        let reg = ToolRegistry::with_defaults();
+        let schemas = reg.get_tiered_schemas(&["web_fetch"], global_core_tool_names());
+
+        assert_eq!(schemas.len(), 1);
+        let properties = schemas[0]["function"]["parameters"]["properties"]
+            .as_object()
+            .expect("web_fetch properties should be an object");
+        assert!(properties.contains_key("url"));
+        assert!(properties.contains_key("extractMode"));
+        assert!(properties.contains_key("maxChars"));
+    }
+
+    #[test]
+    fn test_tiered_schemas_keep_required_param_tools_full() {
+        let reg = ToolRegistry::with_defaults();
+        let schemas = reg.get_tiered_schemas(&["write_file"], global_core_tool_names());
+
+        assert_eq!(schemas.len(), 1);
+        let properties = schemas[0]["function"]["parameters"]["properties"]
+            .as_object()
+            .expect("write_file properties should be an object");
+        assert!(properties.contains_key("path"));
+        assert!(properties.contains_key("content"));
+    }
+
+    #[test]
+    fn test_tiered_schemas_still_keep_no_required_tools_lightweight() {
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(NoRequiredTool));
+        let schemas = reg.get_tiered_schemas(&["no_required_tool"], global_core_tool_names());
+
+        assert_eq!(schemas.len(), 1);
+        let properties = schemas[0]["function"]["parameters"]["properties"]
+            .as_object()
+            .expect("no_required_tool properties should be an object");
+        assert!(properties.is_empty());
+    }
+
+    fn assert_no_array_without_items(value: &Value, path: &str) {
+        match value {
+            Value::Object(map) => {
+                if map.get("type").and_then(Value::as_str) == Some("array") {
+                    assert!(
+                        map.contains_key("items"),
+                        "array schema missing items at {}",
+                        path
+                    );
+                }
+                for (key, child) in map {
+                    let child_path = if path.is_empty() {
+                        key.to_string()
+                    } else {
+                        format!("{}.{}", path, key)
+                    };
+                    assert_no_array_without_items(child, &child_path);
+                }
+            }
+            Value::Array(items) => {
+                for (idx, child) in items.iter().enumerate() {
+                    assert_no_array_without_items(child, &format!("{}[{}]", path, idx));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn test_all_tool_schemas_have_valid_array_items() {
+        let reg = ToolRegistry::with_defaults();
+        let schemas = reg.get_tool_schemas();
+
+        for schema in &schemas {
+            let tool_name = schema["function"]["name"].as_str().unwrap_or("unknown");
+            let parameters = &schema["function"]["parameters"];
+            assert_no_array_without_items(parameters, tool_name);
+        }
     }
 }

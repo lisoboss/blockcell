@@ -12,13 +12,34 @@
 //
 // 预注入变量:
 //   user_input  — 用户原始输入文本
-//   device      — 摄像头索引 (可选, 默认 "0")
-//   format      — 图片格式 (可选, 默认 "jpg")
-//   output_path — 输出路径 (可选, 自动生成)
+//   ctx         — 运行时上下文, 其中 ctx.message 可能为 JSON 字符串
 
 // === Step 1: 确定参数 ===
-let device_idx = if device != () { parse_int(device) } else { 0 };
-let img_format = if format != () { format } else { "jpg" };
+let raw_message = if ctx != () {
+    let msg = get_field(ctx, "message");
+    if msg != () && msg != "" { msg } else { user_input }
+} else {
+    user_input
+};
+
+let payload = from_json(raw_message);
+let device_val = if is_map(payload) {
+    get_field(payload, "device")
+} else {
+    ()
+};
+let device_idx = if device_val != () { device_val } else { 0 };
+let format_val = if is_map(payload) {
+    get_field(payload, "format")
+} else {
+    ()
+};
+let img_format = if format_val != () && format_val != "" { format_val } else { "jpg" };
+let output_path_val = if is_map(payload) {
+    get_field(payload, "output_path")
+} else {
+    ()
+};
 
 log("📷 [拍照] 开始拍照流程");
 log("📷 [拍照] 设备: " + device_idx + ", 格式: " + img_format);
@@ -40,8 +61,8 @@ let capture_params = #{
 };
 
 // 如果用户指定了输出路径，加入参数
-if output_path != () && output_path != "" {
-    capture_params.output_path = output_path;
+if output_path_val != () && output_path_val != "" {
+    capture_params.output_path = output_path_val;
 }
 
 log("📷 [拍照] 正在拍摄...");

@@ -2,11 +2,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use blockcell_core::config::ToolCallMode;
 use blockcell_core::Config;
 use tracing::{info, warn};
 
-use crate::{Provider};
-use crate::factory::create_provider;
+use crate::factory::create_provider_with_tool_mode;
+use crate::Provider;
 
 /// 单个池条目的运行时健康状态
 #[derive(Debug, Clone, PartialEq)]
@@ -77,6 +78,30 @@ pub struct ProviderPool {
 }
 
 impl ProviderPool {
+    /// Build a pool from a single already-constructed provider.
+    /// Useful for tests and for embedding a deterministic provider in local flows.
+    pub fn from_single_provider(
+        model: impl Into<String>,
+        provider_name: impl Into<String>,
+        provider: Arc<dyn Provider>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            entries: vec![BuiltEntry {
+                model: model.into(),
+                provider_name: provider_name.into(),
+                weight: 1,
+                priority: 1,
+                provider,
+            }],
+            state: Mutex::new(PoolState {
+                health: HashMap::from([(0, EntryHealth::Healthy)]),
+                stats: HashMap::new(),
+            }),
+            fail_threshold: 3,
+            cooldown: Duration::from_secs(60),
+        })
+    }
+
     /// 从 config 构建 ProviderPool。
     ///
     /// - 如果 `config.agents.defaults.model_pool` 非空，使用 pool 配置。
@@ -85,28 +110,47 @@ impl ProviderPool {
         let defaults = &config.agents.defaults;
 
         // 收集 ModelEntry 列表（兼容旧配置）
-        let entries_cfg: Vec<(String, String, u32, u32)> = if !defaults.model_pool.is_empty() {
-            defaults.model_pool.iter()
-                .map(|e| (e.model.clone(), e.provider.clone(), e.weight, e.priority))
-                .collect()
-        } else {
-            // 旧配置：单条目
-            let model = defaults.model.clone();
-            let provider_name = defaults.provider.clone().unwrap_or_default();
-            vec![(model, provider_name, 1, 1)]
-        };
+        let entries_cfg: Vec<(String, String, u32, u32, ToolCallMode)> =
+            if !defaults.model_pool.is_empty() {
+                defaults
+                    .model_pool
+                    .iter()
+                    .map(|e| {
+                        (
+                            e.model.clone(),
+                            e.provider.clone(),
+                            e.weight,
+                            e.priority,
+                            e.tool_call_mode,
+                        )
+                    })
+                    .collect()
+            } else {
+                // 旧配置：单条目
+                let model = defaults.model.clone();
+                let provider_name = defaults.provider.clone().unwrap_or_default();
+                vec![(model, provider_name, 1, 1, ToolCallMode::Native)]
+            };
 
         if entries_cfg.is_empty() {
-            return Err(anyhow::anyhow!("model_pool is empty and no default model configured"));
+            return Err(anyhow::anyhow!(
+                "model_pool is empty and no default model configured"
+            ));
         }
 
         let mut entries = Vec::with_capacity(entries_cfg.len());
         let mut health_map = HashMap::new();
         let stats_map = HashMap::new();
 
-        for (idx, (model, provider_name, weight, priority)) in entries_cfg.into_iter().enumerate() {
-            let explicit = if provider_name.is_empty() { None } else { Some(provider_name.as_str()) };
-            match create_provider(config, &model, explicit) {
+        for (idx, (model, provider_name, weight, priority, tool_call_mode)) in
+            entries_cfg.into_iter().enumerate()
+        {
+            let explicit = if provider_name.is_empty() {
+                None
+            } else {
+                Some(provider_name.as_str())
+            };
+            match create_provider_with_tool_mode(config, &model, explicit, Some(tool_call_mode)) {
                 Ok(p) => {
                     info!(
                         idx, model = %model, provider = %provider_name,
@@ -136,7 +180,10 @@ impl ProviderPool {
 
         Ok(Arc::new(Self {
             entries,
-            state: Mutex::new(PoolState { health: health_map, stats: stats_map }),
+            state: Mutex::new(PoolState {
+                health: health_map,
+                stats: stats_map,
+            }),
             fail_threshold: 3,
             cooldown: Duration::from_secs(60),
         }))
@@ -176,7 +223,10 @@ impl ProviderPool {
             // 降级保底：临时解除所有 Cooling，Dead 不解除
             let fallback: Vec<usize> = (0..self.entries.len())
                 .filter(|idx| {
-                    matches!(state.health.get(idx), Some(EntryHealth::Healthy) | Some(EntryHealth::Cooling(_)))
+                    matches!(
+                        state.health.get(idx),
+                        Some(EntryHealth::Healthy) | Some(EntryHealth::Cooling(_))
+                    )
                 })
                 .collect();
             if fallback.is_empty() {
@@ -191,19 +241,19 @@ impl ProviderPool {
         };
 
         // 按 priority 分组，取最高优先级（最小值）
-        let min_priority = candidates.iter()
+        let min_priority = candidates
+            .iter()
             .map(|idx| self.entries[*idx].priority)
             .min()
             .unwrap_or(1);
 
-        let top_group: Vec<usize> = candidates.into_iter()
+        let top_group: Vec<usize> = candidates
+            .into_iter()
             .filter(|idx| self.entries[*idx].priority == min_priority)
             .collect();
 
         // 加权随机选取
-        let total_weight: u32 = top_group.iter()
-            .map(|idx| self.entries[*idx].weight)
-            .sum();
+        let total_weight: u32 = top_group.iter().map(|idx| self.entries[*idx].weight).sum();
 
         if total_weight == 0 {
             return None;
@@ -243,7 +293,9 @@ impl ProviderPool {
             }
             CallResult::RateLimit => {
                 warn!(idx, model = %self.entries[idx].model, "ProviderPool: rate limited, entering cooldown");
-                state.health.insert(idx, EntryHealth::Cooling(Instant::now()));
+                state
+                    .health
+                    .insert(idx, EntryHealth::Cooling(Instant::now()));
             }
             CallResult::AuthError => {
                 warn!(idx, model = %self.entries[idx].model, "ProviderPool: auth error, marking dead");
@@ -262,7 +314,9 @@ impl ProviderPool {
                         fail_count = new_count,
                         "ProviderPool: fail threshold reached, entering cooldown"
                     );
-                    state.health.insert(idx, EntryHealth::Cooling(Instant::now()));
+                    state
+                        .health
+                        .insert(idx, EntryHealth::Cooling(Instant::now()));
                     state.stats.entry(idx).or_default().transient_fail_count = 0;
                 }
             }
@@ -272,15 +326,24 @@ impl ProviderPool {
     /// 将错误字符串分类为 CallResult
     pub fn classify_error(err: &str) -> CallResult {
         let lower = err.to_lowercase();
-        if lower.contains("429") || lower.contains("rate limit") || lower.contains("too many requests") {
+        if lower.contains("429")
+            || lower.contains("rate limit")
+            || lower.contains("too many requests")
+        {
             CallResult::RateLimit
-        } else if lower.contains("401") || lower.contains("403")
-            || lower.contains("unauthorized") || lower.contains("invalid api key")
-            || lower.contains("authentication") || lower.contains("api key")
+        } else if lower.contains("401")
+            || lower.contains("403")
+            || lower.contains("unauthorized")
+            || lower.contains("invalid api key")
+            || lower.contains("authentication")
+            || lower.contains("api key")
         {
             CallResult::AuthError
-        } else if lower.contains("500") || lower.contains("502") || lower.contains("503")
-            || lower.contains("504") || lower.contains("server error")
+        } else if lower.contains("500")
+            || lower.contains("502")
+            || lower.contains("503")
+            || lower.contains("504")
+            || lower.contains("server error")
         {
             CallResult::ServerError
         } else {
@@ -292,29 +355,31 @@ impl ProviderPool {
     pub fn status_summary(&self) -> Vec<PoolEntryStatus> {
         let state = self.state.lock().unwrap();
         let now = Instant::now();
-        (0..self.entries.len()).map(|idx| {
-            let entry = &self.entries[idx];
-            let health_str = match state.health.get(&idx) {
-                Some(EntryHealth::Healthy) => "healthy".to_string(),
-                Some(EntryHealth::Cooling(since)) => {
-                    let remaining = self.cooldown.saturating_sub(now.duration_since(*since));
-                    format!("cooling({}s)", remaining.as_secs())
+        (0..self.entries.len())
+            .map(|idx| {
+                let entry = &self.entries[idx];
+                let health_str = match state.health.get(&idx) {
+                    Some(EntryHealth::Healthy) => "healthy".to_string(),
+                    Some(EntryHealth::Cooling(since)) => {
+                        let remaining = self.cooldown.saturating_sub(now.duration_since(*since));
+                        format!("cooling({}s)", remaining.as_secs())
+                    }
+                    Some(EntryHealth::Dead) => "dead".to_string(),
+                    None => "unknown".to_string(),
+                };
+                let stats = state.stats.get(&idx);
+                PoolEntryStatus {
+                    index: idx,
+                    model: entry.model.clone(),
+                    provider: entry.provider_name.clone(),
+                    weight: entry.weight,
+                    priority: entry.priority,
+                    health: health_str,
+                    success_count: stats.map(|s| s.success_count).unwrap_or(0),
+                    fail_count: stats.map(|s| s.transient_fail_count).unwrap_or(0),
                 }
-                Some(EntryHealth::Dead) => "dead".to_string(),
-                None => "unknown".to_string(),
-            };
-            let stats = state.stats.get(&idx);
-            PoolEntryStatus {
-                index: idx,
-                model: entry.model.clone(),
-                provider: entry.provider_name.clone(),
-                weight: entry.weight,
-                priority: entry.priority,
-                health: health_str,
-                success_count: stats.map(|s| s.success_count).unwrap_or(0),
-                fail_count: stats.map(|s| s.transient_fail_count).unwrap_or(0),
-            }
-        }).collect()
+            })
+            .collect()
     }
 }
 
@@ -337,24 +402,42 @@ mod tests {
 
     #[test]
     fn test_classify_error_rate_limit() {
-        assert!(matches!(ProviderPool::classify_error("HTTP 429 Too Many Requests"), CallResult::RateLimit));
-        assert!(matches!(ProviderPool::classify_error("rate limit exceeded"), CallResult::RateLimit));
+        assert!(matches!(
+            ProviderPool::classify_error("HTTP 429 Too Many Requests"),
+            CallResult::RateLimit
+        ));
+        assert!(matches!(
+            ProviderPool::classify_error("rate limit exceeded"),
+            CallResult::RateLimit
+        ));
     }
 
     #[test]
     fn test_classify_error_auth() {
-        assert!(matches!(ProviderPool::classify_error("HTTP 401 Unauthorized"), CallResult::AuthError));
-        assert!(matches!(ProviderPool::classify_error("invalid api key provided"), CallResult::AuthError));
+        assert!(matches!(
+            ProviderPool::classify_error("HTTP 401 Unauthorized"),
+            CallResult::AuthError
+        ));
+        assert!(matches!(
+            ProviderPool::classify_error("invalid api key provided"),
+            CallResult::AuthError
+        ));
     }
 
     #[test]
     fn test_classify_error_server() {
-        assert!(matches!(ProviderPool::classify_error("HTTP 503 Service Unavailable"), CallResult::ServerError));
+        assert!(matches!(
+            ProviderPool::classify_error("HTTP 503 Service Unavailable"),
+            CallResult::ServerError
+        ));
     }
 
     #[test]
     fn test_classify_error_transient() {
-        assert!(matches!(ProviderPool::classify_error("connection timeout"), CallResult::Transient));
+        assert!(matches!(
+            ProviderPool::classify_error("connection timeout"),
+            CallResult::Transient
+        ));
     }
 
     #[test]
@@ -369,18 +452,20 @@ mod tests {
     #[test]
     fn test_pool_from_config_with_pool_entries() {
         let mut config = Config::default();
-        config.agents.defaults.model_pool = vec![
-            blockcell_core::config::ModelEntry {
-                model: "ollama/llama3".to_string(),
-                provider: "ollama".to_string(),
-                weight: 2,
-                priority: 1,
-                input_price: None,
-                output_price: None,
-            },
-        ];
+        config.agents.defaults.model_pool = vec![blockcell_core::config::ModelEntry {
+            model: "ollama/llama3".to_string(),
+            provider: "ollama".to_string(),
+            weight: 2,
+            priority: 1,
+            input_price: None,
+            output_price: None,
+            tool_call_mode: blockcell_core::config::ToolCallMode::Native,
+        }];
         let result = ProviderPool::from_config(&config);
-        assert!(result.is_ok(), "pool with ollama entry should build successfully");
+        assert!(
+            result.is_ok(),
+            "pool with ollama entry should build successfully"
+        );
         let pool = result.unwrap();
         let status = pool.status_summary();
         assert_eq!(status.len(), 1);
@@ -391,38 +476,39 @@ mod tests {
     #[test]
     fn test_report_transient_fails_then_cooling() {
         let mut config = Config::default();
-        config.agents.defaults.model_pool = vec![
-            blockcell_core::config::ModelEntry {
-                model: "ollama/llama3".to_string(),
-                provider: "ollama".to_string(),
-                weight: 1,
-                priority: 1,
-                input_price: None,
-                output_price: None,
-            },
-        ];
+        config.agents.defaults.model_pool = vec![blockcell_core::config::ModelEntry {
+            model: "ollama/llama3".to_string(),
+            provider: "ollama".to_string(),
+            weight: 1,
+            priority: 1,
+            input_price: None,
+            output_price: None,
+            tool_call_mode: blockcell_core::config::ToolCallMode::Native,
+        }];
         let pool = ProviderPool::from_config(&config).unwrap();
         // 连续上报 3 次 Transient 应触发冷却
         pool.report(0, CallResult::Transient);
         pool.report(0, CallResult::Transient);
         pool.report(0, CallResult::Transient);
         let status = pool.status_summary();
-        assert!(status[0].health.starts_with("cooling"), "should enter cooling after 3 transient failures");
+        assert!(
+            status[0].health.starts_with("cooling"),
+            "should enter cooling after 3 transient failures"
+        );
     }
 
     #[test]
     fn test_report_auth_error_dead() {
         let mut config = Config::default();
-        config.agents.defaults.model_pool = vec![
-            blockcell_core::config::ModelEntry {
-                model: "ollama/llama3".to_string(),
-                provider: "ollama".to_string(),
-                weight: 1,
-                priority: 1,
-                input_price: None,
-                output_price: None,
-            },
-        ];
+        config.agents.defaults.model_pool = vec![blockcell_core::config::ModelEntry {
+            model: "ollama/llama3".to_string(),
+            provider: "ollama".to_string(),
+            weight: 1,
+            priority: 1,
+            input_price: None,
+            output_price: None,
+            tool_call_mode: blockcell_core::config::ToolCallMode::Native,
+        }];
         let pool = ProviderPool::from_config(&config).unwrap();
         pool.report(0, CallResult::AuthError);
         let status = pool.status_summary();

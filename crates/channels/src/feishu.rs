@@ -1,9 +1,10 @@
-use futures::{SinkExt, StreamExt};
+use crate::account::feishu_account_id;
 use blockcell_core::{Config, Error, InboundMessage, Result};
+use futures::{SinkExt, StreamExt};
 use prost::Message as _;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{mpsc, Mutex};
@@ -71,11 +72,36 @@ impl CachedToken {
     }
 }
 
-/// Process-global token cache for the free `send_message` function.
-static GLOBAL_TOKEN_CACHE: OnceLock<Mutex<CachedToken>> = OnceLock::new();
+fn lookup_cached_token(cache: &HashMap<String, CachedToken>, app_id: &str) -> Option<String> {
+    cache.get(app_id).and_then(|entry| {
+        if entry.is_valid() {
+            Some(entry.token.clone())
+        } else {
+            None
+        }
+    })
+}
 
-fn global_token_cache() -> &'static Mutex<CachedToken> {
-    GLOBAL_TOKEN_CACHE.get_or_init(|| Mutex::new(CachedToken::default()))
+fn store_cached_token(
+    cache: &mut HashMap<String, CachedToken>,
+    app_id: &str,
+    token: &str,
+    expires_at: i64,
+) {
+    cache.insert(
+        app_id.to_string(),
+        CachedToken {
+            token: token.to_string(),
+            expires_at,
+        },
+    );
+}
+
+/// Process-global token cache for the free `send_message` function.
+static GLOBAL_TOKEN_CACHE: OnceLock<Mutex<HashMap<String, CachedToken>>> = OnceLock::new();
+
+fn global_token_cache() -> &'static Mutex<HashMap<String, CachedToken>> {
+    GLOBAL_TOKEN_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -127,6 +153,7 @@ struct MessageEvent {
     parent_id: Option<String>,
     message_id: String,
     chat_id: String,
+    chat_type: Option<String>,
     message_type: String,
     content: String,
 }
@@ -227,7 +254,10 @@ impl FeishuChannel {
         .await?;
         cache.token = token.clone();
         cache.expires_at = chrono::Utc::now().timestamp() + expires_in;
-        info!(expires_in = expires_in, "Feishu tenant_access_token refreshed");
+        info!(
+            expires_in = expires_in,
+            "Feishu tenant_access_token refreshed"
+        );
         Ok(token)
     }
 
@@ -257,20 +287,29 @@ impl FeishuChannel {
             )));
         }
 
-        let endpoint_resp: WsEndpointResponse = serde_json::from_str(&body)
-            .map_err(|e| Error::Channel(format!("Failed to parse endpoint response: {} | body: {}", e, &body.truncate_chars_ref(500))))?;
+        let endpoint_resp: WsEndpointResponse = serde_json::from_str(&body).map_err(|e| {
+            Error::Channel(format!(
+                "Failed to parse endpoint response: {} | body: {}",
+                e,
+                &body.truncate_chars_ref(500)
+            ))
+        })?;
 
         if endpoint_resp.code != 0 {
             return Err(Error::Channel(format!(
                 "Feishu endpoint error code={} msg={} | body: {}",
-                endpoint_resp.code, endpoint_resp.msg, &body.truncate_chars_ref(500)
+                endpoint_resp.code,
+                endpoint_resp.msg,
+                &body.truncate_chars_ref(500)
             )));
         }
 
-        endpoint_resp
-            .data
-            .map(|d| d.url)
-            .ok_or_else(|| Error::Channel(format!("No endpoint URL in response | body: {}", &body.truncate_chars_ref(500))))
+        endpoint_resp.data.map(|d| d.url).ok_or_else(|| {
+            Error::Channel(format!(
+                "No endpoint URL in response | body: {}",
+                &body.truncate_chars_ref(500)
+            ))
+        })
     }
 
     pub async fn run_loop(self: Arc<Self>, mut shutdown: tokio::sync::broadcast::Receiver<()>) {
@@ -335,7 +374,9 @@ impl FeishuChannel {
                     // Feishu uses Protobuf binary frames
                     match Frame::decode(data.as_slice()) {
                         Ok(frame) => {
-                            let msg_type = frame.headers.iter()
+                            let msg_type = frame
+                                .headers
+                                .iter()
                                 .find(|h| h.key == "type")
                                 .map(|h| h.value.as_str())
                                 .unwrap_or("");
@@ -382,7 +423,8 @@ impl FeishuChannel {
                                         };
                                         let mut buf = Vec::new();
                                         if prost::Message::encode(&ack, &mut buf).is_ok() {
-                                            if let Err(e) = write.send(WsMessage::Binary(buf)).await {
+                                            if let Err(e) = write.send(WsMessage::Binary(buf)).await
+                                            {
                                                 error!(error = %e, "Failed to send ACK");
                                             }
                                         }
@@ -475,7 +517,12 @@ impl FeishuChannel {
             .await
             .map_err(|e| Error::Channel(format!("Failed to create media dir: {}", e)))?;
 
-        let filename = format!("feishu_{}_{}.{}", file_type, &file_key[..8.min(file_key.len())], ext);
+        let filename = format!(
+            "feishu_{}_{}.{}",
+            file_type,
+            &file_key[..8.min(file_key.len())],
+            ext
+        );
         let path = self.media_dir.join(&filename);
 
         let bytes = resp
@@ -511,7 +558,9 @@ impl FeishuChannel {
             seen.insert(header.event_id.clone());
             if seen.len() > 1000 {
                 let to_remove: Vec<_> = seen.iter().take(100).cloned().collect();
-                for id in to_remove { seen.remove(&id); }
+                for id in to_remove {
+                    seen.remove(&id);
+                }
             }
         }
 
@@ -553,7 +602,9 @@ impl FeishuChannel {
                 let mc: MessageContent = serde_json::from_str(&message.content)
                     .map_err(|e| Error::Channel(format!("Failed to parse text content: {}", e)))?;
                 let t = mc.text.unwrap_or_default();
-                if t.is_empty() { return Ok(()); }
+                if t.is_empty() {
+                    return Ok(());
+                }
                 (t, vec![])
             }
             "image" => {
@@ -562,26 +613,41 @@ impl FeishuChannel {
                 let key = mc.image_key.unwrap_or_default();
                 let mut paths = vec![];
                 if !key.is_empty() {
-                    match self.download_media(&message.message_id, &key, "image", None).await {
+                    match self
+                        .download_media(&message.message_id, &key, "image", None)
+                        .await
+                    {
                         Ok(p) => paths.push(p),
                         Err(e) => error!(error = %e, "Failed to download Feishu image"),
                     }
                 }
-                ("[图片，已下载到本地，可直接查看或用 read_file 读取]".to_string(), paths)
+                (
+                    "[图片，已下载到本地，可直接查看或用 read_file 读取]".to_string(),
+                    paths,
+                )
             }
             "file" => {
-                let mc: FileContent = serde_json::from_str(&message.content)
-                    .unwrap_or(FileContent { file_key: None, file_name: None });
+                let mc: FileContent =
+                    serde_json::from_str(&message.content).unwrap_or(FileContent {
+                        file_key: None,
+                        file_name: None,
+                    });
                 let key = mc.file_key.unwrap_or_default();
                 let name = mc.file_name.as_deref();
                 let mut paths = vec![];
                 if !key.is_empty() {
-                    match self.download_media(&message.message_id, &key, "file", name).await {
+                    match self
+                        .download_media(&message.message_id, &key, "file", name)
+                        .await
+                    {
                         Ok(p) => paths.push(p),
                         Err(e) => error!(error = %e, "Failed to download Feishu file"),
                     }
                 }
-                let desc = format!("[文件: {}，已下载到本地，可用 read_file 读取]", name.unwrap_or("unknown"));
+                let desc = format!(
+                    "[文件: {}，已下载到本地，可用 read_file 读取]",
+                    name.unwrap_or("unknown")
+                );
                 (desc, paths)
             }
             "audio" => {
@@ -590,21 +656,33 @@ impl FeishuChannel {
                 let key = mc.file_key.unwrap_or_default();
                 let mut paths = vec![];
                 if !key.is_empty() {
-                    match self.download_media(&message.message_id, &key, "audio", None).await {
+                    match self
+                        .download_media(&message.message_id, &key, "audio", None)
+                        .await
+                    {
                         Ok(p) => paths.push(p),
                         Err(e) => error!(error = %e, "Failed to download Feishu audio"),
                     }
                 }
-                ("[语音消息，已下载到本地，请用 audio_transcribe 工具转写后回复]".to_string(), paths)
+                (
+                    "[语音消息，已下载到本地，请用 audio_transcribe 工具转写后回复]".to_string(),
+                    paths,
+                )
             }
             "video" | "media" => {
-                let mc: VideoContent = serde_json::from_str(&message.content)
-                    .unwrap_or(VideoContent { file_key: None, file_name: None });
+                let mc: VideoContent =
+                    serde_json::from_str(&message.content).unwrap_or(VideoContent {
+                        file_key: None,
+                        file_name: None,
+                    });
                 let key = mc.file_key.unwrap_or_default();
                 let name = mc.file_name.as_deref();
                 let mut paths = vec![];
                 if !key.is_empty() {
-                    match self.download_media(&message.message_id, &key, "video", name).await {
+                    match self
+                        .download_media(&message.message_id, &key, "video", name)
+                        .await
+                    {
                         Ok(p) => paths.push(p),
                         Err(e) => error!(error = %e, "Failed to download Feishu video"),
                     }
@@ -631,6 +709,7 @@ impl FeishuChannel {
 
         let inbound = InboundMessage {
             channel: "feishu".to_string(),
+            account_id: feishu_account_id(&self.config),
             sender_id: sender_id.clone(),
             chat_id: message.chat_id.clone(),
             content: content_text,
@@ -639,6 +718,7 @@ impl FeishuChannel {
                 "message_id": message.message_id,
                 "event_id": header.event_id,
                 "message_type": message.message_type,
+                "chat_type": message.chat_type.as_deref().unwrap_or("p2p"),
             }),
             timestamp_ms: chrono::Utc::now().timestamp_millis(),
         };
@@ -659,10 +739,16 @@ async fn fetch_tenant_access_token(
     app_secret: &str,
 ) -> Result<(String, i64)> {
     #[derive(Serialize)]
-    struct TokenRequest<'a> { app_id: &'a str, app_secret: &'a str }
+    struct TokenRequest<'a> {
+        app_id: &'a str,
+        app_secret: &'a str,
+    }
 
     let resp = client
-        .post(format!("{}/auth/v3/tenant_access_token/internal", FEISHU_OPEN_API))
+        .post(format!(
+            "{}/auth/v3/tenant_access_token/internal",
+            FEISHU_OPEN_API
+        ))
         .json(&TokenRequest { app_id, app_secret })
         .send()
         .await
@@ -686,10 +772,11 @@ async fn fetch_tenant_access_token(
 
 /// Get a cached tenant_access_token for the free send_message function.
 async fn get_cached_token(config: &Config) -> Result<String> {
+    let app_id = config.channels.feishu.app_id.clone();
     let cache = global_token_cache();
     let mut guard = cache.lock().await;
-    if guard.is_valid() {
-        return Ok(guard.token.clone());
+    if let Some(token) = lookup_cached_token(&guard, &app_id) {
+        return Ok(token);
     }
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -701,9 +788,17 @@ async fn get_cached_token(config: &Config) -> Result<String> {
         &config.channels.feishu.app_secret,
     )
     .await?;
-    guard.token = token.clone();
-    guard.expires_at = chrono::Utc::now().timestamp() + expires_in;
-    info!(expires_in = expires_in, "Feishu tenant_access_token refreshed via global cache");
+    store_cached_token(
+        &mut guard,
+        &app_id,
+        &token,
+        chrono::Utc::now().timestamp() + expires_in,
+    );
+    info!(
+        expires_in = expires_in,
+        app_id = %app_id,
+        "Feishu tenant_access_token refreshed via global cache"
+    );
     Ok(token)
 }
 
@@ -716,11 +811,10 @@ fn is_feishu_token_invalid_error(s: &str) -> bool {
         || s.contains("token attached")
 }
 
-async fn invalidate_global_token_cache() {
+async fn invalidate_global_token_cache(app_id: &str) {
     let cache = global_token_cache();
     let mut guard = cache.lock().await;
-    guard.token.clear();
-    guard.expires_at = 0;
+    guard.remove(app_id);
 }
 
 pub async fn send_message(config: &Config, chat_id: &str, text: &str) -> Result<()> {
@@ -737,7 +831,7 @@ pub async fn send_message(config: &Config, chat_id: &str, text: &str) -> Result<
             let msg = e.to_string();
             if is_feishu_token_invalid_error(&msg) {
                 warn!("Feishu send_message got invalid token error, refreshing token and retrying once");
-                invalidate_global_token_cache().await;
+                invalidate_global_token_cache(&config.channels.feishu.app_id).await;
                 let token2 = get_cached_token(config).await?;
                 return do_send_message(&client, &token2, chat_id, text).await;
             }
@@ -779,9 +873,15 @@ async fn upload_feishu_media(
             .part("image", part);
 
         #[derive(Deserialize)]
-        struct Resp { code: i32, msg: String, data: Option<ImgData> }
+        struct Resp {
+            code: i32,
+            msg: String,
+            data: Option<ImgData>,
+        }
         #[derive(Deserialize)]
-        struct ImgData { image_key: String }
+        struct ImgData {
+            image_key: String,
+        }
 
         let resp = client
             .post(format!("{}/im/v1/images", FEISHU_OPEN_API))
@@ -791,12 +891,19 @@ async fn upload_feishu_media(
             .await
             .map_err(|e| Error::Channel(format!("Feishu image upload failed: {}", e)))?;
 
-        let r: Resp = resp.json().await
+        let r: Resp = resp
+            .json()
+            .await
             .map_err(|e| Error::Channel(format!("Feishu image upload parse failed: {}", e)))?;
         if r.code != 0 {
-            return Err(Error::Channel(format!("Feishu image upload error {}: {}", r.code, r.msg)));
+            return Err(Error::Channel(format!(
+                "Feishu image upload error {}: {}",
+                r.code, r.msg
+            )));
         }
-        return r.data.map(|d| d.image_key)
+        return r
+            .data
+            .map(|d| d.image_key)
             .ok_or_else(|| Error::Channel("Feishu image upload: no image_key".to_string()));
     }
 
@@ -810,9 +917,15 @@ async fn upload_feishu_media(
         .part("file", part);
 
     #[derive(Deserialize)]
-    struct Resp { code: i32, msg: String, data: Option<FileData> }
+    struct Resp {
+        code: i32,
+        msg: String,
+        data: Option<FileData>,
+    }
     #[derive(Deserialize)]
-    struct FileData { file_key: String }
+    struct FileData {
+        file_key: String,
+    }
 
     let resp = client
         .post(format!("{}/im/v1/files", FEISHU_OPEN_API))
@@ -822,12 +935,18 @@ async fn upload_feishu_media(
         .await
         .map_err(|e| Error::Channel(format!("Feishu file upload failed: {}", e)))?;
 
-    let r: Resp = resp.json().await
+    let r: Resp = resp
+        .json()
+        .await
         .map_err(|e| Error::Channel(format!("Feishu file upload parse failed: {}", e)))?;
     if r.code != 0 {
-        return Err(Error::Channel(format!("Feishu file upload error {}: {}", r.code, r.msg)));
+        return Err(Error::Channel(format!(
+            "Feishu file upload error {}: {}",
+            r.code, r.msg
+        )));
     }
-    r.data.map(|d| d.file_key)
+    r.data
+        .map(|d| d.file_key)
         .ok_or_else(|| Error::Channel("Feishu file upload: no file_key".to_string()))
 }
 
@@ -892,7 +1011,7 @@ pub async fn send_media_message(config: &Config, chat_id: &str, file_path: &str)
             let msg = e.to_string();
             if is_feishu_token_invalid_error(&msg) {
                 warn!("Feishu send_media_message upload got invalid token error, refreshing token and retrying once");
-                invalidate_global_token_cache().await;
+                invalidate_global_token_cache(&config.channels.feishu.app_id).await;
                 let token2 = get_cached_token(config).await?;
                 upload_feishu_media(&client, &token2, file_path, file_type).await?
             } else {
@@ -932,7 +1051,10 @@ pub async fn send_media_message(config: &Config, chat_id: &str, file_path: &str)
         content: &str,
     ) -> Result<()> {
         let resp = send_client
-            .post(format!("{}/im/v1/messages?receive_id_type=chat_id", FEISHU_OPEN_API))
+            .post(format!(
+                "{}/im/v1/messages?receive_id_type=chat_id",
+                FEISHU_OPEN_API
+            ))
             .header("Authorization", format!("Bearer {}", token))
             .json(&SendReq {
                 receive_id: chat_id,
@@ -945,7 +1067,10 @@ pub async fn send_media_message(config: &Config, chat_id: &str, file_path: &str)
 
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(Error::Channel(format!("Feishu API send media error: {}", body)));
+            return Err(Error::Channel(format!(
+                "Feishu API send media error: {}",
+                body
+            )));
         }
         Ok(())
     }
@@ -956,13 +1081,61 @@ pub async fn send_media_message(config: &Config, chat_id: &str, file_path: &str)
             let msg = e.to_string();
             if is_feishu_token_invalid_error(&msg) {
                 warn!("Feishu send_media_message got invalid token error, refreshing token and retrying once");
-                invalidate_global_token_cache().await;
+                invalidate_global_token_cache(&config.channels.feishu.app_id).await;
                 let token2 = get_cached_token(config).await?;
                 return send_once(&send_client, &token2, chat_id, msg_type, &content).await;
             }
             Err(e)
         }
     }
+}
+
+/// Reply to a specific message in a Feishu group chat.
+/// Uses the `/im/v1/messages/{parent_id}/reply` endpoint so the reply is visually
+/// quoted in the conversation. Falls back to `send_message` on error.
+pub async fn send_reply_message(
+    config: &Config,
+    parent_message_id: &str,
+    text: &str,
+) -> Result<()> {
+    crate::rate_limit::feishu_limiter().acquire().await;
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| Error::Channel(format!("Failed to build HTTP client: {}", e)))?;
+
+    let token = get_cached_token(config).await?;
+
+    #[derive(Serialize)]
+    struct ReplyRequest {
+        msg_type: String,
+        content: String,
+    }
+
+    let content = serde_json::json!({ "text": text }).to_string();
+    let request = ReplyRequest {
+        msg_type: "text".to_string(),
+        content,
+    };
+
+    let url = format!(
+        "{}/im/v1/messages/{}/reply",
+        FEISHU_OPEN_API, parent_message_id
+    );
+
+    let response = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&request)
+        .send()
+        .await
+        .map_err(|e| Error::Channel(format!("Failed to send Feishu reply: {}", e)))?;
+
+    if !response.status().is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(Error::Channel(format!("Feishu reply API error: {}", body)));
+    }
+    Ok(())
 }
 
 async fn do_send_message(client: &Client, token: &str, chat_id: &str, text: &str) -> Result<()> {
@@ -981,7 +1154,10 @@ async fn do_send_message(client: &Client, token: &str, chat_id: &str, text: &str
     };
 
     let response = client
-        .post(format!("{}/im/v1/messages?receive_id_type=chat_id", FEISHU_OPEN_API))
+        .post(format!(
+            "{}/im/v1/messages?receive_id_type=chat_id",
+            FEISHU_OPEN_API
+        ))
         .header("Authorization", format!("Bearer {}", token))
         .json(&request)
         .send()
@@ -993,4 +1169,36 @@ async fn do_send_message(client: &Client, token: &str, chat_id: &str, text: &str
         return Err(Error::Channel(format!("Feishu API error: {}", body)));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_lookup_cached_token_is_scoped_by_app_id() {
+        let mut cache = std::collections::HashMap::new();
+        store_cached_token(
+            &mut cache,
+            "app-a",
+            "token-a",
+            chrono::Utc::now().timestamp() + 7200,
+        );
+        store_cached_token(
+            &mut cache,
+            "app-b",
+            "token-b",
+            chrono::Utc::now().timestamp() + 7200,
+        );
+
+        assert_eq!(
+            lookup_cached_token(&cache, "app-a").as_deref(),
+            Some("token-a")
+        );
+        assert_eq!(
+            lookup_cached_token(&cache, "app-b").as_deref(),
+            Some("token-b")
+        );
+        assert_eq!(lookup_cached_token(&cache, "missing"), None);
+    }
 }

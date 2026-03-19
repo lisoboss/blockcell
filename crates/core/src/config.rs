@@ -1,4 +1,6 @@
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -17,9 +19,12 @@ pub struct ProviderConfig {
     /// 格式："http://host:port" 或 "socks5://host:port"
     #[serde(default)]
     pub proxy: Option<String>,
-    /// API 接口类型："openai" | "anthropic" | "gemini" | "ollama"
+    /// API 接口类型："openai" | "openai_responses" | "anthropic" | "gemini" | "ollama"
     /// 用于前端显示和接口兼容性标识，默认 "openai"（序列化时省略默认值）
-    #[serde(default = "default_api_type", skip_serializing_if = "is_default_api_type")]
+    #[serde(
+        default = "default_api_type",
+        skip_serializing_if = "is_default_api_type"
+    )]
     pub api_type: String,
 }
 
@@ -60,7 +65,17 @@ impl Default for CommunityHubConfig {
 }
 
 /// 一个可用的"模型+供应商"条目，用于 model_pool 多模型高可用配置。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ToolCallMode {
+    #[default]
+    Native,
+    Text,
+    None,
+    Auto,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelEntry {
     /// 模型名称，例如 "deepseek-chat"、"claude-3-5-sonnet"
@@ -79,12 +94,27 @@ pub struct ModelEntry {
     /// 输出价格（USD/1M tokens），可选
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_price: Option<f64>,
+    /// 工具调用模式：
+    /// - native: 使用 API 原生 tools/tool_calls
+    /// - text: 不发送 tools，改为文本协议 <tool_call> ... </tool_call>
+    /// - none: 禁用工具
+    /// - auto: 先尝试 native，失败或被中继剥离后自动退化为 text
+    #[serde(default, skip_serializing_if = "is_default_tool_call_mode")]
+    pub tool_call_mode: ToolCallMode,
 }
 
-fn default_entry_weight() -> u32 { 1 }
-fn default_entry_priority() -> u32 { 1 }
+fn default_entry_weight() -> u32 {
+    1
+}
+fn default_entry_priority() -> u32 {
+    1
+}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+fn is_default_tool_call_mode(mode: &ToolCallMode) -> bool {
+    matches!(mode, ToolCallMode::Native)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentDefaults {
     #[serde(default = "default_workspace")]
@@ -120,6 +150,12 @@ pub struct AgentDefaults {
     /// 若留空，则沿用旧的单 model + provider 配置（向后兼容）。
     #[serde(default)]
     pub model_pool: Vec<ModelEntry>,
+    /// Allowed MCP server names visible to this agent.
+    #[serde(default)]
+    pub allowed_mcp_servers: Vec<String>,
+    /// Allowed MCP tool names visible to this agent.
+    #[serde(default)]
+    pub allowed_mcp_tools: Vec<String>,
 }
 
 fn default_workspace() -> String {
@@ -127,7 +163,7 @@ fn default_workspace() -> String {
 }
 
 fn default_model() -> String {
-    "anthropic/claude-sonnet-4-20250514".to_string()
+    "".to_string()
 }
 
 fn default_max_tokens() -> u32 {
@@ -154,6 +190,10 @@ fn default_max_context_tokens() -> u32 {
     32000
 }
 
+fn default_true() -> bool {
+    true
+}
+
 impl Default for AgentDefaults {
     fn default() -> Self {
         Self {
@@ -169,6 +209,8 @@ impl Default for AgentDefaults {
             evolution_model: None,
             evolution_provider: None,
             model_pool: Vec::new(),
+            allowed_mcp_servers: Vec::new(),
+            allowed_mcp_tools: Vec::new(),
         }
     }
 }
@@ -194,7 +236,7 @@ fn default_ghost_enabled() -> bool {
 }
 
 fn default_ghost_schedule() -> String {
-    "0 */4 * * *" .to_string() // Every 4 hours
+    "0 */4 * * *".to_string() // Every 4 hours
 }
 
 fn default_max_syncs() -> u32 {
@@ -239,6 +281,467 @@ pub struct AgentsConfig {
     pub defaults: AgentDefaults,
     #[serde(default)]
     pub ghost: GhostConfig,
+    /// Optional multi-agent definitions.
+    /// If empty, runtime falls back to a single implicit "default" agent.
+    #[serde(default)]
+    pub list: Vec<AgentProfileConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentProfileConfig {
+    pub id: String,
+    #[serde(default = "default_agent_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub intent_profile: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub model_pool: Vec<ModelEntry>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub max_tool_iterations: Option<u32>,
+    #[serde(default)]
+    pub llm_max_retries: Option<u32>,
+    #[serde(default)]
+    pub llm_retry_delay_ms: Option<u64>,
+    #[serde(default)]
+    pub max_context_tokens: Option<u32>,
+    #[serde(default)]
+    pub evolution_model: Option<String>,
+    #[serde(default)]
+    pub evolution_provider: Option<String>,
+    #[serde(default)]
+    pub allowed_mcp_servers: Option<Vec<String>>,
+    #[serde(default)]
+    pub allowed_mcp_tools: Option<Vec<String>>,
+}
+
+fn default_agent_enabled() -> bool {
+    true
+}
+
+impl Default for AgentProfileConfig {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            enabled: true,
+            name: None,
+            intent_profile: None,
+            model: None,
+            provider: None,
+            model_pool: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            max_tool_iterations: None,
+            llm_max_retries: None,
+            llm_retry_delay_ms: None,
+            max_context_tokens: None,
+            evolution_model: None,
+            evolution_provider: None,
+            allowed_mcp_servers: None,
+            allowed_mcp_tools: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedAgentConfig {
+    pub id: String,
+    pub name: Option<String>,
+    pub defaults: AgentDefaults,
+    pub intent_profile: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IntentToolRuleConfig {
+    #[serde(default = "default_true")]
+    pub inherit_base: bool,
+    #[serde(default)]
+    pub tools: Vec<String>,
+}
+
+impl Default for IntentToolRuleConfig {
+    fn default() -> Self {
+        Self {
+            inherit_base: true,
+            tools: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum IntentToolEntryConfig {
+    Tools(Vec<String>),
+    Rule(IntentToolRuleConfig),
+}
+
+impl IntentToolEntryConfig {
+    pub fn inherit_base(&self) -> bool {
+        match self {
+            Self::Tools(_) => true,
+            Self::Rule(rule) => rule.inherit_base,
+        }
+    }
+
+    pub fn tools(&self) -> &[String] {
+        match self {
+            Self::Tools(tools) => tools,
+            Self::Rule(rule) => &rule.tools,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct IntentToolProfileConfig {
+    #[serde(default)]
+    pub core_tools: Vec<String>,
+    #[serde(default)]
+    pub intent_tools: HashMap<String, IntentToolEntryConfig>,
+    #[serde(default)]
+    pub deny_tools: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IntentRouterConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_intent_router_profile")]
+    pub default_profile: String,
+    #[serde(default)]
+    pub agent_profiles: HashMap<String, String>,
+    #[serde(default = "default_intent_router_profiles")]
+    pub profiles: HashMap<String, IntentToolProfileConfig>,
+}
+
+impl Default for IntentRouterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            default_profile: default_intent_router_profile(),
+            agent_profiles: HashMap::new(),
+            profiles: default_intent_router_profiles(),
+        }
+    }
+}
+
+fn default_intent_router_profile() -> String {
+    "default".to_string()
+}
+
+fn default_intent_router_profiles() -> HashMap<String, IntentToolProfileConfig> {
+    let mut profiles = HashMap::new();
+    profiles.insert(
+        "default".to_string(),
+        IntentToolProfileConfig {
+            core_tools: vec![
+                "read_file".to_string(),
+                "write_file".to_string(),
+                "list_dir".to_string(),
+                "exec".to_string(),
+                "web_search".to_string(),
+                "web_fetch".to_string(),
+                "memory_query".to_string(),
+                "memory_upsert".to_string(),
+                "toggle_manage".to_string(),
+                "message".to_string(),
+                "agent_status".to_string(),
+            ],
+            intent_tools: HashMap::from([
+                (
+                    "Chat".to_string(),
+                    IntentToolEntryConfig::Rule(IntentToolRuleConfig {
+                        inherit_base: false,
+                        tools: vec![],
+                    }),
+                ),
+                (
+                    "FileOps".to_string(),
+                    IntentToolEntryConfig::Tools(vec![
+                        "edit_file".to_string(),
+                        "file_ops".to_string(),
+                        "data_process".to_string(),
+                        "office_write".to_string(),
+                    ]),
+                ),
+                (
+                    "WebSearch".to_string(),
+                    IntentToolEntryConfig::Tools(vec![
+                        "browse".to_string(),
+                        "http_request".to_string(),
+                    ]),
+                ),
+                (
+                    "Finance".to_string(),
+                    IntentToolEntryConfig::Tools(vec![
+                        "http_request".to_string(),
+                        "data_process".to_string(),
+                        "chart_generate".to_string(),
+                        "alert_rule".to_string(),
+                        "stream_subscribe".to_string(),
+                        "knowledge_graph".to_string(),
+                        "cron".to_string(),
+                        "office_write".to_string(),
+                        "browse".to_string(),
+                    ]),
+                ),
+                (
+                    "Blockchain".to_string(),
+                    IntentToolEntryConfig::Tools(vec![
+                        "stream_subscribe".to_string(),
+                        "http_request".to_string(),
+                        "knowledge_graph".to_string(),
+                    ]),
+                ),
+                (
+                    "DataAnalysis".to_string(),
+                    IntentToolEntryConfig::Tools(vec![
+                        "edit_file".to_string(),
+                        "file_ops".to_string(),
+                        "data_process".to_string(),
+                        "chart_generate".to_string(),
+                        "office_write".to_string(),
+                        "http_request".to_string(),
+                    ]),
+                ),
+                (
+                    "Communication".to_string(),
+                    IntentToolEntryConfig::Tools(vec![
+                        "email".to_string(),
+                        "message".to_string(),
+                        "http_request".to_string(),
+                        "community_hub".to_string(),
+                    ]),
+                ),
+                (
+                    "SystemControl".to_string(),
+                    IntentToolEntryConfig::Tools(vec![
+                        "system_info".to_string(),
+                        "capability_evolve".to_string(),
+                        "app_control".to_string(),
+                        "camera_capture".to_string(),
+                        "browse".to_string(),
+                        "image_understand".to_string(),
+                        "termux_api".to_string(),
+                    ]),
+                ),
+                (
+                    "Organization".to_string(),
+                    IntentToolEntryConfig::Tools(vec![
+                        "cron".to_string(),
+                        "memory_forget".to_string(),
+                        "knowledge_graph".to_string(),
+                        "list_tasks".to_string(),
+                        "spawn".to_string(),
+                        "list_skills".to_string(),
+                        "memory_maintenance".to_string(),
+                        "community_hub".to_string(),
+                    ]),
+                ),
+                (
+                    "IoT".to_string(),
+                    IntentToolEntryConfig::Tools(vec![
+                        "http_request".to_string(),
+                        "cron".to_string(),
+                    ]),
+                ),
+                (
+                    "Media".to_string(),
+                    IntentToolEntryConfig::Tools(vec![
+                        "audio_transcribe".to_string(),
+                        "tts".to_string(),
+                        "ocr".to_string(),
+                        "image_understand".to_string(),
+                        "video_process".to_string(),
+                        "file_ops".to_string(),
+                    ]),
+                ),
+                (
+                    "DevOps".to_string(),
+                    IntentToolEntryConfig::Tools(vec![
+                        "network_monitor".to_string(),
+                        "encrypt".to_string(),
+                        "http_request".to_string(),
+                        "edit_file".to_string(),
+                        "file_ops".to_string(),
+                    ]),
+                ),
+                (
+                    "Lifestyle".to_string(),
+                    IntentToolEntryConfig::Tools(vec!["http_request".to_string()]),
+                ),
+                (
+                    "Unknown".to_string(),
+                    IntentToolEntryConfig::Tools(vec![
+                        "edit_file".to_string(),
+                        "file_ops".to_string(),
+                        "office_write".to_string(),
+                        "http_request".to_string(),
+                        "browse".to_string(),
+                        "spawn".to_string(),
+                        "list_tasks".to_string(),
+                        "cron".to_string(),
+                        "memory_forget".to_string(),
+                        "list_skills".to_string(),
+                        "community_hub".to_string(),
+                        "memory_maintenance".to_string(),
+                    ]),
+                ),
+            ]),
+            deny_tools: Vec::new(),
+        },
+    );
+    profiles
+}
+
+fn default_intent_router_option() -> Option<IntentRouterConfig> {
+    Some(IntentRouterConfig::default())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WhatsAppAccountConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_whatsapp_bridge_url")]
+    pub bridge_url: String,
+    #[serde(default)]
+    pub allow_from: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TelegramAccountConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub token: String,
+    #[serde(default)]
+    pub allow_from: Vec<String>,
+    #[serde(default)]
+    pub proxy: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct FeishuAccountConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub app_id: String,
+    #[serde(default)]
+    pub app_secret: String,
+    #[serde(default)]
+    pub encrypt_key: String,
+    #[serde(default)]
+    pub verification_token: String,
+    #[serde(default)]
+    pub allow_from: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SlackAccountConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub bot_token: String,
+    #[serde(default)]
+    pub app_token: String,
+    #[serde(default)]
+    pub channels: Vec<String>,
+    #[serde(default)]
+    pub allow_from: Vec<String>,
+    #[serde(default = "default_slack_poll_interval")]
+    pub poll_interval_secs: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscordAccountConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub bot_token: String,
+    #[serde(default)]
+    pub channels: Vec<String>,
+    #[serde(default)]
+    pub allow_from: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DingTalkAccountConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub app_key: String,
+    #[serde(default)]
+    pub app_secret: String,
+    #[serde(default)]
+    pub robot_code: String,
+    #[serde(default)]
+    pub allow_from: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LarkAccountConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub app_id: String,
+    #[serde(default)]
+    pub app_secret: String,
+    #[serde(default)]
+    pub encrypt_key: String,
+    #[serde(default)]
+    pub verification_token: String,
+    #[serde(default)]
+    pub allow_from: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WeComAccountConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_wecom_mode")]
+    pub mode: String,
+    #[serde(default)]
+    pub corp_id: String,
+    #[serde(default)]
+    pub corp_secret: String,
+    #[serde(default)]
+    pub agent_id: i64,
+    #[serde(default)]
+    pub bot_id: String,
+    #[serde(default)]
+    pub bot_secret: String,
+    #[serde(default)]
+    pub callback_token: String,
+    #[serde(default)]
+    pub encoding_aes_key: String,
+    #[serde(default)]
+    pub allow_from: Vec<String>,
+    #[serde(default = "default_wecom_poll_interval")]
+    pub poll_interval_secs: u32,
+    #[serde(default = "default_wecom_ws_url")]
+    pub ws_url: String,
+    #[serde(default = "default_wecom_ping_interval")]
+    pub ping_interval_secs: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -250,6 +753,11 @@ pub struct WhatsAppConfig {
     pub bridge_url: String,
     #[serde(default)]
     pub allow_from: Vec<String>,
+    /// Multi-account config map. Key is account_id.
+    #[serde(default)]
+    pub accounts: HashMap<String, WhatsAppAccountConfig>,
+    #[serde(default)]
+    pub default_account_id: Option<String>,
 }
 
 impl Default for WhatsAppConfig {
@@ -258,6 +766,8 @@ impl Default for WhatsAppConfig {
             enabled: false,
             bridge_url: default_whatsapp_bridge_url(),
             allow_from: Vec::new(),
+            accounts: HashMap::new(),
+            default_account_id: None,
         }
     }
 }
@@ -277,6 +787,10 @@ pub struct TelegramConfig {
     pub allow_from: Vec<String>,
     #[serde(default)]
     pub proxy: Option<String>,
+    #[serde(default)]
+    pub accounts: HashMap<String, TelegramAccountConfig>,
+    #[serde(default)]
+    pub default_account_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -294,6 +808,10 @@ pub struct FeishuConfig {
     pub verification_token: String,
     #[serde(default)]
     pub allow_from: Vec<String>,
+    #[serde(default)]
+    pub accounts: HashMap<String, FeishuAccountConfig>,
+    #[serde(default)]
+    pub default_account_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -311,6 +829,10 @@ pub struct SlackConfig {
     pub allow_from: Vec<String>,
     #[serde(default = "default_slack_poll_interval")]
     pub poll_interval_secs: u32,
+    #[serde(default)]
+    pub accounts: HashMap<String, SlackAccountConfig>,
+    #[serde(default)]
+    pub default_account_id: Option<String>,
 }
 
 fn default_slack_poll_interval() -> u32 {
@@ -328,6 +850,10 @@ pub struct DiscordConfig {
     pub channels: Vec<String>,
     #[serde(default)]
     pub allow_from: Vec<String>,
+    #[serde(default)]
+    pub accounts: HashMap<String, DiscordAccountConfig>,
+    #[serde(default)]
+    pub default_account_id: Option<String>,
 }
 
 /// 钉钉 (DingTalk) channel configuration.
@@ -349,6 +875,10 @@ pub struct DingTalkConfig {
     /// Allowlist of sender user IDs. Empty = allow all.
     #[serde(default)]
     pub allow_from: Vec<String>,
+    #[serde(default)]
+    pub accounts: HashMap<String, DingTalkAccountConfig>,
+    #[serde(default)]
+    pub default_account_id: Option<String>,
 }
 
 /// Lark (international Feishu) channel configuration.
@@ -369,6 +899,56 @@ pub struct LarkConfig {
     pub verification_token: String,
     #[serde(default)]
     pub allow_from: Vec<String>,
+    #[serde(default)]
+    pub accounts: HashMap<String, LarkAccountConfig>,
+    #[serde(default)]
+    pub default_account_id: Option<String>,
+}
+
+/// QQ Official Bot channel configuration.
+/// Uses Tencent's official QQ Bot API with OAuth2 authentication
+/// and a Discord-like WebSocket gateway protocol.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct QQConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// QQ Bot App ID
+    #[serde(default)]
+    pub app_id: String,
+    /// QQ Bot App Secret
+    #[serde(default)]
+    pub app_secret: String,
+    /// API environment: production or sandbox
+    #[serde(default)]
+    pub environment: String,
+    /// Connection mode: "websocket" (default, no public IP needed) or "webhook" (requires public URL)
+    #[serde(default)]
+    pub mode: String,
+    /// Allowlist of user IDs. Empty = allow all.
+    #[serde(default)]
+    pub allow_from: Vec<String>,
+    #[serde(default)]
+    pub accounts: HashMap<String, QQAccountConfig>,
+    #[serde(default)]
+    pub default_account_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct QQAccountConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub app_id: String,
+    #[serde(default)]
+    pub app_secret: String,
+    #[serde(default)]
+    pub environment: String,
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub allow_from: Vec<String>,
 }
 
 /// 企业微信 (WeCom / WeChat Work) channel configuration.
@@ -378,6 +958,8 @@ pub struct LarkConfig {
 pub struct WeComConfig {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default = "default_wecom_mode")]
+    pub mode: String,
     /// Enterprise corp ID (企业ID)
     #[serde(default)]
     pub corp_id: String,
@@ -387,6 +969,12 @@ pub struct WeComConfig {
     /// Application agent ID (应用AgentId)
     #[serde(default)]
     pub agent_id: i64,
+    /// Long connection bot_id (智能机器人 BotID)
+    #[serde(default)]
+    pub bot_id: String,
+    /// Long connection secret (智能机器人 Secret)
+    #[serde(default)]
+    pub bot_secret: String,
     /// Callback token for message verification (企业微信回调Token)
     #[serde(default)]
     pub callback_token: String,
@@ -399,23 +987,52 @@ pub struct WeComConfig {
     /// Polling interval in seconds (used when callback is not configured). Default: 10.
     #[serde(default = "default_wecom_poll_interval")]
     pub poll_interval_secs: u32,
+    /// Long connection websocket url.
+    #[serde(default = "default_wecom_ws_url")]
+    pub ws_url: String,
+    /// Long connection ping interval in seconds. Default: 30.
+    #[serde(default = "default_wecom_ping_interval")]
+    pub ping_interval_secs: u32,
+    #[serde(default)]
+    pub accounts: HashMap<String, WeComAccountConfig>,
+    #[serde(default)]
+    pub default_account_id: Option<String>,
+}
+
+fn default_wecom_mode() -> String {
+    "webhook".to_string()
 }
 
 fn default_wecom_poll_interval() -> u32 {
     10
 }
 
+fn default_wecom_ws_url() -> String {
+    "wss://openws.work.weixin.qq.com".to_string()
+}
+
+fn default_wecom_ping_interval() -> u32 {
+    30
+}
+
 impl Default for WeComConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            mode: default_wecom_mode(),
             corp_id: String::new(),
             corp_secret: String::new(),
             agent_id: 0,
+            bot_id: String::new(),
+            bot_secret: String::new(),
             callback_token: String::new(),
             encoding_aes_key: String::new(),
             allow_from: Vec::new(),
             poll_interval_secs: default_wecom_poll_interval(),
+            ws_url: default_wecom_ws_url(),
+            ping_interval_secs: default_wecom_ping_interval(),
+            accounts: HashMap::new(),
+            default_account_id: None,
         }
     }
 }
@@ -439,6 +1056,8 @@ pub struct ChannelsConfig {
     pub wecom: WeComConfig,
     #[serde(default)]
     pub lark: LarkConfig,
+    #[serde(default)]
+    pub qq: QQConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -500,8 +1119,13 @@ impl Default for GatewayConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WebSearchConfig {
+    /// Brave Search API key (optional, for brave_search)
     #[serde(default)]
     pub api_key: String,
+    /// Baidu AI Search API key (optional, for baidu_search)
+    /// Get from https://qianfan.baidubce.com — set env BAIDU_API_KEY or this field
+    #[serde(default)]
+    pub baidu_api_key: String,
     #[serde(default = "default_max_results")]
     pub max_results: u32,
 }
@@ -510,6 +1134,7 @@ impl Default for WebSearchConfig {
     fn default() -> Self {
         Self {
             api_key: String::new(),
+            baidu_api_key: String::new(),
             max_results: default_max_results(),
         }
     }
@@ -575,6 +1200,57 @@ fn default_tick_interval() -> u32 {
     30
 }
 
+/// Configuration for the path-access policy system.
+/// Points to the separate `path_access.json5` rules file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PathAccessConfig {
+    /// Whether the path-access policy system is active.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Path to the rules file. Supports `~/` expansion.
+    #[serde(default = "default_path_access_policy_file")]
+    pub policy_file: String,
+
+    /// Behavior when the policy file is missing or unparseable.
+    /// One of: `"fallback_to_safe_default"` | `"fail_closed"` | `"disabled"`
+    #[serde(default = "default_missing_file_policy")]
+    pub missing_file_policy: String,
+
+    /// Reserved for future hot-reload support.
+    #[serde(default)]
+    pub reload_on_change: bool,
+}
+
+fn default_path_access_policy_file() -> String {
+    "~/.blockcell/path_access.json5".to_string()
+}
+
+fn default_missing_file_policy() -> String {
+    "fallback_to_safe_default".to_string()
+}
+
+impl Default for PathAccessConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            policy_file: default_path_access_policy_file(),
+            missing_file_policy: default_missing_file_policy(),
+            reload_on_change: false,
+        }
+    }
+}
+
+/// Top-level security settings for the agent runtime.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SecurityConfig {
+    /// Path-access policy rules.
+    #[serde(default)]
+    pub path_access: PathAccessConfig,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AutoUpgradeConfig {
@@ -602,46 +1278,6 @@ fn default_manifest_url() -> String {
     "https://github.com/blockcell-labs/blockcell/releases/latest/download/manifest.json".to_string()
 }
 
-/// MCP (Model Context Protocol) server configuration.
-/// Each entry describes one external MCP server process to launch at startup.
-///
-/// Example config.json:
-/// ```json
-/// "mcpServers": {
-///   "sqlite": {
-///     "command": "uvx",
-///     "args": ["mcp-server-sqlite", "--db-path", "/tmp/test.db"]
-///   },
-///   "github": {
-///     "command": "npx",
-///     "args": ["-y", "@modelcontextprotocol/server-github"],
-///     "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_xxx" }
-///   }
-/// }
-/// ```
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct McpServerConfig {
-    /// Executable to launch (e.g. "npx", "uvx", "python")
-    pub command: String,
-    /// Command-line arguments
-    #[serde(default)]
-    pub args: Vec<String>,
-    /// Extra environment variables for the child process
-    #[serde(default)]
-    pub env: HashMap<String, String>,
-    /// Working directory for the child process (optional)
-    #[serde(default)]
-    pub cwd: Option<String>,
-    /// Whether this server is enabled (default: true)
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-}
-
-fn default_true() -> bool {
-    true
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
@@ -655,96 +1291,144 @@ pub struct Config {
     pub agents: AgentsConfig,
     #[serde(default)]
     pub channels: ChannelsConfig,
+    /// Simplified multi-agent routing table: channel -> owner agent id.
+    #[serde(default)]
+    pub channel_owners: HashMap<String, String>,
+    /// Account-level routing overrides: channel -> account_id -> owner agent id.
+    #[serde(default)]
+    pub channel_account_owners: HashMap<String, HashMap<String, String>>,
     #[serde(default)]
     pub gateway: GatewayConfig,
     #[serde(default)]
     pub tools: ToolsConfig,
+    #[serde(
+        default = "default_intent_router_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub intent_router: Option<IntentRouterConfig>,
     #[serde(default)]
     pub auto_upgrade: AutoUpgradeConfig,
-    /// MCP server definitions. Key = server name (used as tool name prefix).
     #[serde(default)]
-    pub mcp_servers: HashMap<String, McpServerConfig>,
+    pub security: SecurityConfig,
 }
 
 impl Default for Config {
     fn default() -> Self {
         let mut providers = HashMap::new();
-        providers.insert("openrouter".to_string(), ProviderConfig {
-            api_key: String::new(),
-            api_base: Some("https://openrouter.ai/api/v1".to_string()),
-            proxy: None,
-            api_type: "openai".to_string(),
-        });
+        providers.insert(
+            "openrouter".to_string(),
+            ProviderConfig {
+                api_key: String::new(),
+                api_base: Some("https://openrouter.ai/api/v1".to_string()),
+                proxy: None,
+                api_type: "openai".to_string(),
+            },
+        );
         providers.insert("anthropic".to_string(), ProviderConfig::default());
         providers.insert("openai".to_string(), ProviderConfig::default());
         providers.insert("deepseek".to_string(), ProviderConfig::default());
-        providers.insert("groq".to_string(), ProviderConfig {
-            api_key: String::new(),
-            api_base: Some("https://api.groq.com/openai/v1".to_string()),
-            proxy: None,
-            api_type: "openai".to_string(),
-        });
+        providers.insert(
+            "groq".to_string(),
+            ProviderConfig {
+                api_key: String::new(),
+                api_base: Some("https://api.groq.com/openai/v1".to_string()),
+                proxy: None,
+                api_type: "openai".to_string(),
+            },
+        );
         providers.insert("zhipu".to_string(), ProviderConfig::default());
-        providers.insert("vllm".to_string(), ProviderConfig {
-            api_key: "dummy".to_string(),
-            api_base: Some("http://localhost:8000/v1".to_string()),
-            proxy: None,
-            api_type: "openai".to_string(),
-        });
-        providers.insert("gemini".to_string(), ProviderConfig {
-            api_key: String::new(),
-            api_base: Some("https://generativelanguage.googleapis.com/v1beta/openai".to_string()),
-            proxy: None,
-            api_type: "openai".to_string(),
-        });
-        providers.insert("kimi".to_string(), ProviderConfig {
-            api_key: String::new(),
-            api_base: Some("https://api.moonshot.ai/v1".to_string()),
-            proxy: None,
-            api_type: "openai".to_string(),
-        });
-        providers.insert("xai".to_string(), ProviderConfig {
-            api_key: String::new(),
-            api_base: Some("https://api.x.ai/v1".to_string()),
-            proxy: None,
-            api_type: "openai".to_string(),
-        });
-        providers.insert("mistral".to_string(), ProviderConfig {
-            api_key: String::new(),
-            api_base: Some("https://api.mistral.ai/v1".to_string()),
-            proxy: None,
-            api_type: "openai".to_string(),
-        });
-        providers.insert("minimax".to_string(), ProviderConfig {
-            api_key: String::new(),
-            api_base: Some("https://api.minimax.chat/v1".to_string()),
-            proxy: None,
-            api_type: "anthropic".to_string(),
-        });
-        providers.insert("qwen".to_string(), ProviderConfig {
-            api_key: String::new(),
-            api_base: Some("https://api.qwen.ai/v1".to_string()),
-            proxy: None,
-            api_type: "openai".to_string(),
-        });
-        providers.insert("glm".to_string(), ProviderConfig {
-            api_key: String::new(),
-            api_base: Some("https://api.z.ai/v1".to_string()),
-            proxy: None,
-            api_type: "openai".to_string(),
-        });
-        providers.insert("siliconflow".to_string(), ProviderConfig {
-            api_key: String::new(),
-            api_base: Some("https://api.siliconflow.cn/v1".to_string()),
-            proxy: None,
-            api_type: "openai".to_string(),
-        });
-        providers.insert("ollama".to_string(), ProviderConfig {
-            api_key: "ollama".to_string(),
-            api_base: Some("http://localhost:11434".to_string()),
-            proxy: None,
-            api_type: "ollama".to_string(),
-        });
+        providers.insert(
+            "vllm".to_string(),
+            ProviderConfig {
+                api_key: "dummy".to_string(),
+                api_base: Some("http://localhost:8000/v1".to_string()),
+                proxy: None,
+                api_type: "openai".to_string(),
+            },
+        );
+        providers.insert(
+            "gemini".to_string(),
+            ProviderConfig {
+                api_key: String::new(),
+                api_base: Some(
+                    "https://generativelanguage.googleapis.com/v1beta/openai".to_string(),
+                ),
+                proxy: None,
+                api_type: "openai".to_string(),
+            },
+        );
+        providers.insert(
+            "kimi".to_string(),
+            ProviderConfig {
+                api_key: String::new(),
+                api_base: Some("https://api.moonshot.cn/v1".to_string()),
+                proxy: None,
+                api_type: "openai".to_string(),
+            },
+        );
+        providers.insert(
+            "xai".to_string(),
+            ProviderConfig {
+                api_key: String::new(),
+                api_base: Some("https://api.x.ai/v1".to_string()),
+                proxy: None,
+                api_type: "openai".to_string(),
+            },
+        );
+        providers.insert(
+            "mistral".to_string(),
+            ProviderConfig {
+                api_key: String::new(),
+                api_base: Some("https://api.mistral.ai/v1".to_string()),
+                proxy: None,
+                api_type: "openai".to_string(),
+            },
+        );
+        providers.insert(
+            "minimax".to_string(),
+            ProviderConfig {
+                api_key: String::new(),
+                api_base: Some("https://api.minimaxi.com/v1".to_string()),
+                proxy: None,
+                api_type: "anthropic".to_string(),
+            },
+        );
+        providers.insert(
+            "qwen".to_string(),
+            ProviderConfig {
+                api_key: String::new(),
+                api_base: Some("https://api.qwen.ai/v1".to_string()),
+                proxy: None,
+                api_type: "openai".to_string(),
+            },
+        );
+        providers.insert(
+            "glm".to_string(),
+            ProviderConfig {
+                api_key: String::new(),
+                api_base: Some("https://api.z.ai/v1".to_string()),
+                proxy: None,
+                api_type: "openai".to_string(),
+            },
+        );
+        providers.insert(
+            "siliconflow".to_string(),
+            ProviderConfig {
+                api_key: String::new(),
+                api_base: Some("https://api.siliconflow.cn/v1".to_string()),
+                proxy: None,
+                api_type: "openai".to_string(),
+            },
+        );
+        providers.insert(
+            "ollama".to_string(),
+            ProviderConfig {
+                api_key: "ollama".to_string(),
+                api_base: Some("http://localhost:11434".to_string()),
+                proxy: None,
+                api_type: "ollama".to_string(),
+            },
+        );
 
         Self {
             providers,
@@ -752,18 +1436,138 @@ impl Default for Config {
             community_hub: CommunityHubConfig::default(),
             agents: AgentsConfig::default(),
             channels: ChannelsConfig::default(),
+            channel_owners: HashMap::new(),
+            channel_account_owners: HashMap::new(),
             gateway: GatewayConfig::default(),
             tools: ToolsConfig::default(),
+            intent_router: Some(IntentRouterConfig::default()),
             auto_upgrade: AutoUpgradeConfig::default(),
-            mcp_servers: HashMap::new(),
+            security: SecurityConfig::default(),
         }
     }
+}
+
+fn format_json5_parse_error(
+    path: Option<&Path>,
+    context: &str,
+    error: &json5::Error,
+) -> crate::error::Error {
+    let path_text = path
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<inline>".to_string());
+    crate::error::Error::Config(format!(
+        "{} parse error in {}: {}",
+        context, path_text, error
+    ))
+}
+
+fn expand_env_vars_in_text(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut index = 0usize;
+
+    while let Some(relative_start) = content[index..].find("${") {
+        let start = index + relative_start;
+        out.push_str(&content[index..start]);
+
+        let expr_start = start + 2;
+        if let Some(relative_end) = content[expr_start..].find('}') {
+            let end = expr_start + relative_end;
+            let expr = &content[expr_start..end];
+            out.push_str(&expand_env_expr(expr));
+            index = end + 1;
+        } else {
+            out.push_str(&content[start..]);
+            return out;
+        }
+    }
+
+    out.push_str(&content[index..]);
+    out
+}
+
+fn expand_env_expr(expr: &str) -> String {
+    if let Some((name, default)) = expr.split_once(":-") {
+        let name = name.trim();
+        if name.is_empty() {
+            return String::new();
+        }
+        return std::env::var(name)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| default.to_string());
+    }
+
+    let name = expr.trim();
+    if name.is_empty() {
+        return String::new();
+    }
+
+    std::env::var(name).unwrap_or_default()
+}
+
+pub fn parse_json5_str<T>(content: &str) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    parse_json5_str_with_context(content, None, "JSON5")
+}
+
+pub fn parse_json5_str_with_context<T>(
+    content: &str,
+    path: Option<&Path>,
+    context: &str,
+) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    let expanded = expand_env_vars_in_text(content);
+    json5::from_str(&expanded).map_err(|e| format_json5_parse_error(path, context, &e))
+}
+
+pub fn parse_json5_value(content: &str) -> Result<Value> {
+    parse_json5_str(content)
+}
+
+pub fn stringify_json5_pretty<T>(value: &T) -> Result<String>
+where
+    T: Serialize,
+{
+    Ok(serde_json::to_string_pretty(value)?)
+}
+
+pub fn write_json5_pretty<T>(path: &Path, value: &T) -> Result<()>
+where
+    T: Serialize,
+{
+    let content = stringify_json5_pretty(value)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, content)?;
+    Ok(())
+}
+
+pub fn validate_config_json5_str(content: &str) -> Result<Config> {
+    parse_json5_str(content)
+}
+
+pub fn validate_config_json5_file(path: &Path, content: &str) -> Result<Config> {
+    parse_json5_str_with_context(content, Some(path), "Config JSON5")
+}
+
+pub fn write_raw_validated_config_json5(path: &Path, content: &str) -> Result<Config> {
+    let config = validate_config_json5_str(content)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, content)?;
+    Ok(config)
 }
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        let config: Config = serde_json::from_str(&content)?;
+        let config: Config = validate_config_json5_file(path, &content)?;
         Ok(config)
     }
 
@@ -777,17 +1581,21 @@ impl Config {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        let content = serde_json::to_string_pretty(self)?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(path, content)?;
-        Ok(())
+        write_json5_pretty(path, self)
     }
 
     pub fn get_api_key(&self) -> Option<(&str, &ProviderConfig)> {
         let priority = [
-            "openrouter", "deepseek", "anthropic", "openai", "kimi", "gemini", "zhipu", "groq", "vllm", "ollama",
+            "openrouter",
+            "deepseek",
+            "anthropic",
+            "openai",
+            "kimi",
+            "gemini",
+            "zhipu",
+            "groq",
+            "vllm",
+            "ollama",
         ];
 
         for name in priority {
@@ -823,11 +1631,310 @@ impl Config {
         }
         None
     }
+
+    pub fn resolve_channel_owner(&self, channel: &str) -> Option<&str> {
+        self.channel_owners
+            .get(channel)
+            .map(|owner| owner.as_str())
+            .filter(|owner| !owner.trim().is_empty())
+    }
+
+    pub fn resolve_channel_account_owner(&self, channel: &str, account_id: &str) -> Option<&str> {
+        let account_id = account_id.trim();
+        if account_id.is_empty() {
+            return None;
+        }
+
+        self.channel_account_owners
+            .get(channel)
+            .and_then(|owners| owners.get(account_id))
+            .map(|owner| owner.as_str())
+            .filter(|owner| !owner.trim().is_empty())
+    }
+
+    pub fn resolve_effective_channel_owner(
+        &self,
+        channel: &str,
+        account_id: Option<&str>,
+    ) -> Option<&str> {
+        account_id
+            .and_then(|account_id| self.resolve_channel_account_owner(channel, account_id))
+            .or_else(|| self.resolve_channel_owner(channel))
+    }
+
+    pub fn is_external_channel_enabled(&self, channel: &str) -> bool {
+        match channel {
+            "telegram" => self.channels.telegram.enabled,
+            "whatsapp" => self.channels.whatsapp.enabled,
+            "feishu" => self.channels.feishu.enabled,
+            "slack" => self.channels.slack.enabled,
+            "discord" => self.channels.discord.enabled,
+            "dingtalk" => self.channels.dingtalk.enabled,
+            "wecom" => self.channels.wecom.enabled,
+            "lark" => self.channels.lark.enabled,
+            "qq" => self.channels.qq.enabled,
+            _ => false,
+        }
+    }
+
+    pub fn known_agent_ids(&self) -> Vec<String> {
+        let mut ids = vec!["default".to_string()];
+        for agent in self.agents.list.iter().filter(|agent| agent.enabled) {
+            let agent_id = agent.id.trim();
+            if agent_id.is_empty() || agent_id == "default" {
+                continue;
+            }
+            if !ids.iter().any(|id| id == agent_id) {
+                ids.push(agent_id.to_string());
+            }
+        }
+        ids
+    }
+
+    pub fn agent_exists(&self, agent_id: &str) -> bool {
+        let agent_id = agent_id.trim();
+        !agent_id.is_empty() && self.known_agent_ids().iter().any(|id| id == agent_id)
+    }
+
+    pub fn resolve_agent_spec(&self, agent_id: &str) -> Option<ResolvedAgentConfig> {
+        let agent_id = agent_id.trim();
+        if agent_id.is_empty() {
+            return None;
+        }
+
+        let agent = self
+            .agents
+            .list
+            .iter()
+            .find(|agent| agent.enabled && agent.id.trim() == agent_id);
+
+        if agent_id != "default" && agent.is_none() {
+            return None;
+        }
+
+        let mut defaults = self.agents.defaults.clone();
+        if let Some(agent) = agent {
+            let explicit_model = agent
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            let explicit_provider = agent
+                .provider
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            let has_single_model_override = explicit_model.is_some() || explicit_provider.is_some();
+
+            if let Some(model) = explicit_model {
+                defaults.model = model;
+            }
+            if let Some(provider) = explicit_provider {
+                defaults.provider = Some(provider);
+            }
+            if !agent.model_pool.is_empty() {
+                defaults.model_pool = agent.model_pool.clone();
+            } else if has_single_model_override {
+                defaults.model_pool.clear();
+            }
+            if let Some(max_tokens) = agent.max_tokens {
+                defaults.max_tokens = max_tokens;
+            }
+            if let Some(temperature) = agent.temperature {
+                defaults.temperature = temperature;
+            }
+            if let Some(max_tool_iterations) = agent.max_tool_iterations {
+                defaults.max_tool_iterations = max_tool_iterations;
+            }
+            if let Some(llm_max_retries) = agent.llm_max_retries {
+                defaults.llm_max_retries = llm_max_retries;
+            }
+            if let Some(llm_retry_delay_ms) = agent.llm_retry_delay_ms {
+                defaults.llm_retry_delay_ms = llm_retry_delay_ms;
+            }
+            if let Some(max_context_tokens) = agent.max_context_tokens {
+                defaults.max_context_tokens = max_context_tokens;
+            }
+            if let Some(evolution_model) = agent
+                .evolution_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+            {
+                defaults.evolution_model = Some(evolution_model);
+            }
+            if let Some(evolution_provider) = agent
+                .evolution_provider
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+            {
+                defaults.evolution_provider = Some(evolution_provider);
+            }
+            if let Some(allowed_mcp_servers) = &agent.allowed_mcp_servers {
+                defaults.allowed_mcp_servers = allowed_mcp_servers.clone();
+            }
+            if let Some(allowed_mcp_tools) = &agent.allowed_mcp_tools {
+                defaults.allowed_mcp_tools = allowed_mcp_tools.clone();
+            }
+        }
+
+        Some(ResolvedAgentConfig {
+            id: agent_id.to_string(),
+            name: agent.and_then(|entry| entry.name.clone()),
+            defaults,
+            intent_profile: self.resolve_intent_profile_id(Some(agent_id)),
+        })
+    }
+
+    pub fn resolved_agents(&self) -> Vec<ResolvedAgentConfig> {
+        self.known_agent_ids()
+            .into_iter()
+            .filter_map(|agent_id| self.resolve_agent_spec(&agent_id))
+            .collect()
+    }
+
+    pub fn config_for_agent(&self, agent_id: &str) -> Option<Config> {
+        let resolved = self.resolve_agent_spec(agent_id)?;
+        let mut config = self.clone();
+        config.agents.defaults = resolved.defaults;
+        Some(config)
+    }
+
+    pub fn resolve_intent_profile_id(&self, agent_id: Option<&str>) -> Option<String> {
+        let router = self.intent_router.clone().unwrap_or_default();
+
+        let requested_agent_id = agent_id.map(str::trim).filter(|id| !id.is_empty());
+
+        if let Some(agent_id) = requested_agent_id {
+            if let Some(profile) = self
+                .agents
+                .list
+                .iter()
+                .find(|agent| agent.enabled && agent.id.trim() == agent_id)
+                .and_then(|agent| agent.intent_profile.as_deref())
+                .map(str::trim)
+                .filter(|profile| !profile.is_empty())
+            {
+                return Some(profile.to_string());
+            }
+
+            if let Some(profile) = router
+                .agent_profiles
+                .get(agent_id)
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|profile| !profile.is_empty())
+            {
+                return Some(profile.to_string());
+            }
+        }
+
+        let default_profile = router.default_profile.trim();
+        if default_profile.is_empty() {
+            None
+        } else {
+            Some(default_profile.to_string())
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    fn temp_config_path(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("blockcell-config-tests-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp test dir");
+        dir.join(name)
+    }
+
+    #[test]
+    fn test_config_load_accepts_json5_comments_and_trailing_commas() {
+        let path = temp_config_path("config.json5");
+        fs::write(
+            &path,
+            r#"{
+  // provider config in JSON5
+  providers: {
+    openai: {
+      apiKey: 'sk-test',
+    },
+  },
+  agents: {
+    defaults: {
+      model: 'gpt-4.1',
+    },
+  },
+}"#,
+        )
+        .expect("write config.json5");
+
+        let cfg = Config::load(&path).expect("load json5 config");
+        assert_eq!(cfg.agents.defaults.model, "gpt-4.1");
+        assert_eq!(
+            cfg.providers.get("openai").map(|p| p.api_key.as_str()),
+            Some("sk-test")
+        );
+    }
+
+    #[test]
+    fn test_config_save_round_trips_via_json5_loader() {
+        let path = temp_config_path("config.json5");
+        let mut cfg = Config::default();
+        cfg.agents.defaults.model = "deepseek-chat".to_string();
+
+        cfg.save(&path).expect("save config json5");
+        let content = fs::read_to_string(&path).expect("read saved config");
+        assert!(content.contains("deepseek-chat"));
+
+        let loaded = Config::load(&path).expect("reload saved config");
+        assert_eq!(loaded.agents.defaults.model, "deepseek-chat");
+    }
+
+    #[test]
+    fn test_config_load_expands_env_vars_in_json5() {
+        let path = temp_config_path("config.json5");
+        unsafe {
+            std::env::set_var("BLOCKCELL_TEST_OPENAI_KEY", "sk-from-env");
+            std::env::remove_var("BLOCKCELL_TEST_MODEL");
+        }
+
+        fs::write(
+            &path,
+            r#"{
+  providers: {
+    openai: {
+      apiKey: "${BLOCKCELL_TEST_OPENAI_KEY}",
+    },
+  },
+  agents: {
+    defaults: {
+      model: "${BLOCKCELL_TEST_MODEL:-gpt-4.1}",
+    },
+  },
+}"#,
+        )
+        .expect("write config.json5");
+
+        let cfg = Config::load(&path).expect("load env-expanded json5 config");
+        assert_eq!(
+            cfg.providers.get("openai").map(|p| p.api_key.as_str()),
+            Some("sk-from-env")
+        );
+        assert_eq!(cfg.agents.defaults.model, "gpt-4.1");
+
+        unsafe {
+            std::env::remove_var("BLOCKCELL_TEST_OPENAI_KEY");
+            std::env::remove_var("BLOCKCELL_TEST_MODEL");
+        }
+    }
 
     #[test]
     fn test_community_hub_top_level() {
@@ -836,7 +1943,306 @@ mod tests {
   "providers": {}
 }"#;
         let cfg: Config = serde_json::from_str(raw).unwrap();
-        assert_eq!(cfg.community_hub_url().as_deref(), Some("http://example.com"));
+        assert_eq!(
+            cfg.community_hub_url().as_deref(),
+            Some("http://example.com")
+        );
         assert_eq!(cfg.community_hub_api_key().as_deref(), Some("k"));
+    }
+
+    #[test]
+    fn test_channel_owners_and_accounts_deserialize() {
+        let raw = r#"{
+  "agents": {
+    "list": [
+      { "id": "chat", "enabled": true }
+    ]
+  },
+  "channelOwners": {
+    "telegram": "chat"
+  },
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "defaultAccountId": "default",
+      "accounts": {
+        "default": {
+          "enabled": true,
+          "token": "tg-token"
+        }
+      }
+    }
+  }
+}"#;
+        let cfg: Config = serde_json::from_str(raw).unwrap();
+        assert_eq!(cfg.resolve_channel_owner("telegram"), Some("chat"));
+        assert!(cfg.is_external_channel_enabled("telegram"));
+        assert_eq!(
+            cfg.channels.telegram.default_account_id.as_deref(),
+            Some("default")
+        );
+        let acc = cfg.channels.telegram.accounts.get("default").unwrap();
+        assert_eq!(acc.token, "tg-token");
+        assert!(cfg.agent_exists("chat"));
+    }
+
+    #[test]
+    fn test_channel_account_owner_override_deserializes_and_resolves() {
+        let raw = r#"{
+  "agents": {
+    "list": [
+      { "id": "ops", "enabled": true }
+    ]
+  },
+  "channelOwners": {
+    "telegram": "default"
+  },
+  "channelAccountOwners": {
+    "telegram": {
+      "bot2": "ops"
+    }
+  },
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "accounts": {
+        "bot1": { "enabled": true, "token": "tg-bot1" },
+        "bot2": { "enabled": true, "token": "tg-bot2" }
+      }
+    }
+  }
+}"#;
+        let cfg: Config = serde_json::from_str(raw).unwrap();
+
+        assert_eq!(
+            cfg.resolve_channel_account_owner("telegram", "bot2"),
+            Some("ops")
+        );
+        assert_eq!(
+            cfg.resolve_effective_channel_owner("telegram", Some("bot2")),
+            Some("ops")
+        );
+        assert_eq!(
+            cfg.resolve_effective_channel_owner("telegram", Some("bot1")),
+            Some("default")
+        );
+        assert_eq!(
+            cfg.resolve_effective_channel_owner("telegram", None),
+            Some("default")
+        );
+    }
+
+    #[test]
+    fn test_channel_account_owner_resolution_ignores_blank_values() {
+        let raw = r#"{
+  "channelOwners": {
+    "telegram": "default"
+  },
+  "channelAccountOwners": {
+    "telegram": {
+      "bot1": "   "
+    }
+  }
+}"#;
+        let cfg: Config = serde_json::from_str(raw).unwrap();
+
+        assert_eq!(cfg.resolve_channel_account_owner("telegram", "bot1"), None);
+        assert_eq!(
+            cfg.resolve_effective_channel_owner("telegram", Some("bot1")),
+            Some("default")
+        );
+    }
+
+    #[test]
+    fn test_legacy_single_channel_fields_still_work() {
+        let raw = r#"{
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "token": "legacy-token"
+    }
+  }
+}"#;
+        let cfg: Config = serde_json::from_str(raw).unwrap();
+        assert_eq!(cfg.channels.telegram.token, "legacy-token");
+        assert!(cfg.channels.telegram.accounts.is_empty());
+        assert_eq!(cfg.channels.telegram.default_account_id, None);
+        assert!(cfg.agent_exists("default"));
+    }
+
+    #[test]
+    fn test_known_agent_ids_fallback_to_default() {
+        let cfg = Config::default();
+        let ids = cfg.known_agent_ids();
+        assert_eq!(ids, vec!["default".to_string()]);
+    }
+
+    #[test]
+    fn test_intent_router_deserializes_and_resolves_agent_profile() {
+        let raw = r#"{
+  "agents": {
+    "list": [
+      { "id": "ops", "enabled": true, "intentProfile": "ops" }
+    ]
+  },
+  "intentRouter": {
+    "enabled": true,
+    "defaultProfile": "default",
+    "profiles": {
+      "default": {
+        "coreTools": ["read_file", "message"],
+        "intentTools": {
+          "Chat": { "inheritBase": false, "tools": [] },
+          "Unknown": ["browse"]
+        }
+      },
+      "ops": {
+        "coreTools": ["read_file", "exec"],
+        "intentTools": {
+          "DevOps": ["git_api"],
+          "Unknown": ["http_request"]
+        },
+        "denyTools": ["email"]
+      }
+    }
+  }
+}"#;
+
+        let cfg: Config = serde_json::from_str(raw).unwrap();
+        let router = cfg.intent_router.as_ref().expect("intent router");
+        assert!(router.enabled);
+        assert_eq!(
+            cfg.resolve_intent_profile_id(Some("ops")),
+            Some("ops".to_string())
+        );
+        assert_eq!(
+            cfg.resolve_intent_profile_id(Some("missing")),
+            Some("default".to_string())
+        );
+        assert_eq!(
+            cfg.resolve_intent_profile_id(None),
+            Some("default".to_string())
+        );
+    }
+
+    #[test]
+    fn test_default_config_includes_intent_router_defaults() {
+        let cfg = Config::default();
+        let router = cfg.intent_router.as_ref().expect("default intent router");
+
+        assert!(router.profiles.contains_key("default"));
+        assert_eq!(
+            cfg.resolve_intent_profile_id(Some("default")),
+            Some("default".to_string())
+        );
+    }
+
+    #[test]
+    fn test_missing_intent_router_uses_default_router() {
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        let router = cfg.intent_router.as_ref().expect("defaulted intent router");
+
+        assert!(router.enabled);
+        assert!(router.profiles.contains_key("default"));
+        assert_eq!(
+            cfg.resolve_intent_profile_id(None),
+            Some("default".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolved_agent_falls_back_to_implicit_default() {
+        let cfg = Config::default();
+        let resolved = cfg
+            .resolve_agent_spec("default")
+            .expect("implicit default agent");
+
+        assert_eq!(resolved.id, "default");
+        assert_eq!(resolved.defaults.model, cfg.agents.defaults.model);
+        assert_eq!(resolved.defaults.provider, cfg.agents.defaults.provider);
+        assert_eq!(resolved.intent_profile.as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn test_resolved_agent_inherits_and_overrides_defaults() {
+        let raw = r#"{
+  "agents": {
+    "defaults": {
+      "model": "deepseek-chat",
+      "provider": "deepseek",
+      "modelPool": [
+        { "model": "deepseek-chat", "provider": "deepseek", "weight": 1, "priority": 1 }
+      ]
+    },
+    "list": [
+      {
+        "id": "ops",
+        "enabled": true,
+        "intentProfile": "ops",
+        "model": "gpt-4.1",
+        "provider": "openai"
+      }
+    ]
+  },
+  "intentRouter": {
+    "enabled": true,
+    "defaultProfile": "default",
+    "profiles": {
+      "default": {
+        "coreTools": ["read_file"],
+        "intentTools": { "Unknown": [] }
+      },
+      "ops": {
+        "coreTools": ["exec"],
+        "intentTools": { "Unknown": ["http_request"] }
+      }
+    }
+  }
+}"#;
+
+        let cfg: Config = serde_json::from_str(raw).unwrap();
+        let resolved = cfg.resolve_agent_spec("ops").expect("resolved ops agent");
+
+        assert_eq!(resolved.id, "ops");
+        assert_eq!(resolved.defaults.model, "gpt-4.1");
+        assert_eq!(resolved.defaults.provider.as_deref(), Some("openai"));
+        assert!(
+            resolved.defaults.model_pool.is_empty(),
+            "explicit model/provider override should disable inherited model_pool"
+        );
+        assert_eq!(resolved.intent_profile.as_deref(), Some("ops"));
+    }
+
+    #[test]
+    fn test_resolved_agents_always_include_default() {
+        let raw = r#"{
+  "agents": {
+    "list": [
+      { "id": "ops", "enabled": true, "intentProfile": "ops" }
+    ]
+  },
+  "intentRouter": {
+    "enabled": true,
+    "defaultProfile": "default",
+    "profiles": {
+      "default": {
+        "coreTools": ["read_file"],
+        "intentTools": { "Unknown": [] }
+      },
+      "ops": {
+        "coreTools": ["exec"],
+        "intentTools": { "Unknown": ["http_request"] }
+      }
+    }
+  }
+}"#;
+
+        let cfg: Config = serde_json::from_str(raw).unwrap();
+        let ids: Vec<String> = cfg
+            .resolved_agents()
+            .into_iter()
+            .map(|agent| agent.id)
+            .collect();
+        assert_eq!(ids, vec!["default".to_string(), "ops".to_string()]);
     }
 }

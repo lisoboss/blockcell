@@ -1,7 +1,6 @@
 # Article 01: What Is blockcell? A Self-Evolving AI Agent Framework
 
-> Series: *In-Depth Analysis of the Open Source Project “blockcell”* — 1/14
-
+> Series: *In-Depth Analysis of the Open Source Project “blockcell”* — Article 1
 ---
 
 ## Start with a scenario
@@ -167,7 +166,7 @@ curl -fsSL https://raw.githubusercontent.com/blockcell-labs/blockcell/refs/heads
 blockcell onboard
 
 # Edit config and add your API key
-# ~/.blockcell/config.json
+# ~/.blockcell/config.json5
 
 # Start chatting
 blockcell agent

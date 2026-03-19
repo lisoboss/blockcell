@@ -1,0 +1,9 @@
+name: shell
+description: 执行明确的本机命令并整理结果
+tools:
+  - exec
+permissions:
+  - system.exec
+fallback:
+  strategy: error
+  message: 当前无法完成命令执行。请检查命令、权限或运行环境。

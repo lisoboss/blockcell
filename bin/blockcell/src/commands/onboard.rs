@@ -1,4 +1,7 @@
-use blockcell_core::Paths;
+use blockcell_core::{
+    config::{parse_json5_value, stringify_json5_pretty, write_raw_validated_config_json5},
+    Paths,
+};
 use std::io::{self, Write};
 use std::process::Command;
 
@@ -60,118 +63,68 @@ const HEARTBEAT_MD: &str = r#"# Heartbeat Tasks
 <!-- Empty file or only comments = no action needed -->
 "#;
 
-const TOOLS_MD: &str = r#"# Available Tools
-
-This document describes the tools available to the agent.
-
-## File System Tools
-
-### read_file
-Read the contents of a file.
-- **path**: Path to the file to read
-
-### write_file
-Write content to a file, creating parent directories if needed.
-- **path**: Path to the file to write
-- **content**: Content to write to the file
-
-### edit_file
-Edit a file by replacing old_text with new_text. old_text must match exactly and appear only once.
-- **path**: Path to the file to edit
-- **old_text**: Text to find and replace (must match exactly)
-- **new_text**: Text to replace old_text with
-
-### list_dir
-List contents of a directory.
-- **path**: Path to the directory to list
-
-## Command Execution
-
-### exec
-Execute a shell command.
-- **command**: The command to execute
-- **working_dir**: Working directory for the command (optional)
-
-**Safety**: Dangerous commands (rm -rf, dd, format, shutdown, etc.) are blocked.
-
-## Web Tools
-
-### web_search
-Search the web using Brave Search API.
-- **query**: Search query
-- **count**: Number of results (1-10, default 5)
-
-**Note**: Requires Brave Search API key in config.
-
-### web_fetch
-Fetch and extract content from a URL.
-- **url**: URL to fetch (must be http or https)
-- **extractMode**: Content extraction mode (markdown or text, default: markdown)
-- **maxChars**: Maximum characters to return (default: 50000)
-
-## Communication
-
-### message
-Send a message to a specific channel/chat.
-- **content**: Message content
-- **channel**: Target channel (optional)
-- **chat_id**: Target chat ID (optional)
-
-**Note**: Only use this for sending to specific channels. For normal conversation, respond directly.
-
-### spawn
-Start a background task (subagent).
-- **task**: Task description
-- **label**: Task label (optional)
-
-**Note**: Subagents run in isolation and report back when complete.
-"#;
-
 const EXAMPLE_CONFIG: &str = r#"{
   "providers": {
     "openrouter": {
       "apiKey": "",
-      "apiBase": "https://openrouter.ai/api/v1"
+      "apiBase": "https://openrouter.ai/api/v1",
+      "apiType": "openai"
     },
     "anthropic": {
       "apiKey": "",
-      "apiBase": "https://api.anthropic.com"
+      "apiBase": "https://api.anthropic.com",
+      "apiType": "anthropic"
     },
     "openai": {
       "apiKey": "",
-      "apiBase": "https://api.openai.com/v1"
+      "apiBase": "https://api.openai.com/v1",
+      "proxy": null,
+      "apiType": "openai_responses"
     },
     "deepseek": {
       "apiKey": "",
-      "apiBase": "https://api.deepseek.com/v1"
+      "apiBase": "https://api.deepseek.com/v1",
+      "apiType": "openai"
     },
     "gemini": {
       "apiKey": "",
-      "apiBase": "https://generativelanguage.googleapis.com"
+      "apiBase": "https://generativelanguage.googleapis.com",
+      "apiType": "openai"
     },
     "kimi": {
       "apiKey": "",
-      "apiBase": "https://api.moonshot.cn/v1"
+      "apiBase": "https://api.moonshot.cn/v1",
+      "apiType": "openai"
     },
     "groq": {
       "apiKey": "",
-      "apiBase": "https://api.groq.com/openai/v1"
+      "apiBase": "https://api.groq.com/openai/v1",
+      "apiType": "openai"
     },
     "zhipu": {
       "apiKey": "",
-      "apiBase": "https://open.bigmodel.cn/api/paas/v4"
+      "apiBase": "https://open.bigmodel.cn/api/paas/v4",
+      "apiType": "openai"
     },
     "ollama": {
       "apiKey": "",
-      "apiBase": "http://localhost:11434"
+      "apiBase": "http://localhost:11434",
+      "apiType": "ollama"
     }
   },
   "agents": {
     "defaults": {
-      "model": "anthropic/claude-sonnet-4-20250514",
       "maxTokens": 8192,
       "temperature": 0.7,
-      "maxToolIterations": 20
+      "maxToolIterations": 20,
+      "modelPool": [
+        {
+          "provider": "deepseek",
+          "model": "deepseek-chat",
+          "weight": 1,
+          "priority": 1
+        }
+      ]
     }
   },
   "gateway": {
@@ -291,7 +244,12 @@ pub async fn run(
     }
 
     // Check if config exists
-    if paths.config_file().exists() && !force && provider.is_none() && api_key.is_none() && model.is_none() {
+    if paths.config_file().exists()
+        && !force
+        && provider.is_none()
+        && api_key.is_none()
+        && model.is_none()
+    {
         print!("Config already exists. Overwrite? [y/N] ");
         io::stdout().flush()?;
 
@@ -316,8 +274,9 @@ pub async fn run(
             EXAMPLE_CONFIG.to_string()
         };
 
-        let mut json: serde_json::Value = serde_json::from_str(&config_str)
-            .unwrap_or_else(|_| serde_json::from_str(EXAMPLE_CONFIG).unwrap());
+        let mut json: serde_json::Value = parse_json5_value(&config_str).unwrap_or_else(|_| {
+            parse_json5_value(EXAMPLE_CONFIG).expect("parse bundled example config")
+        });
 
         ensure_auto_upgrade_defaults(&mut json);
 
@@ -326,25 +285,40 @@ pub async fn run(
             json["providers"][prov]["apiKey"] = serde_json::json!(key);
         }
 
-        // Set model
-        if let Some(ref m) = model {
-            json["agents"]["defaults"]["model"] = serde_json::json!(m);
+        let selected_model = if let Some(ref m) = model {
+            m.clone()
         } else {
-            // Set a sensible default model for the provider
-            let default_model = default_model_for_provider(prov);
-            json["agents"]["defaults"]["model"] = serde_json::json!(default_model);
+            default_model_for_provider(prov).to_string()
+        };
+
+        json["agents"]["defaults"]["modelPool"] = serde_json::json!([
+            {
+                "provider": prov,
+                "model": selected_model,
+                "weight": 1,
+                "priority": 1
+            }
+        ]);
+        if let Some(defaults) = json["agents"]["defaults"].as_object_mut() {
+            defaults.remove("model");
+            defaults.remove("provider");
         }
 
         if let Some(parent) = paths.config_file().parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(paths.config_file(), serde_json::to_string_pretty(&json)?)?;
+        std::fs::write(paths.config_file(), stringify_json5_pretty(&json)?)?;
 
         println!("✓ Provider configured: {}", prov);
         if api_key.is_some() {
             println!("  ✓ API key set");
         }
-        println!("  ✓ Model: {}", json["agents"]["defaults"]["model"].as_str().unwrap_or("?"));
+        println!(
+            "  ✓ Model: {}",
+            json["agents"]["defaults"]["modelPool"][0]["model"]
+                .as_str()
+                .unwrap_or("?")
+        );
         println!("✓ Config: {}", paths.config_file().display());
         println!();
         println!("Run `blockcell agent` to start chatting.");
@@ -355,14 +329,13 @@ pub async fn run(
     if let Some(parent) = paths.config_file().parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(paths.config_file(), EXAMPLE_CONFIG)?;
+    write_raw_validated_config_json5(&paths.config_file(), EXAMPLE_CONFIG)?;
     println!("✓ Created config: {}", paths.config_file().display());
 
     // Create workspace files
     write_if_not_exists(&paths.agents_md(), AGENTS_MD)?;
     write_if_not_exists(&paths.soul_md(), SOUL_MD)?;
     write_if_not_exists(&paths.user_md(), USER_MD)?;
-    write_if_not_exists(&paths.tools_md(), TOOLS_MD)?;
     write_if_not_exists(&paths.memory_md(), MEMORY_MD)?;
     write_if_not_exists(&paths.heartbeat_md(), HEARTBEAT_MD)?;
 
@@ -376,10 +349,14 @@ pub async fn run(
         let existing = std::fs::read_to_string(&memory_path).unwrap_or_default();
         if !existing.contains("## Hardware") {
             let env_snapshot = probe_environment();
-            let updated = format!("{}
+            let updated = format!(
+                "{}
 
 ---
-{}", existing.trim_end(), env_snapshot.trim_start());
+{}",
+                existing.trim_end(),
+                env_snapshot.trim_start()
+            );
             std::fs::write(&memory_path, updated)?;
         }
     }
@@ -389,7 +366,11 @@ pub async fn run(
     let skills_dir = paths.skills_dir();
     match super::embedded_skills::extract_to_workspace(&skills_dir) {
         Ok(new_skills) if !new_skills.is_empty() => {
-            println!("  ✓ Installed {} builtin skill(s): {}", new_skills.len(), new_skills.join(", "));
+            println!(
+                "  ✓ Installed {} builtin skill(s): {}",
+                new_skills.len(),
+                new_skills.join(", ")
+            );
         }
         Ok(_) => {}
         Err(e) => {
@@ -400,13 +381,16 @@ pub async fn run(
     println!("✓ Created workspace: {}", paths.workspace().display());
     println!();
     println!("Next steps:");
-    println!("  1. Edit {} to add your API keys", paths.config_file().display());
+    println!(
+        "  1. Edit {} to add your API keys",
+        paths.config_file().display()
+    );
     println!("  2. Run `blockcell status` to verify configuration");
     println!("  3. Run `blockcell agent` to start chatting");
     println!();
     println!("Quick setup examples:");
     println!("  blockcell onboard --provider deepseek --api-key sk-xxx --model deepseek-chat");
-    println!("  blockcell onboard --provider kimi --api-key sk-xxx --model moonshot-v1-8k");
+    println!("  blockcell onboard --provider kimi --api-key sk-xxx --model kimi-k2.5");
     println!("  blockcell onboard --provider openai --api-key sk-xxx");
 
     Ok(())
@@ -423,7 +407,12 @@ fn ensure_auto_upgrade_defaults(json: &mut serde_json::Value) {
     if json["autoUpgrade"].get("channel").is_none() {
         json["autoUpgrade"]["channel"] = serde_json::json!("stable");
     }
-    if json["autoUpgrade"].get("manifestUrl").is_none() {
+    if json["autoUpgrade"].get("manifestUrl").is_none()
+        || json["autoUpgrade"]["manifestUrl"]
+            .as_str()
+            .unwrap_or("")
+            .is_empty()
+    {
         json["autoUpgrade"]["manifestUrl"] = serde_json::json!(
             "https://github.com/blockcell-labs/blockcell/releases/latest/download/manifest.json"
         );
@@ -441,7 +430,7 @@ fn default_model_for_provider(provider: &str) -> &'static str {
         "deepseek" => "deepseek-chat",
         "openai" => "gpt-4o",
         "anthropic" => "claude-sonnet-4-20250514",
-        "kimi" | "moonshot" => "moonshot-v1-8k",
+        "kimi" | "moonshot" => "kimi-k2.5",
         "gemini" => "gemini-1.5-flash",
         "groq" => "llama-3.1-70b-versatile",
         "zhipu" => "glm-4",
@@ -456,7 +445,10 @@ fn write_if_not_exists(path: &std::path::Path, content: &str) -> io::Result<()> 
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(path, content)?;
-        println!("  ✓ Created {}", path.file_name().unwrap().to_string_lossy());
+        println!(
+            "  ✓ Created {}",
+            path.file_name().unwrap().to_string_lossy()
+        );
     }
     Ok(())
 }
@@ -473,8 +465,16 @@ fn sh(cmd: &str, args: &[&str]) -> Option<String> {
 }
 
 fn check_bin(name: &str) -> &'static str {
-    if std::process::Command::new("which").arg(name).output()
-        .map(|o| o.status.success()).unwrap_or(false) { "yes" } else { "no" }
+    if std::process::Command::new("which")
+        .arg(name)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        "yes"
+    } else {
+        "no"
+    }
 }
 
 /// Probe hardware/software environment synchronously at onboard time.
@@ -496,7 +496,9 @@ fn probe_environment() -> String {
     ));
 
     // CPU cores
-    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
     out.push_str(&format!("- **CPU cores**: {}\n", cores));
 
     // CPU model
@@ -509,7 +511,10 @@ fn probe_environment() -> String {
     // RAM
     if let Some(mem_bytes) = sh("sysctl", &["-n", "hw.memsize"]) {
         if let Ok(bytes) = mem_bytes.parse::<u64>() {
-            out.push_str(&format!("- **RAM**: {:.1} GB\n", bytes as f64 / 1_073_741_824.0));
+            out.push_str(&format!(
+                "- **RAM**: {:.1} GB\n",
+                bytes as f64 / 1_073_741_824.0
+            ));
         }
     } else if let Some(meminfo) = sh("grep", &["MemTotal", "/proc/meminfo"]) {
         out.push_str(&format!("- **RAM**: {}\n", meminfo));
@@ -520,22 +525,38 @@ fn probe_environment() -> String {
         .and_then(|s| {
             s.lines()
                 .find(|l| l.trim().starts_with("Chipset Model:") || l.trim().starts_with("Chip:"))
-                .map(|l| l.trim().trim_start_matches("Chipset Model:").trim_start_matches("Chip:").trim().to_string())
+                .map(|l| {
+                    l.trim()
+                        .trim_start_matches("Chipset Model:")
+                        .trim_start_matches("Chip:")
+                        .trim()
+                        .to_string()
+                })
         })
-        .or_else(|| sh("lspci", &[]).and_then(|s| {
-            s.lines().find(|l| l.contains("VGA") || l.contains("3D")).map(|l| l.to_string())
-        }));
+        .or_else(|| {
+            sh("lspci", &[]).and_then(|s| {
+                s.lines()
+                    .find(|l| l.contains("VGA") || l.contains("3D"))
+                    .map(|l| l.to_string())
+            })
+        });
     if let Some(g) = gpu {
         out.push_str(&format!("- **GPU**: {}\n", g));
     }
 
     // Disk
     if let Some(disk) = sh("df", &["-h", "."]) {
-        let summary = disk.lines().nth(1).unwrap_or("").split_whitespace()
+        let summary = disk
+            .lines()
+            .nth(1)
+            .unwrap_or("")
+            .split_whitespace()
             .collect::<Vec<_>>();
         if summary.len() >= 4 {
-            out.push_str(&format!("- **Disk** (workspace): total={} used={} free={}\n",
-                summary[1], summary[2], summary[3]));
+            out.push_str(&format!(
+                "- **Disk** (workspace): total={} used={} free={}\n",
+                summary[1], summary[2], summary[3]
+            ));
         }
     }
 
@@ -544,24 +565,34 @@ fn probe_environment() -> String {
         .map(|s| s.contains("Camera") || s.contains("FaceTime"))
         .unwrap_or(false)
         || std::path::Path::new("/dev/video0").exists();
-    out.push_str(&format!("- **Camera**: {}\n", if has_camera { "available" } else { "not detected" }));
+    out.push_str(&format!(
+        "- **Camera**: {}\n",
+        if has_camera {
+            "available"
+        } else {
+            "not detected"
+        }
+    ));
 
     // Microphone
     let has_mic = sh("system_profiler", &["SPAudioDataType"])
         .map(|s| s.contains("Input") || s.contains("Microphone"))
         .unwrap_or(false);
-    out.push_str(&format!("- **Microphone**: {}\n", if has_mic { "available" } else { "not detected" }));
+    out.push_str(&format!(
+        "- **Microphone**: {}\n",
+        if has_mic { "available" } else { "not detected" }
+    ));
 
     // ── Software & Runtimes ──────────────────────────────────────────────────
     out.push_str("\n## Software & Runtimes\n\n");
 
     let binaries = [
         ("python3", &["--version"][..]),
-        ("node",    &["--version"][..]),
-        ("rustc",   &["--version"][..]),
-        ("git",     &["--version"][..]),
-        ("docker",  &["--version"][..]),
-        ("ffmpeg",  &["-version"][..]),
+        ("node", &["--version"][..]),
+        ("rustc", &["--version"][..]),
+        ("git", &["--version"][..]),
+        ("docker", &["--version"][..]),
+        ("ffmpeg", &["-version"][..]),
     ];
     for (bin, args) in &binaries {
         let ver = sh(bin, args)
@@ -573,7 +604,9 @@ fn probe_environment() -> String {
     // Package managers
     out.push_str(&format!(
         "- **brew**: {} | **pip3**: {} | **npm**: {}\n",
-        check_bin("brew"), check_bin("pip3"), check_bin("npm")
+        check_bin("brew"),
+        check_bin("pip3"),
+        check_bin("npm")
     ));
 
     // Chrome
@@ -581,10 +614,15 @@ fn probe_environment() -> String {
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
         "/Applications/Chromium.app/Contents/MacOS/Chromium",
     ];
-    let has_chrome = chrome_paths.iter().any(|p| std::path::Path::new(p).exists())
+    let has_chrome = chrome_paths
+        .iter()
+        .any(|p| std::path::Path::new(p).exists())
         || sh("which", &["google-chrome"]).is_some()
         || sh("which", &["chromium"]).is_some();
-    out.push_str(&format!("- **Chrome/Chromium**: {}\n", if has_chrome { "available" } else { "not found" }));
+    out.push_str(&format!(
+        "- **Chrome/Chromium**: {}\n",
+        if has_chrome { "available" } else { "not found" }
+    ));
 
     // ── Network ──────────────────────────────────────────────────────────────
     out.push_str("\n## Network\n\n");
@@ -594,10 +632,14 @@ fn probe_environment() -> String {
 
     // Quick internet check via DNS
     use std::net::ToSocketAddrs;
-    let internet = "1.1.1.1:53".to_socket_addrs()
+    let internet = "1.1.1.1:53"
+        .to_socket_addrs()
         .map(|mut a| a.next().is_some())
         .unwrap_or(false);
-    out.push_str(&format!("- **Internet**: {}\n", if internet { "reachable" } else { "unreachable" }));
+    out.push_str(&format!(
+        "- **Internet**: {}\n",
+        if internet { "reachable" } else { "unreachable" }
+    ));
 
     // ── Capabilities Summary ─────────────────────────────────────────────────
     out.push_str("\n## Agent Capabilities (at onboard time)\n\n");

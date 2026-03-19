@@ -1,10 +1,12 @@
 use async_trait::async_trait;
-use blockcell_core::types::{ChatMessage, LLMResponse, ToolCallRequest};
+use blockcell_core::types::{ChatMessage, LLMResponse, StreamChunk, ToolCallRequest};
 use blockcell_core::{Error, Result};
+use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::client::build_http_client;
@@ -21,12 +23,7 @@ pub struct OllamaProvider {
 }
 
 impl OllamaProvider {
-    pub fn new(
-        api_base: Option<&str>,
-        model: &str,
-        max_tokens: u32,
-        temperature: f32,
-    ) -> Self {
+    pub fn new(api_base: Option<&str>, model: &str, max_tokens: u32, temperature: f32) -> Self {
         Self::new_with_proxy(api_base, model, max_tokens, temperature, None, None, &[])
     }
 
@@ -86,13 +83,16 @@ impl OllamaProvider {
                             }
                             "image_url" => {
                                 // Extract base64 data from data:mime;base64,xxx
-                                if let Some(url) = block.get("image_url")
+                                if let Some(url) = block
+                                    .get("image_url")
                                     .and_then(|v| v.get("url"))
                                     .and_then(|v| v.as_str())
                                 {
                                     if let Some(rest) = url.strip_prefix("data:") {
                                         if let Some(semi) = rest.find(';') {
-                                            if let Some(data) = rest[semi..].strip_prefix(";base64,") {
+                                            if let Some(data) =
+                                                rest[semi..].strip_prefix(";base64,")
+                                            {
                                                 images.push(data.to_string());
                                             }
                                         }
@@ -106,7 +106,11 @@ impl OllamaProvider {
                         role: msg.role.clone(),
                         content: text_parts.join("\n"),
                         tool_calls: None,
-                        images: if images.is_empty() { None } else { Some(images) },
+                        images: if images.is_empty() {
+                            None
+                        } else {
+                            Some(images)
+                        },
                     }
                 } else {
                     let content = msg.content.as_str().unwrap_or("").to_string();
@@ -139,8 +143,14 @@ impl OllamaProvider {
 
         for tool in tools {
             if let Some(func) = tool.get("function") {
-                let name = func.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
-                let desc = func.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                let name = func
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let desc = func
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 let params = func.get("parameters").cloned().unwrap_or(Value::Null);
                 s.push_str(&format!("### {}\n{}\n", name, desc));
                 if !params.is_null() {
@@ -186,7 +196,9 @@ impl OllamaProvider {
                         call_index += 1;
                     } else {
                         warn!(json = %json_str, "Failed to parse tool_call JSON from Ollama");
-                        remaining.push_str(&rest[start..start + "<tool_call>".len() + end + "</tool_call>".len()]);
+                        remaining.push_str(
+                            &rest[start..start + "<tool_call>".len() + end + "</tool_call>".len()],
+                        );
                     }
                     rest = &after_tag[end + "</tool_call>".len()..];
                 } else {
@@ -328,7 +340,11 @@ impl OllamaProvider {
     }
 
     /// Fallback: inject tools into system prompt as text for models without native tool support.
-    async fn chat_text_tools(&self, messages: &[ChatMessage], tools: &[Value]) -> Result<LLMResponse> {
+    async fn chat_text_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[Value],
+    ) -> Result<LLMResponse> {
         let tools_prompt = Self::build_tools_prompt(tools);
 
         // Inject tools into system message
@@ -376,9 +392,8 @@ impl OllamaProvider {
             )));
         }
 
-        let resp: OllamaChatResponse = serde_json::from_str(&raw_body).map_err(|e| {
-            Error::Provider(format!("Failed to parse Ollama response: {}", e))
-        })?;
+        let resp: OllamaChatResponse = serde_json::from_str(&raw_body)
+            .map_err(|e| Error::Provider(format!("Failed to parse Ollama response: {}", e)))?;
 
         let (remaining, tool_calls) = Self::parse_text_tool_calls(&resp.message.content);
 
@@ -417,6 +432,173 @@ impl Provider for OllamaProvider {
                 }
             }
         }
+    }
+
+    async fn chat_stream(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[Value],
+    ) -> Result<mpsc::Receiver<StreamChunk>> {
+        let url = format!("{}/api/chat", self.api_base);
+        let model = Self::normalize_model(&self.model);
+        let ollama_messages = Self::convert_messages(messages);
+        let ollama_tools = Self::convert_tools(tools);
+
+        let mut request = serde_json::json!({
+            "model": model,
+            "messages": ollama_messages,
+            "stream": true,
+            "options": {
+                "temperature": self.temperature,
+                "num_predict": self.max_tokens,
+            }
+        });
+
+        if !ollama_tools.is_empty() {
+            request["tools"] = Value::Array(ollama_tools);
+        }
+
+        info!(url = %url, model = %model, "Starting Ollama streaming call");
+
+        let response = self
+            .client
+            .post(&url)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| Error::Provider(format!("Ollama stream request failed: {}", e)))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(Error::Provider(format!(
+                "Ollama stream API error {}: {}",
+                status, body
+            )));
+        }
+
+        let (tx, rx) = mpsc::channel(64);
+
+        tokio::spawn(async move {
+            let mut stream = response.bytes_stream();
+            let mut buffer = String::new();
+            let mut accumulated_content = String::new();
+            let mut tool_calls: Vec<ToolCallRequest> = Vec::new();
+            let mut finish_reason = "stop".to_string();
+            let mut usage = Value::Null;
+
+            while let Some(chunk_result) = stream.next().await {
+                match chunk_result {
+                    Ok(bytes) => {
+                        buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+                        // Ollama 使用 NDJSON 格式，每行一个 JSON 对象
+                        while let Some(pos) = buffer.find('\n') {
+                            let line = buffer[..pos].trim().to_string();
+                            buffer = buffer[pos + 1..].to_string();
+
+                            if line.is_empty() {
+                                continue;
+                            }
+
+                            // 解析 Ollama 流式响应
+                            if let Ok(chunk) = serde_json::from_str::<OllamaStreamResponse>(&line) {
+                                // 处理文本增量
+                                if !chunk.message.content.is_empty() {
+                                    let delta = chunk.message.content.clone();
+                                    accumulated_content.push_str(&delta);
+                                    let _ = tx.send(StreamChunk::TextDelta { delta }).await;
+                                }
+
+                                // 处理工具调用
+                                if let Some(native_calls) = &chunk.message.tool_calls {
+                                    for (i, tc) in native_calls.iter().enumerate() {
+                                        if let Some(func) = &tc.function {
+                                            let id = format!("ollama_call_{}", i);
+                                            let _ = tx
+                                                .send(StreamChunk::ToolCallStart {
+                                                    index: i,
+                                                    id: id.clone(),
+                                                    name: func.name.clone(),
+                                                })
+                                                .await;
+
+                                            // 发送完整参数
+                                            let args_str = serde_json::to_string(&func.arguments)
+                                                .unwrap_or_default();
+                                            let _ = tx
+                                                .send(StreamChunk::ToolCallDelta {
+                                                    index: i,
+                                                    id,
+                                                    delta: args_str,
+                                                })
+                                                .await;
+
+                                            tool_calls.push(ToolCallRequest {
+                                                id: format!("ollama_call_{}", i),
+                                                name: func.name.clone(),
+                                                arguments: func.arguments.clone(),
+                                                thought_signature: None,
+                                            });
+                                        }
+                                    }
+                                }
+
+                                // 检查是否完成
+                                if chunk.done.unwrap_or(false) {
+                                    usage = serde_json::json!({
+                                        "prompt_tokens": chunk.prompt_eval_count,
+                                        "completion_tokens": chunk.eval_count,
+                                    });
+
+                                    if !tool_calls.is_empty() {
+                                        finish_reason = "tool_calls".to_string();
+                                    }
+
+                                    let response = LLMResponse {
+                                        content: if accumulated_content.is_empty() {
+                                            None
+                                        } else {
+                                            Some(accumulated_content)
+                                        },
+                                        reasoning_content: None,
+                                        tool_calls,
+                                        finish_reason,
+                                        usage,
+                                    };
+                                    let _ = tx.send(StreamChunk::Done { response }).await;
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(StreamChunk::Error {
+                                message: e.to_string(),
+                            })
+                            .await;
+                        return;
+                    }
+                }
+            }
+
+            // 如果流结束但没有收到 done 标记
+            let response = LLMResponse {
+                content: if accumulated_content.is_empty() {
+                    None
+                } else {
+                    Some(accumulated_content)
+                },
+                reasoning_content: None,
+                tool_calls,
+                finish_reason,
+                usage,
+            };
+            let _ = tx.send(StreamChunk::Done { response }).await;
+        });
+
+        Ok(rx)
     }
 }
 
@@ -462,6 +644,26 @@ struct OllamaFunctionCall {
     arguments: Value,
 }
 
+/// Ollama 流式响应
+#[derive(Debug, Deserialize)]
+struct OllamaStreamResponse {
+    message: OllamaStreamMessage,
+    #[serde(default)]
+    done: Option<bool>,
+    #[serde(default)]
+    prompt_eval_count: Option<u64>,
+    #[serde(default)]
+    eval_count: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaStreamMessage {
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    tool_calls: Option<Vec<OllamaToolCall>>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,10 +671,7 @@ mod tests {
     #[test]
     fn test_normalize_model() {
         assert_eq!(OllamaProvider::normalize_model("ollama/llama3"), "llama3");
-        assert_eq!(
-            OllamaProvider::normalize_model("qwen2.5:7b"),
-            "qwen2.5:7b"
-        );
+        assert_eq!(OllamaProvider::normalize_model("qwen2.5:7b"), "qwen2.5:7b");
     }
 
     #[test]

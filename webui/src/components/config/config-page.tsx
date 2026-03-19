@@ -5,9 +5,40 @@ import {
   ToggleLeft, ToggleRight,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { getConfig, updateConfig, testProvider, getHealth, logout, reloadConfig } from '@/lib/api';
+import { getConfig, getConfigRaw, updateConfig, updateConfigRaw, testProvider, getHealth, logout, reloadConfig } from '@/lib/api';
 import { useThemeStore } from '@/lib/store';
 import { useI18nStore, useT, type Locale } from '@/lib/i18n';
+
+const INTENT_ROUTER_EXAMPLE = `{
+  "agents": {
+    "list": [
+      { "id": "default", "enabled": true, "intentProfile": "default" },
+      { "id": "ops", "enabled": true, "intentProfile": "ops" }
+    ]
+  },
+  "intentRouter": {
+    "enabled": true,
+    "defaultProfile": "default",
+    "profiles": {
+      "default": {
+        "coreTools": ["read_file", "write_file", "list_dir", "exec", "message"],
+        "intentTools": {
+          "Chat": { "inheritBase": false, "tools": [] },
+          "FileOps": ["edit_file", "file_ops"],
+          "Unknown": ["browse", "http_request"]
+        }
+      },
+      "ops": {
+        "coreTools": ["read_file", "list_dir", "exec", "message"],
+        "intentTools": {
+          "DevOps": ["git_api", "cloud_api", "network_monitor"],
+          "Unknown": ["http_request"]
+        },
+        "denyTools": ["email", "social_media"]
+      }
+    }
+  }
+}`;
 
 // ── Config Editor sub-page ──
 function ConfigEditor({ onBack, t }: { onBack: () => void; t: (k: string, p?: Record<string, string | number>) => string }) {
@@ -54,8 +85,8 @@ function ConfigEditor({ onBack, t }: { onBack: () => void; t: (k: string, p?: Re
   async function fetchConfig() {
     setLoading(true);
     try {
-      const data = await getConfig();
-      setEditJson(JSON.stringify(data, null, 2));
+      const data = await getConfigRaw();
+      setEditJson(data.content);
     } catch (e: any) {
       setMessage({ type: 'error', text: e.message });
     } finally {
@@ -67,9 +98,8 @@ function ConfigEditor({ onBack, t }: { onBack: () => void; t: (k: string, p?: Re
     setSaving(true);
     setMessage(null);
     try {
-      const parsed = JSON.parse(editJson);
-      await updateConfig(parsed);
-      setMessage({ type: 'success', text: t('settings.configSaved') });
+      const result = await updateConfigRaw(editJson);
+      setMessage({ type: 'success', text: result.message || t('settings.configSaved') });
       setRestartNoticeOpen(true);
     } catch (e: any) {
       setMessage({ type: 'error', text: e.message });
@@ -82,15 +112,7 @@ function ConfigEditor({ onBack, t }: { onBack: () => void; t: (k: string, p?: Re
     setTesting(true);
     setMessage(null);
     try {
-      const parsed = JSON.parse(editJson);
-      const model = parsed?.agents?.defaults?.model || '';
-      const providerName = Object.keys(parsed?.providers || {})[0] || 'openai';
-      const providerConf = parsed?.providers?.[providerName] || {};
-      const result = await testProvider({
-        model,
-        api_key: providerConf.apiKey || providerConf.api_key || '',
-        api_base: providerConf.apiBase || providerConf.api_base,
-      });
+      const result = await testProvider({ content: editJson });
       setMessage({ type: 'success', text: result.message || 'Provider test passed' });
     } catch (e: any) {
       setMessage({ type: 'error', text: e.message });
@@ -135,7 +157,7 @@ function ConfigEditor({ onBack, t }: { onBack: () => void; t: (k: string, p?: Re
       {message && (
         <div className={cn(
           'mx-6 mt-4 px-4 py-2 rounded-lg text-sm flex items-center justify-between',
-          message.type === 'success' ? 'bg-cyber/10 text-cyber border border-cyber/20' : 'bg-red-500/10 text-red-500 border border-red-500/20'
+          message.type === 'success' ? 'bg-[hsl(var(--brand-green)/0.10)] text-[hsl(var(--brand-green))] border border-[hsl(var(--brand-green)/0.20)]' : 'bg-red-500/10 text-red-500 border border-red-500/20'
         )}>
           <span>{message.text}</span>
           <button onClick={() => setMessage(null)} className="p-0.5 hover:opacity-70"><X size={14} /></button>
@@ -143,7 +165,31 @@ function ConfigEditor({ onBack, t }: { onBack: () => void; t: (k: string, p?: Re
       )}
 
       <div className="flex-1 overflow-y-auto p-6">
-        <div className="w-full">
+        <div className="w-full space-y-4">
+          <div className="rounded-xl border border-border bg-card p-4">
+            <div className="flex items-start gap-3">
+              <Info size={18} className="mt-0.5 text-blue-500" />
+              <div className="min-w-0 flex-1">
+                <div className="text-sm font-semibold">{t('settings.intentRouterHintTitle')}</div>
+                <p className="mt-1 text-sm text-muted-foreground">{t('settings.intentRouterHintDesc')}</p>
+                <ul className="mt-3 space-y-1 text-sm text-muted-foreground list-disc pl-5">
+                  <li>{t('settings.intentRouterHintPoint1')}</li>
+                  <li>{t('settings.intentRouterHintPoint2')}</li>
+                  <li>{t('settings.intentRouterHintPoint3')}</li>
+                </ul>
+                <div className="mt-4 rounded-lg border border-border bg-background/60 p-3">
+                  <div className="mb-2 flex items-center gap-2 text-xs font-medium uppercase tracking-wider text-muted-foreground">
+                    <FileCode size={14} />
+                    {t('settings.intentRouterExample')}
+                  </div>
+                  <pre className="overflow-x-auto text-xs leading-5 text-foreground"><code>{INTENT_ROUTER_EXAMPLE}</code></pre>
+                </div>
+                <p className="mt-3 text-xs text-muted-foreground">
+                  {t('settings.intentRouterDocHint')} <code className="rounded bg-background px-1 py-0.5">docs/21_intent_router_profiles.md</code> / <code className="rounded bg-background px-1 py-0.5">docs/en/21_intent_router_profiles.md</code>
+                </p>
+              </div>
+            </div>
+          </div>
           {loading ? (
             <div className="flex items-center justify-center h-64">
               <Loader2 size={24} className="animate-spin text-muted-foreground" />
@@ -353,7 +399,7 @@ export function ConfigPage() {
               {/* Save row */}
               <div className="flex items-center justify-between px-5 py-3 border-t border-border bg-muted/10">
                 {proxyMsg ? (
-                  <span className={`text-xs ${proxyMsg.type === 'success' ? 'text-cyber' : 'text-destructive'}`}>{proxyMsg.text}</span>
+                  <span className={`text-xs ${proxyMsg.type === 'success' ? 'text-[hsl(var(--brand-green))]' : 'text-destructive'}`}>{proxyMsg.text}</span>
                 ) : (
                   <span className="text-xs text-muted-foreground">
                     {proxyEnabled

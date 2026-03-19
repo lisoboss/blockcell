@@ -9,10 +9,6 @@ use crate::{Tool, ToolContext, ToolSchema};
 ///
 /// Sends images to vision-capable LLMs (GPT-4o, Claude, Gemini) for:
 /// - Image description and captioning
-/// - Object/scene recognition
-/// - Text extraction with context
-/// - Chart/diagram interpretation
-/// - Comparison of multiple images
 pub struct ImageUnderstandTool;
 
 #[async_trait]
@@ -20,7 +16,7 @@ impl Tool for ImageUnderstandTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "image_understand",
-            description: "Analyze images using multimodal LLM vision. Actions: 'analyze' sends image(s) to a vision LLM with a prompt, 'describe' generates a description/caption, 'compare' compares multiple images, 'extract' extracts structured data from image.",
+            description: "Analyze images using multimodal vision models. You MUST provide `action`. action='describe': requires `path`, optional `provider`, `model`, `detail`, `max_tokens`. action='analyze'|'extract': requires `path`; `prompt` is recommended and usually needed for precise results; optional `provider`, `model`, `detail`, `max_tokens`. action='compare': requires `paths`, optional `prompt`, `provider`, `model`, `detail`, `max_tokens`.",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -69,29 +65,52 @@ impl Tool for ImageUnderstandTool {
     fn validate(&self, params: &Value) -> Result<()> {
         let action = params.get("action").and_then(|v| v.as_str()).unwrap_or("");
         if !["analyze", "describe", "compare", "extract"].contains(&action) {
-            return Err(Error::Tool("action must be 'analyze', 'describe', 'compare', or 'extract'".into()));
+            return Err(Error::Tool(
+                "action must be 'analyze', 'describe', 'compare', or 'extract'".into(),
+            ));
         }
         if action == "compare" {
             let paths = params.get("paths").and_then(|v| v.as_array());
             if paths.map(|a| a.len()).unwrap_or(0) < 2 {
-                return Err(Error::Tool("'paths' array with at least 2 images is required for compare".into()));
+                return Err(Error::Tool(
+                    "'paths' array with at least 2 images is required for compare".into(),
+                ));
             }
-        } else if params.get("path").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+        } else if params
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .is_empty()
+        {
             return Err(Error::Tool("'path' is required".into()));
         }
         Ok(())
     }
 
     async fn execute(&self, ctx: ToolContext, params: Value) -> Result<Value> {
-        let action = params.get("action").and_then(|v| v.as_str()).unwrap_or("describe");
-        let provider = params.get("provider").and_then(|v| v.as_str()).unwrap_or("auto");
-        let max_tokens = params.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(1024) as u32;
+        let action = params
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("describe");
+        let provider = params
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .unwrap_or("auto");
+        let max_tokens = params
+            .get("max_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1024) as u32;
 
         // Collect image paths
         let image_paths: Vec<String> = if action == "compare" {
-            params.get("paths")
+            params
+                .get("paths")
                 .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| resolve_path(s, &ctx.workspace))).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| resolve_path(s, &ctx.workspace)))
+                        .collect()
+                })
                 .unwrap_or_default()
         } else {
             let p = params.get("path").and_then(|v| v.as_str()).unwrap_or("");
@@ -120,7 +139,8 @@ impl Tool for ImageUnderstandTool {
         };
 
         // Encode images
-        let encoded_images: Vec<(String, String)> = image_paths.iter()
+        let encoded_images: Vec<(String, String)> = image_paths
+            .iter()
             .filter_map(|p| encode_image(p).ok())
             .collect();
 
@@ -130,8 +150,12 @@ impl Tool for ImageUnderstandTool {
 
         // Select provider and call
         let (response_text, used_provider, used_model) = match provider {
-            "openai" => call_openai(&ctx, &system_prompt, &encoded_images, &params, max_tokens).await?,
-            "anthropic" => call_anthropic(&ctx, &system_prompt, &encoded_images, max_tokens).await?,
+            "openai" => {
+                call_openai(&ctx, &system_prompt, &encoded_images, &params, max_tokens).await?
+            }
+            "anthropic" => {
+                call_anthropic(&ctx, &system_prompt, &encoded_images, max_tokens).await?
+            }
             "gemini" => call_gemini(&ctx, &system_prompt, &encoded_images, max_tokens).await?,
             _ => {
                 // Try providers in order: openai → anthropic → gemini
@@ -194,7 +218,9 @@ fn encode_image(path: &str) -> Result<(String, String)> {
 fn has_provider_key(ctx: &ToolContext, provider: &str) -> bool {
     // Check config
     if let Some(p) = ctx.config.providers.get(provider) {
-        if !p.api_key.is_empty() { return true; }
+        if !p.api_key.is_empty() {
+            return true;
+        }
     }
     // Check env
     let env_var = match provider {
@@ -203,12 +229,16 @@ fn has_provider_key(ctx: &ToolContext, provider: &str) -> bool {
         "gemini" => "GEMINI_API_KEY",
         _ => return false,
     };
-    std::env::var(env_var).map(|k| !k.is_empty()).unwrap_or(false)
+    std::env::var(env_var)
+        .map(|k| !k.is_empty())
+        .unwrap_or(false)
 }
 
 fn get_api_key(ctx: &ToolContext, provider: &str) -> Result<String> {
     if let Some(p) = ctx.config.providers.get(provider) {
-        if !p.api_key.is_empty() { return Ok(p.api_key.clone()); }
+        if !p.api_key.is_empty() {
+            return Ok(p.api_key.clone());
+        }
     }
     let env_var = match provider {
         "openai" => "OPENAI_API_KEY",
@@ -218,7 +248,13 @@ fn get_api_key(ctx: &ToolContext, provider: &str) -> Result<String> {
     };
     std::env::var(env_var)
         .map_err(|_| Error::Tool(format!("{} not set", env_var)))
-        .and_then(|k| if k.is_empty() { Err(Error::Tool(format!("{} is empty", env_var))) } else { Ok(k) })
+        .and_then(|k| {
+            if k.is_empty() {
+                Err(Error::Tool(format!("{} is empty", env_var)))
+            } else {
+                Ok(k)
+            }
+        })
 }
 
 /// OpenAI GPT-4o Vision
@@ -230,8 +266,14 @@ async fn call_openai(
     max_tokens: u32,
 ) -> Result<(String, String, String)> {
     let api_key = get_api_key(ctx, "openai")?;
-    let model = params.get("model").and_then(|v| v.as_str()).unwrap_or("gpt-4o-mini");
-    let detail = params.get("detail").and_then(|v| v.as_str()).unwrap_or("auto");
+    let model = params
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("gpt-4o-mini");
+    let detail = params
+        .get("detail")
+        .and_then(|v| v.as_str())
+        .unwrap_or("auto");
 
     let mut content = Vec::new();
     content.push(json!({"type": "text", "text": prompt}));
@@ -261,7 +303,9 @@ async fn call_openai(
         return Err(Error::Tool(format!("OpenAI error {}: {}", status, text)));
     }
 
-    let data: Value = response.json().await
+    let data: Value = response
+        .json()
+        .await
         .map_err(|e| Error::Tool(format!("Failed to parse response: {}", e)))?;
 
     let text = data["choices"][0]["message"]["content"]
@@ -318,7 +362,9 @@ async fn call_anthropic(
         return Err(Error::Tool(format!("Anthropic error {}: {}", status, text)));
     }
 
-    let data: Value = response.json().await
+    let data: Value = response
+        .json()
+        .await
         .map_err(|e| Error::Tool(format!("Failed to parse response: {}", e)))?;
 
     let text = data["content"][0]["text"]
@@ -373,7 +419,9 @@ async fn call_gemini(
         return Err(Error::Tool(format!("Gemini error {}: {}", status, text)));
     }
 
-    let data: Value = response.json().await
+    let data: Value = response
+        .json()
+        .await
         .map_err(|e| Error::Tool(format!("Failed to parse response: {}", e)))?;
 
     let text = data["candidates"][0]["content"]["parts"][0]["text"]
@@ -413,22 +461,30 @@ mod tests {
     #[test]
     fn test_validate_analyze() {
         let tool = ImageUnderstandTool;
-        assert!(tool.validate(&json!({"action": "analyze", "path": "/tmp/img.png"})).is_ok());
+        assert!(tool
+            .validate(&json!({"action": "analyze", "path": "/tmp/img.png"}))
+            .is_ok());
         assert!(tool.validate(&json!({"action": "analyze"})).is_err());
     }
 
     #[test]
     fn test_validate_compare() {
         let tool = ImageUnderstandTool;
-        assert!(tool.validate(&json!({"action": "compare", "paths": ["/a.png", "/b.png"]})).is_ok());
-        assert!(tool.validate(&json!({"action": "compare", "paths": ["/a.png"]})).is_err());
+        assert!(tool
+            .validate(&json!({"action": "compare", "paths": ["/a.png", "/b.png"]}))
+            .is_ok());
+        assert!(tool
+            .validate(&json!({"action": "compare", "paths": ["/a.png"]}))
+            .is_err());
         assert!(tool.validate(&json!({"action": "compare"})).is_err());
     }
 
     #[test]
     fn test_validate_describe() {
         let tool = ImageUnderstandTool;
-        assert!(tool.validate(&json!({"action": "describe", "path": "/tmp/img.png"})).is_ok());
+        assert!(tool
+            .validate(&json!({"action": "describe", "path": "/tmp/img.png"}))
+            .is_ok());
     }
 
     #[test]

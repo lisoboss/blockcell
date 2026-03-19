@@ -1,10 +1,12 @@
 use async_trait::async_trait;
-use blockcell_core::types::{ChatMessage, LLMResponse, ToolCallRequest};
+use blockcell_core::types::{ChatMessage, LLMResponse, StreamChunk, ToolCallRequest};
 use blockcell_core::{Error, Result};
+use futures::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
 use std::time::Duration;
+use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
 use crate::client::build_http_client;
@@ -29,9 +31,19 @@ impl GeminiProvider {
         max_tokens: u32,
         temperature: f32,
     ) -> Self {
-        Self::new_with_proxy(api_key, api_base, model, max_tokens, temperature, None, None, &[])
+        Self::new_with_proxy(
+            api_key,
+            api_base,
+            model,
+            max_tokens,
+            temperature,
+            None,
+            None,
+            &[],
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_proxy(
         api_key: &str,
         api_base: Option<&str>,
@@ -89,7 +101,8 @@ impl GeminiProvider {
                     if let Some(arr) = msg.content.as_array() {
                         let mut parts: Vec<Value> = Vec::new();
                         for block in arr {
-                            let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                            let block_type =
+                                block.get("type").and_then(|v| v.as_str()).unwrap_or("");
                             match block_type {
                                 "text" => {
                                     if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
@@ -98,14 +111,17 @@ impl GeminiProvider {
                                 }
                                 "image_url" => {
                                     // Convert data:mime;base64,xxx to Gemini inlineData format
-                                    if let Some(url) = block.get("image_url")
+                                    if let Some(url) = block
+                                        .get("image_url")
                                         .and_then(|v| v.get("url"))
                                         .and_then(|v| v.as_str())
                                     {
                                         if let Some(rest) = url.strip_prefix("data:") {
                                             if let Some(semi) = rest.find(';') {
                                                 let mime = &rest[..semi];
-                                                if let Some(data) = rest[semi..].strip_prefix(";base64,") {
+                                                if let Some(data) =
+                                                    rest[semi..].strip_prefix(";base64,")
+                                                {
                                                     parts.push(serde_json::json!({
                                                         "inlineData": {
                                                             "mimeType": mime,
@@ -193,7 +209,10 @@ impl GeminiProvider {
                         if last.get("role").and_then(|v| v.as_str()) == Some("user") {
                             if let Some(parts) = last.get_mut("parts") {
                                 if let Some(arr) = parts.as_array_mut() {
-                                    if arr.first().and_then(|v| v.get("functionResponse")).is_some()
+                                    if arr
+                                        .first()
+                                        .and_then(|v| v.get("functionResponse"))
+                                        .is_some()
                                     {
                                         arr.push(func_response);
                                         continue;
@@ -265,10 +284,13 @@ impl GeminiProvider {
                     .get("description")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let parameters = func.get("parameters").cloned().unwrap_or(serde_json::json!({
-                    "type": "object",
-                    "properties": {}
-                }));
+                let parameters = func
+                    .get("parameters")
+                    .cloned()
+                    .unwrap_or(serde_json::json!({
+                        "type": "object",
+                        "properties": {}
+                    }));
 
                 Some(serde_json::json!({
                     "name": name,
@@ -380,7 +402,10 @@ impl Provider for GeminiProvider {
                     tool_calls.push(ToolCallRequest {
                         id: format!("gemini_call_{}", i),
                         name: fc.name.clone(),
-                        arguments: fc.args.clone().unwrap_or(Value::Object(serde_json::Map::new())),
+                        arguments: fc
+                            .args
+                            .clone()
+                            .unwrap_or(Value::Object(serde_json::Map::new())),
                         thought_signature: part.thought_signature.clone(),
                     });
                 }
@@ -431,6 +456,201 @@ impl Provider for GeminiProvider {
             usage,
         })
     }
+
+    async fn chat_stream(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[Value],
+    ) -> Result<mpsc::Receiver<StreamChunk>> {
+        let model = Self::normalize_model(&self.model);
+        // Gemini 使用 streamGenerateContent 端点
+        let url = format!(
+            "{}/models/{}:streamGenerateContent?key={}&alt=sse",
+            self.api_base, model, self.api_key
+        );
+
+        let (system_instruction, contents) = Self::convert_messages(messages);
+        let gemini_tools = Self::convert_tools(tools);
+
+        let mut request = serde_json::json!({
+            "contents": contents,
+            "generationConfig": {
+                "temperature": self.temperature,
+                "maxOutputTokens": self.max_tokens,
+            }
+        });
+
+        if let Some(sys) = &system_instruction {
+            request["systemInstruction"] = serde_json::json!({
+                "parts": [{"text": sys}]
+            });
+        }
+
+        if !gemini_tools.is_empty() {
+            request["tools"] = Value::Array(gemini_tools);
+        }
+
+        info!(model = %model, "Starting Gemini streaming call");
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| Error::Provider(format!("Gemini stream request failed: {}", e)))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(Error::Provider(format!(
+                "Gemini stream API error {}: {}",
+                status, body
+            )));
+        }
+
+        let (tx, rx) = mpsc::channel(64);
+
+        tokio::spawn(async move {
+            let mut stream = response.bytes_stream();
+            let mut buffer = String::new();
+            let mut accumulated_content = String::new();
+            let mut tool_calls: Vec<ToolCallRequest> = Vec::new();
+            let mut finish_reason = "stop".to_string();
+            let mut usage = Value::Null;
+            let mut tool_call_index = 0usize;
+
+            while let Some(chunk_result) = stream.next().await {
+                match chunk_result {
+                    Ok(bytes) => {
+                        buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+                        // 处理 SSE 行
+                        while let Some(pos) = buffer.find('\n') {
+                            let line = buffer[..pos].trim().to_string();
+                            buffer = buffer[pos + 1..].to_string();
+
+                            if let Some(data) = line.strip_prefix("data: ") {
+                                if data.is_empty() {
+                                    continue;
+                                }
+
+                                // 解析 Gemini 流式响应
+                                if let Ok(resp) = serde_json::from_str::<GeminiStreamResponse>(data)
+                                {
+                                    // 处理 usage metadata
+                                    if let Some(meta) = &resp.usage_metadata {
+                                        usage = serde_json::json!({
+                                            "prompt_tokens": meta.prompt_token_count,
+                                            "completion_tokens": meta.candidates_token_count,
+                                        });
+                                    }
+
+                                    // 处理 candidates
+                                    if let Some(candidates) = &resp.candidates {
+                                        if let Some(candidate) = candidates.first() {
+                                            // 处理 finish_reason
+                                            if let Some(fr) = &candidate.finish_reason {
+                                                finish_reason = match fr.as_str() {
+                                                    "STOP" => "stop".to_string(),
+                                                    "MAX_TOKENS" => "length".to_string(),
+                                                    "SAFETY" => "content_filter".to_string(),
+                                                    other => other.to_lowercase(),
+                                                };
+                                            }
+
+                                            // 处理 content parts
+                                            if let Some(content) = &candidate.content {
+                                                for part in &content.parts {
+                                                    // 处理文本
+                                                    if let Some(text) = &part.text {
+                                                        if !text.is_empty() {
+                                                            accumulated_content.push_str(text);
+                                                            let _ = tx
+                                                                .send(StreamChunk::TextDelta {
+                                                                    delta: text.clone(),
+                                                                })
+                                                                .await;
+                                                        }
+                                                    }
+
+                                                    // 处理工具调用
+                                                    if let Some(fc) = &part.function_call {
+                                                        let idx = tool_call_index;
+                                                        tool_call_index += 1;
+
+                                                        let args = fc.args.clone().unwrap_or(
+                                                            Value::Object(serde_json::Map::new()),
+                                                        );
+
+                                                        let _ = tx
+                                                            .send(StreamChunk::ToolCallStart {
+                                                                index: idx,
+                                                                id: format!("gemini_call_{}", idx),
+                                                                name: fc.name.clone(),
+                                                            })
+                                                            .await;
+
+                                                        let args_str = serde_json::to_string(&args)
+                                                            .unwrap_or_default();
+                                                        let _ = tx
+                                                            .send(StreamChunk::ToolCallDelta {
+                                                                index: idx,
+                                                                id: format!("gemini_call_{}", idx),
+                                                                delta: args_str,
+                                                            })
+                                                            .await;
+
+                                                        tool_calls.push(ToolCallRequest {
+                                                            id: format!("gemini_call_{}", idx),
+                                                            name: fc.name.clone(),
+                                                            arguments: args,
+                                                            thought_signature: part
+                                                                .thought_signature
+                                                                .clone(),
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(StreamChunk::Error {
+                                message: e.to_string(),
+                            })
+                            .await;
+                        return;
+                    }
+                }
+            }
+
+            // 流结束，发送最终响应
+            if !tool_calls.is_empty() {
+                finish_reason = "tool_calls".to_string();
+            }
+
+            let response = LLMResponse {
+                content: if accumulated_content.is_empty() {
+                    None
+                } else {
+                    Some(accumulated_content)
+                },
+                reasoning_content: None,
+                tool_calls,
+                finish_reason,
+                usage,
+            };
+            let _ = tx.send(StreamChunk::Done { response }).await;
+        });
+
+        Ok(rx)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -474,6 +694,14 @@ struct GeminiFunctionCall {
 struct GeminiUsageMetadata {
     prompt_token_count: Option<u64>,
     candidates_token_count: Option<u64>,
+}
+
+/// Gemini 流式响应
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiStreamResponse {
+    candidates: Option<Vec<GeminiCandidate>>,
+    usage_metadata: Option<GeminiUsageMetadata>,
 }
 
 #[cfg(test)]
@@ -594,7 +822,10 @@ mod tests {
         assert_eq!(contents[1]["role"], "model");
         let parts = contents[1]["parts"].as_array().unwrap();
         assert!(parts[0].get("functionCall").is_some());
-        assert_eq!(parts[0].get("thoughtSignature").and_then(|v| v.as_str()), Some("sig_abc"));
+        assert_eq!(
+            parts[0].get("thoughtSignature").and_then(|v| v.as_str()),
+            Some("sig_abc")
+        );
     }
 
     #[test]
@@ -609,11 +840,7 @@ mod tests {
 
         let tool_result = ChatMessage::tool_result("read_file", "file contents");
 
-        let messages = vec![
-            ChatMessage::user("read /tmp/test"),
-            assistant,
-            tool_result,
-        ];
+        let messages = vec![ChatMessage::user("read /tmp/test"), assistant, tool_result];
 
         let (_system, contents) = GeminiProvider::convert_messages(&messages);
         assert_eq!(contents.len(), 3);

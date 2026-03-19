@@ -1,16 +1,18 @@
 'use client';
 
-import { useRef, useEffect, useState, useCallback } from 'react';
+import { useRef, useEffect, useState, useMemo, useCallback, memo } from 'react';
 import { Send, Loader2, Paperclip, X, FileAudio, Upload, Square } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { useChatStore } from '@/lib/store';
+import { useAgentStore, useChatStore } from '@/lib/store';
 import { wsManager } from '@/lib/ws';
 import { getSession, uploadFile } from '@/lib/api';
 import { MessageBubble } from './message-bubble';
 import { BlockcellLogo } from '../blockcell-logo';
+import { CommandPicker, CommandItem } from './command-picker';
 import { useT } from '@/lib/i18n';
 import { isMediaPath } from './media-attachment';
 import type { UiMessage } from '@/lib/store';
+import { computeVirtualWindow } from '@/lib/virtual-list';
 
 interface PendingFile {
   file: File;
@@ -18,33 +20,172 @@ interface PendingFile {
   type: 'image' | 'audio' | 'video';
 }
 
+const DEFAULT_MESSAGE_HEIGHT = 148;
+const MESSAGE_GAP_PX = 16;
+const VIRTUAL_OVERSCAN_PX = 640;
+
 export function ChatPage() {
-  const { messages, sessions, currentSessionId, setMessages, addMessage, isLoading, setLoading } = useChatStore();
+  const messages = useChatStore((s) => s.messages);
+  const sessions = useChatStore((s) => s.sessions);
+  const currentSessionId = useChatStore((s) => s.currentSessionId);
+  const setMessages = useChatStore((s) => s.setMessages);
+  const addMessage = useChatStore((s) => s.addMessage);
+  const isLoading = useChatStore((s) => s.isLoading);
+  const setLoading = useChatStore((s) => s.setLoading);
+  const selectedAgentId = useAgentStore((s) => s.selectedAgentId);
   const t = useT();
   const [input, setInput] = useState('');
   const [isDragOver, setIsDragOver] = useState(false);
   const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
   const [uploading, setUploading] = useState(false);
   const [isCancelling, setIsCancelling] = useState(false);
+  const [showCommandPicker, setShowCommandPicker] = useState(false);
+  const [commandQuery, setCommandQuery] = useState('');
+  const hasMessages = messages.length > 0;
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewportHeight, setViewportHeight] = useState(0);
+  const [messageHeights, setMessageHeights] = useState<Record<string, number>>({});
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const inputContainerRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const selectedAgentRef = useRef(selectedAgentId);
+  const currentSessionRef = useRef(currentSessionId);
+  const scrollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingFilesRef = useRef<PendingFile[]>([]);
+  const sessionMessageKeyPrefix = currentSessionId || 'draft';
+  const showLoadingIndicator = isLoading && messages[messages.length - 1]?.role !== 'assistant';
+
+  const itemHeights = useMemo(
+    () =>
+      messages.map((message) => {
+        const key = `${sessionMessageKeyPrefix}:${message.id}`;
+        return messageHeights[key] ?? DEFAULT_MESSAGE_HEIGHT;
+      }),
+    [messageHeights, messages, sessionMessageKeyPrefix],
+  );
+
+  const virtualWindow = useMemo(
+    () =>
+      computeVirtualWindow(
+        itemHeights,
+        scrollTop,
+        viewportHeight,
+        VIRTUAL_OVERSCAN_PX,
+      ),
+    [itemHeights, scrollTop, viewportHeight],
+  );
+
+  const visibleMessageIndexes = useMemo(() => {
+    if (virtualWindow.endIndex < virtualWindow.startIndex) {
+      return [];
+    }
+
+    const indexes: number[] = [];
+    for (let i = virtualWindow.startIndex; i <= virtualWindow.endIndex; i += 1) {
+      indexes.push(i);
+    }
+    return indexes;
+  }, [virtualWindow.endIndex, virtualWindow.startIndex]);
+
+  const highlightedIndex = useMemo(
+    () => messages.findIndex((message) => message.highlight),
+    [messages],
+  );
+
+  useEffect(() => {
+    selectedAgentRef.current = selectedAgentId;
+  }, [selectedAgentId]);
+
+  useEffect(() => {
+    currentSessionRef.current = currentSessionId;
+  }, [currentSessionId]);
+
+  useEffect(() => {
+    setMessageHeights({});
+    setScrollTop(0);
+  }, [sessionMessageKeyPrefix]);
+
+  useEffect(() => {
+    pendingFilesRef.current = pendingFiles;
+  }, [pendingFiles]);
+
+  useEffect(() => {
+    const container = scrollContainerRef.current;
+    if (!container) {
+      return;
+    }
+
+    const updateViewportHeight = () => {
+      setViewportHeight(container.clientHeight);
+    };
+
+    updateViewportHeight();
+
+    if (typeof ResizeObserver === 'undefined') {
+      window.addEventListener('resize', updateViewportHeight);
+      return () => window.removeEventListener('resize', updateViewportHeight);
+    }
+
+    const observer = new ResizeObserver(() => {
+      updateViewportHeight();
+    });
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      for (const pendingFile of pendingFilesRef.current) {
+        URL.revokeObjectURL(pendingFile.previewUrl);
+      }
+    };
+  }, []);
 
   // Load session history when switching sessions
   useEffect(() => {
     if (currentSessionId) {
-      // Check if this session exists in the persisted sessions list
       const isPersistedSession = sessions.some((s) => s.id === currentSessionId);
       if (isPersistedSession) {
-        loadSessionHistory(currentSessionId);
+        const currentMessages = useChatStore.getState().messages;
+        const hasOnlyOptimisticMessages = currentMessages.length > 0 && currentMessages.every((m) => m.id.startsWith('user_') || m.id.startsWith('msg_'));
+        if (!hasOnlyOptimisticMessages) {
+          loadSessionHistory(currentSessionId, selectedAgentId);
+        }
+      } else if (useChatStore.getState().messages.length > 0) {
+        setMessages([]);
       }
+    } else if (useChatStore.getState().messages.length > 0) {
+      setMessages([]);
     }
-  }, [currentSessionId]);
+  }, [currentSessionId, selectedAgentId, sessions, setMessages]);
 
-  // Auto-scroll to bottom
+  // Auto-scroll to bottom — debounced to avoid layout thrashing on every streaming token
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+    if (scrollTimerRef.current) clearTimeout(scrollTimerRef.current);
+    scrollTimerRef.current = setTimeout(() => {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'auto', block: 'end' });
+    }, 50);
+    return () => {
+      if (scrollTimerRef.current) clearTimeout(scrollTimerRef.current);
+    };
+  }, [messages, virtualWindow.totalHeight, showLoadingIndicator]);
+
+  // Scroll to highlighted message — only runs when session changes, not on every token
+  useEffect(() => {
+    const highlighted = document.querySelector('[data-highlighted-message="true"]');
+    if (highlighted) {
+      highlighted.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      return;
+    }
+
+    if (highlightedIndex >= 0 && scrollContainerRef.current) {
+      const top = virtualWindow.offsets[highlightedIndex] ?? 0;
+      const targetTop = Math.max(0, top - Math.max(0, viewportHeight / 3));
+      scrollContainerRef.current.scrollTo({ top: targetTop, behavior: 'smooth' });
+    }
+  }, [currentSessionId, highlightedIndex, viewportHeight, virtualWindow.offsets]);
 
   // Auto-focus input
   useEffect(() => {
@@ -57,9 +198,28 @@ export function ChatPage() {
     }
   }, [isLoading]);
 
-  async function loadSessionHistory(sessionId: string) {
+  const handleVirtualScroll = useCallback((e: React.UIEvent<HTMLDivElement>) => {
+    setScrollTop(e.currentTarget.scrollTop);
+  }, []);
+
+  const handleMessageHeightChange = useCallback((id: string, height: number) => {
+    setMessageHeights((prev) => {
+      if (prev[id] === height) {
+        return prev;
+      }
+      return {
+        ...prev,
+        [id]: height,
+      };
+    });
+  }, []);
+
+  async function loadSessionHistory(sessionId: string, agentId: string) {
     try {
-      const data = await getSession(sessionId);
+      const data = await getSession(sessionId, agentId);
+      if (selectedAgentRef.current !== agentId || currentSessionRef.current !== sessionId) {
+        return;
+      }
       const uiMessages: UiMessage[] = data.messages
         .filter((m) => {
           // Skip system and tool messages
@@ -75,9 +235,24 @@ export function ChatPage() {
           reasoning: m.reasoning_content || undefined,
           timestamp: Date.now() - (data.messages.length - i) * 1000,
         }));
+      const currentState = useChatStore.getState();
+      if (currentState.currentSessionId !== sessionId) {
+        return;
+      }
+      if (currentState.messages.length > 0) {
+        return;
+      }
       setMessages(uiMessages);
     } catch {
-      setMessages([]);
+      const currentState = useChatStore.getState();
+      if (
+        selectedAgentRef.current === agentId &&
+        currentSessionRef.current === sessionId &&
+        currentState.currentSessionId === sessionId &&
+        currentState.messages.length === 0
+      ) {
+        setMessages([]);
+      }
     }
   }
 
@@ -158,7 +333,7 @@ export function ChatPage() {
             };
             reader.readAsDataURL(pf.file);
           });
-          await uploadFile(uploadPath, b64, 'base64');
+          await uploadFile(uploadPath, b64, 'base64', selectedAgentId);
           mediaPaths.push(uploadPath);
           URL.revokeObjectURL(pf.previewUrl);
         }
@@ -182,29 +357,99 @@ export function ChatPage() {
       timestamp: Date.now(),
     });
 
-    // Derive chat_id from session — use the session ID directly so the
-    // runtime saves history under the same key shown in the sessions list.
-    // The session_file() helper on the server normalises ':' → '_', so
-    // "ws_1234567890" and "ws:1234567890" both map to the same file.
-    const chatId = currentSessionId.replace(/_/g, ':');
+    const hasPersistedSession = !!currentSessionId && sessions.some((s) => s.id === currentSessionId);
+    const chatId = hasPersistedSession ? currentSessionId.replace(/_/g, ':') : undefined;
 
     // Send via WebSocket
-    wsManager.sendChat(content, chatId, mediaPaths);
+    wsManager.sendChat(content, chatId, mediaPaths, selectedAgentId);
     setInput('');
     setLoading(true);
   }
 
   function handleCancel() {
     if (!isLoading || isCancelling) return;
+    if (!currentSessionId) return;
     const chatId = currentSessionId.replace(/_/g, ':');
-    wsManager.sendCancel(chatId);
+    wsManager.sendCancel(chatId, selectedAgentId);
     setIsCancelling(true);
   }
 
   function handleKeyDown(e: React.KeyboardEvent) {
+    // Handle command picker navigation
+    if (showCommandPicker) {
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'Tab' || e.key === 'Enter') {
+        // Let CommandPicker handle these
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        setShowCommandPicker(false);
+        setCommandQuery('');
+        return;
+      }
+    }
+
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSend();
+    }
+  }
+
+  function handleInputChange(e: React.ChangeEvent<HTMLTextAreaElement>) {
+    const value = e.target.value;
+    setInput(value);
+
+    // Detect "/" at start of line or after space
+    const cursorPos = e.target.selectionStart;
+    const textBeforeCursor = value.slice(0, cursorPos);
+    const lastNewline = textBeforeCursor.lastIndexOf('\n');
+    const textAfterLastNewline = textBeforeCursor.slice(lastNewline + 1);
+
+    // Find the last '/' in the current line
+    const lastSlash = textAfterLastNewline.lastIndexOf('/');
+    if (lastSlash !== -1) {
+      // Check if '/' is at start or after a space
+      const isAtStart = lastSlash === 0;
+      const isAfterSpace = lastSlash > 0 && textAfterLastNewline[lastSlash - 1] === ' ';
+
+      if (isAtStart || isAfterSpace) {
+        const afterSlash = textAfterLastNewline.slice(lastSlash + 1);
+        // Check if there's no space after '/' (still typing command)
+        if (!afterSlash.includes(' ')) {
+          setShowCommandPicker(true);
+          setCommandQuery(afterSlash);
+          return;
+        }
+      }
+    }
+
+    setShowCommandPicker(false);
+    setCommandQuery('');
+  }
+
+  function handleCommandSelect(item: CommandItem) {
+    // Insert the command name at cursor position
+    const cursorPos = inputRef.current?.selectionStart || 0;
+    const textBeforeCursor = input.slice(0, cursorPos);
+    const textAfterCursor = input.slice(cursorPos);
+
+    // Find the start of the "/" command (use lastIndexOf to find the last '/')
+    const lastNewline = textBeforeCursor.lastIndexOf('\n');
+    const slashPos = textBeforeCursor.lastIndexOf('/');
+
+    if (slashPos !== -1 && slashPos > lastNewline) {
+      // Replace from "/" to cursor with the command name
+      const newText = input.slice(0, slashPos) + '/' + item.name + ' ' + textAfterCursor;
+      setInput(newText);
+      setShowCommandPicker(false);
+      setCommandQuery('');
+
+      // Focus input and move cursor after the inserted command
+      setTimeout(() => {
+        inputRef.current?.focus();
+        const newCursorPos = slashPos + 1 + item.name.length + 1;
+        inputRef.current?.setSelectionRange(newCursorPos, newCursorPos);
+      }, 0);
     }
   }
 
@@ -223,9 +468,13 @@ export function ChatPage() {
         </div>
       )}
       {/* Messages area */}
-      <div className="flex-1 overflow-y-auto px-4 py-6">
-        <div className="max-w-3xl mx-auto space-y-4">
-          {messages.length === 0 && (
+      <div
+        ref={scrollContainerRef}
+        onScroll={handleVirtualScroll}
+        className="flex-1 overflow-y-auto px-4 py-6"
+      >
+        <div className="max-w-3xl mx-auto">
+          {!hasMessages && (
             <div className="flex flex-col items-center pt-8 pb-4 text-muted-foreground">
               <div className="mb-3">
                 <BlockcellLogo size="md" />
@@ -234,15 +483,36 @@ export function ChatPage() {
               <p className="text-sm">{t('chat.emptyHint')}</p>
             </div>
           )}
-          {messages.map((msg) => (
-            <MessageBubble key={msg.id} message={msg} />
-          ))}
-          {isLoading && messages[messages.length - 1]?.role !== 'assistant' && (
-            <div className="flex items-center gap-2 text-muted-foreground text-sm">
+
+          {hasMessages && (
+            <div
+              className="relative"
+              style={{ height: `${virtualWindow.totalHeight}px` }}
+            >
+              {visibleMessageIndexes.map((index) => {
+                const message = messages[index];
+                const scopedId = `${sessionMessageKeyPrefix}:${message.id}`;
+
+                return (
+                  <VirtualizedMessageRow
+                    key={scopedId}
+                    itemId={scopedId}
+                    top={virtualWindow.offsets[index] ?? 0}
+                    message={message}
+                    onHeightChange={handleMessageHeightChange}
+                  />
+                );
+              })}
+            </div>
+          )}
+
+          {showLoadingIndicator && (
+            <div className="mt-4 flex items-center gap-2 text-muted-foreground text-sm">
               <Loader2 size={16} className="animate-spin" />
               <span>{t('chat.thinking')}</span>
             </div>
           )}
+
           <div ref={messagesEndRef} />
         </div>
       </div>
@@ -280,7 +550,19 @@ export function ChatPage() {
             </div>
           )}
 
-          <div className="flex items-end gap-2 bg-card border border-border rounded-xl p-2">
+          <div ref={inputContainerRef} className="flex items-end gap-2 bg-card border border-border rounded-xl p-2 relative">
+            {/* Command Picker */}
+            <CommandPicker
+              open={showCommandPicker}
+              query={commandQuery}
+              onSelect={handleCommandSelect}
+              onClose={() => {
+                setShowCommandPicker(false);
+                setCommandQuery('');
+              }}
+              containerRef={inputContainerRef}
+            />
+
             {/* Hidden file input */}
             <input
               ref={fileInputRef}
@@ -304,7 +586,7 @@ export function ChatPage() {
             <textarea
               ref={inputRef}
               value={input}
-              onChange={(e) => setInput(e.target.value)}
+              onChange={handleInputChange}
               onKeyDown={handleKeyDown}
               placeholder={t('chat.inputPlaceholder')}
               className="flex-1 bg-transparent resize-none outline-none text-sm min-h-[40px] max-h-[200px] px-2"
@@ -332,3 +614,55 @@ export function ChatPage() {
     </div>
   );
 }
+
+const VirtualizedMessageRow = memo(function VirtualizedMessageRow({
+  itemId,
+  top,
+  message,
+  onHeightChange,
+}: {
+  itemId: string;
+  top: number;
+  message: UiMessage;
+  onHeightChange: (id: string, height: number) => void;
+}) {
+  const rowRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const node = rowRef.current;
+    if (!node) {
+      return;
+    }
+
+    const reportHeight = () => {
+      onHeightChange(itemId, Math.ceil(node.getBoundingClientRect().height));
+    };
+
+    reportHeight();
+
+    if (typeof ResizeObserver === 'undefined') {
+      return;
+    }
+
+    const observer = new ResizeObserver(() => {
+      reportHeight();
+    });
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [itemId, onHeightChange]);
+
+  return (
+    <div
+      ref={rowRef}
+      style={{
+        position: 'absolute',
+        top,
+        left: 0,
+        right: 0,
+        paddingBottom: `${MESSAGE_GAP_PX}px`,
+      }}
+    >
+      <MessageBubble message={message} />
+    </div>
+  );
+});

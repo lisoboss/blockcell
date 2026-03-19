@@ -35,15 +35,14 @@ const config: Config = {
           DEFAULT: 'hsl(var(--card))',
           foreground: 'hsl(var(--card-foreground))',
         },
-        // Brand colors from blockcell.dev
         rust: {
           DEFAULT: '#ea580c',
           light: '#f97316',
           dark: '#c2410c',
         },
         cyber: {
-          DEFAULT: '#00ff9d',
-          dim: 'rgba(0, 255, 157, 0.3)',
+          DEFAULT: 'hsl(var(--cyber))',
+          dim: 'hsl(var(--cyber) / 0.3)',
         },
         slate: {
           950: '#020617',

@@ -1,67 +1,58 @@
-pub mod fs;
-pub mod exec;
-pub mod web;
-pub mod html_to_md;
-pub mod message;
-pub mod spawn;
-pub mod cron;
-pub mod office;
-pub mod tasks;
-pub mod browser;
-pub mod memory;
-pub mod skills;
-pub mod system_info;
-pub mod camera;
-pub mod app_control;
-pub mod file_ops;
-pub mod data_process;
-pub mod http_request;
-pub mod email;
-pub mod audio_transcribe;
-pub mod chart_generate;
-pub mod office_write;
-pub mod calendar_api;
-pub mod iot_control;
-pub mod tts;
-pub mod ocr;
-pub mod image_understand;
-pub mod social_media;
-pub mod notification;
-pub mod cloud_api;
-pub mod git_api;
-pub mod finance_api;
-pub mod video_process;
-pub mod health_api;
-pub mod map_api;
-pub mod contacts;
-pub mod encrypt;
-pub mod network_monitor;
-pub mod knowledge_graph;
-pub mod stream_subscribe;
+pub mod agent_status;
+pub mod session_recall;
 pub mod alert_rule;
-pub mod blockchain_rpc;
-pub mod exchange_api;
-pub mod blockchain_tx;
-pub mod contract_security;
-pub mod bridge_api;
-pub mod nft_market;
-pub mod multisig;
+pub mod app_control;
+pub mod audio_transcribe;
+pub mod browser;
+pub mod camera;
+pub mod chart_generate;
 pub mod community_hub;
-pub mod memory_maintenance;
-pub mod toggle_manage;
-pub mod termux_api;
+pub mod cron;
+pub mod data_process;
+pub mod email;
+pub mod encrypt;
+pub mod exec;
+pub mod exec_local;
+pub mod file_ops;
+pub mod fs;
+pub mod html_to_md;
+pub mod http_request;
+pub mod image_understand;
+pub mod knowledge_graph;
 pub mod mcp;
+pub mod memory;
+pub mod memory_maintenance;
+pub mod message;
+pub mod network_monitor;
+pub mod ocr;
+pub mod office;
+pub mod office_write;
 pub mod registry;
+pub mod registry_builder;
+pub mod skills;
+pub mod spawn;
+pub mod stream_subscribe;
+pub mod system_info;
+pub mod tasks;
+pub mod termux_api;
+pub mod toggle_manage;
+pub mod tts;
+pub mod video_process;
+pub mod web;
 
 use async_trait::async_trait;
-use blockcell_core::{Config, OutboundMessage, Result};
+use blockcell_core::system_event::{EventPriority, SystemEvent};
 use blockcell_core::types::PermissionSet;
+use blockcell_core::{Config, OutboundMessage, Result};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
 pub use registry::ToolRegistry;
+pub use registry_builder::{
+    build_tool_registry_for_agent_config, build_tool_registry_with_all_mcp,
+};
 
 /// Truncate a string to at most `max_chars` characters, respecting UTF-8 char boundaries.
 /// Returns a borrowed slice if no truncation needed, or an owned String if truncated.
@@ -85,7 +76,13 @@ pub type OutboundSender = mpsc::Sender<OutboundMessage>;
 #[async_trait]
 pub trait SpawnHandle: Send + Sync {
     /// Spawn a subagent task. Returns a JSON string with task_id and status.
-    fn spawn(&self, task: &str, label: &str, origin_channel: &str, origin_chat_id: &str) -> Result<Value>;
+    fn spawn(
+        &self,
+        task: &str,
+        label: &str,
+        origin_channel: &str,
+        origin_chat_id: &str,
+    ) -> Result<Value>;
 }
 
 /// Opaque handle to the task manager, passed through ToolContext.
@@ -95,11 +92,35 @@ pub type TaskManagerHandle = Arc<dyn TaskManagerOps + Send + Sync>;
 /// Opaque handle to the memory store, passed through ToolContext.
 pub type MemoryStoreHandle = Arc<dyn MemoryStoreOps + Send + Sync>;
 
+/// Opaque handle to the response cache, passed through ToolContext.
+pub type ResponseCacheHandle = Arc<dyn ResponseCacheOps + Send + Sync>;
+
 /// Opaque handle to the capability registry, passed through ToolContext.
 pub type CapabilityRegistryHandle = Arc<Mutex<dyn CapabilityRegistryOps + Send + Sync>>;
 
 /// Opaque handle to the core evolution engine, passed through ToolContext.
 pub type CoreEvolutionHandle = Arc<Mutex<dyn CoreEvolutionOps + Send + Sync>>;
+
+/// Opaque handle to the system event emitter, passed through ToolContext.
+pub type EventEmitterHandle = Arc<dyn SystemEventEmitter + Send + Sync>;
+
+/// Trait abstracting system event emission needed by tools and runtime services.
+pub trait SystemEventEmitter: Send + Sync {
+    fn emit(&self, event: SystemEvent);
+
+    fn emit_simple(
+        &self,
+        kind: &str,
+        source: &str,
+        priority: EventPriority,
+        title: &str,
+        summary: &str,
+    ) {
+        self.emit(SystemEvent::new_main_session(
+            kind, source, priority, title, summary,
+        ));
+    }
+}
 
 /// Trait abstracting capability registry operations needed by tools.
 #[async_trait]
@@ -122,7 +143,12 @@ pub trait CapabilityRegistryOps: Send + Sync {
 #[async_trait]
 pub trait CoreEvolutionOps: Send + Sync {
     /// Request a new capability evolution.
-    async fn request_capability(&self, capability_id: &str, description: &str, provider_kind_str: &str) -> Result<Value>;
+    async fn request_capability(
+        &self,
+        capability_id: &str,
+        description: &str,
+        provider_kind_str: &str,
+    ) -> Result<Value>;
     /// List evolution records as JSON.
     async fn list_records_json(&self) -> Result<Value>;
     /// Get a specific evolution record.
@@ -160,6 +186,13 @@ pub trait MemoryStoreOps: Send + Sync {
     fn maintenance(&self, recycle_days: i64) -> Result<(usize, usize)>;
 }
 
+/// Trait abstracting session response cache operations needed by tools.
+/// The cache stores large list/table responses and allows retrieval by ref_id.
+pub trait ResponseCacheOps: Send + Sync {
+    /// Recall a cached response by ref_id. Returns JSON string.
+    fn recall_json(&self, session_key: &str, ref_id: &str) -> String;
+}
+
 /// Trait abstracting task manager operations needed by tools.
 #[async_trait]
 pub trait TaskManagerOps: Send + Sync {
@@ -172,8 +205,10 @@ pub trait TaskManagerOps: Send + Sync {
 pub struct ToolContext {
     pub workspace: PathBuf,
     pub builtin_skills_dir: Option<PathBuf>,
+    pub active_skill_dir: Option<PathBuf>,
     pub session_key: String,
     pub channel: String,
+    pub account_id: Option<String>,
     pub chat_id: String,
     pub config: Config,
     pub permissions: PermissionSet,
@@ -183,6 +218,11 @@ pub struct ToolContext {
     pub spawn_handle: Option<Arc<dyn SpawnHandle>>,
     pub capability_registry: Option<CapabilityRegistryHandle>,
     pub core_evolution: Option<CoreEvolutionHandle>,
+    pub event_emitter: Option<EventEmitterHandle>,
+    /// Path to channel_contacts.json for cross-channel contact lookup.
+    pub channel_contacts_file: Option<PathBuf>,
+    /// Session response cache handle for session_recall tool.
+    pub response_cache: Option<ResponseCacheHandle>,
 }
 
 pub struct ToolSchema {
@@ -191,12 +231,46 @@ pub struct ToolSchema {
     pub parameters: Value,
 }
 
+/// Context passed to `Tool::prompt_rule()` so each tool can emit channel-aware / intent-aware rules.
+pub struct PromptContext<'a> {
+    pub channel: &'a str,
+    /// Intent category names (e.g. "Finance", "Blockchain", "Chat") resolved by the caller.
+    /// Tools can use this to conditionally emit detailed domain-specific guidelines.
+    pub intents: &'a [String],
+}
+
+impl<'a> PromptContext<'a> {
+    pub fn is_im_channel(&self) -> bool {
+        matches!(
+            self.channel,
+            "wecom"
+                | "feishu"
+                | "lark"
+                | "telegram"
+                | "slack"
+                | "discord"
+                | "dingtalk"
+                | "whatsapp"
+        )
+    }
+
+    pub fn has_intent(&self, name: &str) -> bool {
+        self.intents.iter().any(|i| i == name)
+    }
+}
+
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn schema(&self) -> ToolSchema;
     fn validate(&self, params: &Value) -> Result<()>;
     fn required_permissions(&self, _params: &Value) -> PermissionSet {
         PermissionSet::new()
+    }
+    /// Return an optional system-prompt rule describing how the LLM should use this tool.
+    /// Each line should be a markdown list item starting with `- `.
+    /// Return `None` (default) if the tool needs no special instructions.
+    fn prompt_rule(&self, _ctx: &PromptContext) -> Option<String> {
+        None
     }
     async fn execute(&self, ctx: ToolContext, params: Value) -> Result<Value>;
 }

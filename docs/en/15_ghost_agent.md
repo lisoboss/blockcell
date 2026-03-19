@@ -1,7 +1,6 @@
 # Article 15: Ghost Agent — Background Maintenance and Community Sync
 
-> Series: *In-Depth Analysis of the Open Source Project “blockcell”* — 15/16
-
+> Series: *In-Depth Analysis of the Open Source Project “blockcell”* — Article 15
 ---
 
 ## Why a “Ghost Agent”
@@ -32,7 +31,7 @@ Core implementation:
 
 ---
 
-## Configuration (`config.json`)
+## Configuration (`config.json5`)
 
 Ghost configuration lives under `agents.ghost`:
 

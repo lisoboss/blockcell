@@ -8,11 +8,12 @@ import {
 import {
   getEvolution, getSkills, getTools,
   triggerEvolution, deleteEvolution, testSkill, getTestSuggestion, getEvolutionSummary,
-  searchSkills,
+  searchSkills, getEvolutionDetail,
   type EvolutionRecord, type EvolutionSummary,
 } from '@/lib/api';
 import { useT } from '@/lib/i18n';
 import { wsManager } from '@/lib/ws';
+import { MarkdownContent } from '@/components/chat/markdown-content';
 
 type Tab = 'overview' | 'skills' | 'test';
 
@@ -20,7 +21,7 @@ type Tab = 'overview' | 'skills' | 'test';
 
 function statusColor(status: string): string {
   switch (status) {
-    case 'Completed': case 'Active': case 'TestPassed': case 'Observing': case 'Deployed': return 'text-cyber';
+    case 'Completed': case 'Active': case 'TestPassed': case 'Observing': case 'Deployed': return 'text-[hsl(var(--brand-green))]';
     case 'Triggered': case 'Requested': return 'text-blue-400';
     case 'Generating': case 'Compiling': case 'Auditing': case 'Validating':
     case 'RollingOut': case 'Generated': case 'AuditPassed': case 'CompilePassed':
@@ -31,10 +32,16 @@ function statusColor(status: string): string {
   }
 }
 
+function patchDiffToMarkdown(diff: string): string {
+  if (!diff) return '';
+  if (diff.includes('```')) return diff;
+  return `\n\n\`\`\`diff\n${diff}\n\`\`\`\n`;
+}
+
 function statusIcon(status: string) {
   switch (status) {
     case 'Completed': case 'Active': case 'TestPassed': case 'Observing': case 'Deployed':
-      return <CheckCircle size={14} className="text-cyber" />;
+      return <CheckCircle size={14} className="text-[hsl(var(--brand-green))]" />;
     case 'Triggered': case 'Requested':
       return <Zap size={14} className="text-blue-400" />;
     case 'Generating': case 'Compiling': case 'Auditing': case 'Validating':
@@ -93,6 +100,7 @@ const CAP_STAGES = [
 function PipelineStages({ status, stages }: { status: string; stages: string[] }) {
   const currentIdx = stages.indexOf(status);
   const isFailed = ['Failed', 'AuditFailed', 'DryRunFailed', 'TestFailed', 'RolledBack', 'Blocked'].includes(status);
+  const completedStageClass = 'bg-[hsl(var(--brand-green))]';
 
   return (
     <div className="flex items-center gap-1">
@@ -103,13 +111,13 @@ function PipelineStages({ status, stages }: { status: string; stages: string[] }
 
         let dotClass = 'w-2 h-2 rounded-full transition-all ';
         if (isCompleted && i <= stages.length - 1) {
-          dotClass += 'bg-cyber';
+          dotClass += completedStageClass;
         } else if (isActive && isFailed) {
           dotClass += 'bg-red-400';
         } else if (isActive) {
           dotClass += 'bg-yellow-400 animate-pulse';
         } else if (isPast) {
-          dotClass += 'bg-cyber';
+          dotClass += completedStageClass;
         } else {
           dotClass += 'bg-muted';
         }
@@ -118,7 +126,7 @@ function PipelineStages({ status, stages }: { status: string; stages: string[] }
           <div key={stage} className="flex items-center gap-1">
             <div className={dotClass} title={stage} />
             {i < stages.length - 1 && (
-              <div className={`w-3 h-px ${isPast || (isCompleted) ? 'bg-cyber' : 'bg-muted'}`} />
+              <div className={`w-3 h-px ${isPast || isCompleted ? 'bg-[hsl(var(--brand-green))]' : 'bg-muted'}`} />
             )}
           </div>
         );
@@ -332,7 +340,7 @@ export function EvolutionPage() {
         <div className="flex items-center gap-2">
           <button
             onClick={() => { setShowNewSkill(!showNewSkill); setSearchResults(null); setNewSkillDesc(''); setNewSkillName(''); }}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-cyber/10 text-cyber border border-cyber/30 hover:bg-cyber/20 transition-colors"
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-[hsl(var(--brand-green)/0.10)] text-[hsl(var(--brand-green))] border border-[hsl(var(--brand-green)/0.28)] hover:bg-[hsl(var(--brand-green)/0.16)] transition-colors"
           >
             <Plus size={12} />
             {t('evolution.triggerNew')}
@@ -351,7 +359,7 @@ export function EvolutionPage() {
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
           <MiniStat label={t('evolution.totalRecords')} value={String(skillRecords.length)} icon={<GitBranch size={16} />} />
           <MiniStat label={t('evolution.evolving')} value={String(activeSkills)} icon={<Loader2 size={16} className="animate-spin" />} color="text-yellow-400" />
-          <MiniStat label={t('evolution.completed')} value={String(completedSkills)} icon={<CheckCircle size={16} />} color="text-cyber" />
+          <MiniStat label={t('evolution.completed')} value={String(completedSkills)} icon={<CheckCircle size={16} />} color="text-[hsl(var(--brand-green))]" />
           <MiniStat label={t('evolution.failed')} value={String(failedSkills)} icon={<XCircle size={16} />} color="text-red-400" />
           <MiniStat label={t('evolution.skills')} value={String(skills.length)} icon={<Code2 size={16} />} />
           <MiniStat label={t('evolution.tools')} value={String(toolCount)} icon={<Code2 size={16} />} color="text-purple-400" />
@@ -359,10 +367,10 @@ export function EvolutionPage() {
 
         {/* New Skill creation form */}
         {showNewSkill && (
-          <div className="border border-cyber/30 rounded-xl p-5 bg-cyber/5 space-y-4">
+          <div className="border border-[hsl(var(--brand-green)/0.28)] rounded-xl p-5 bg-[hsl(var(--brand-green)/0.05)] space-y-4">
             <div className="flex items-center justify-between">
               <h3 className="text-sm font-semibold flex items-center gap-2">
-                <Sparkles size={14} className="text-cyber" />
+                <Sparkles size={14} className="text-[hsl(var(--brand-green))]" />
                 {t('evolution.newSkillTitle')}
               </h3>
               <button onClick={() => setShowNewSkill(false)} className="text-muted-foreground hover:text-foreground p-1">
@@ -379,7 +387,7 @@ export function EvolutionPage() {
                 onChange={e => { setNewSkillDesc(e.target.value); setSearchResults(null); }}
                 placeholder={t('evolution.newSkillPlaceholder')}
                 rows={3}
-                className="w-full px-3 py-2 text-sm rounded-lg border border-border bg-background focus:outline-none focus:ring-1 focus:ring-cyber resize-none"
+                className="w-full px-3 py-2 text-sm rounded-lg border border-border bg-background focus:outline-none focus:ring-1 focus:ring-[hsl(var(--brand-green)/0.35)] resize-none"
               />
             </div>
 
@@ -389,7 +397,7 @@ export function EvolutionPage() {
                 <button
                   onClick={handleNewSkillSearch}
                   disabled={searchingSkills || !newSkillDesc.trim()}
-                  className="flex items-center gap-1.5 px-4 py-1.5 text-xs font-medium rounded-lg bg-cyber/15 text-cyber border border-cyber/30 hover:bg-cyber/25 disabled:opacity-50 transition-colors"
+                  className="flex items-center gap-1.5 px-4 py-1.5 text-xs font-medium rounded-lg bg-[hsl(var(--brand-green)/0.12)] text-[hsl(var(--brand-green))] border border-[hsl(var(--brand-green)/0.28)] hover:bg-[hsl(var(--brand-green)/0.18)] disabled:opacity-50 transition-colors"
                 >
                   {searchingSkills ? <Loader2 size={12} className="animate-spin" /> : <Search size={12} />}
                   {searchingSkills ? t('evolution.searchingSkills') : t('common.search')}
@@ -415,7 +423,7 @@ export function EvolutionPage() {
                             <div className="flex items-center gap-2">
                               <span className="font-medium text-sm">{r.name}</span>
                               <span className={`text-[9px] px-1.5 py-0.5 rounded font-medium ${
-                                r.source === 'builtin' ? 'bg-blue-400/10 text-blue-400' : 'bg-cyber/10 text-cyber'
+                                r.source === 'builtin' ? 'bg-blue-400/10 text-blue-400' : 'bg-[hsl(var(--brand-green)/0.10)] text-[hsl(var(--brand-green))]'
                               }`}>{r.source}</span>
                               <span className="text-[9px] text-muted-foreground">
                                 {t('evolution.matchScore')}: {r.score}
@@ -424,13 +432,10 @@ export function EvolutionPage() {
                             {r.description && (
                               <p className="text-[10px] text-muted-foreground mt-0.5 truncate">{r.description}</p>
                             )}
-                            {r.triggers && (
-                              <p className="text-[10px] text-muted-foreground/60 mt-0.5 truncate">{r.triggers}</p>
-                            )}
                           </div>
                           <button
                             onClick={() => handleUseExisting(r.name)}
-                            className="shrink-0 px-2.5 py-1 text-[10px] font-medium rounded-md bg-cyber/15 text-cyber border border-cyber/30 hover:bg-cyber/25 transition-colors"
+                            className="shrink-0 px-2.5 py-1 text-[10px] font-medium rounded-md bg-[hsl(var(--brand-green)/0.12)] text-[hsl(var(--brand-green))] border border-[hsl(var(--brand-green)/0.28)] hover:bg-[hsl(var(--brand-green)/0.18)] transition-colors"
                           >
                             {t('evolution.useExisting')}
                           </button>
@@ -440,8 +445,8 @@ export function EvolutionPage() {
                   </>
                 ) : (
                   <div className="flex items-center gap-2 text-xs">
-                    <Sparkles size={12} className="text-cyber" />
-                    <span className="text-cyber">{t('evolution.noSimilarSkills')}</span>
+                    <Sparkles size={12} className="text-[hsl(var(--brand-green))]" />
+                    <span className="text-[hsl(var(--brand-green))]">{t('evolution.noSimilarSkills')}</span>
                   </div>
                 )}
 
@@ -454,7 +459,7 @@ export function EvolutionPage() {
                       value={newSkillName}
                       onChange={e => setNewSkillName(e.target.value)}
                       placeholder={t('evolution.newSkillNamePlaceholder')}
-                      className="w-full px-3 py-1.5 text-sm rounded-lg border border-border bg-background focus:outline-none focus:ring-1 focus:ring-cyber font-mono"
+                      className="w-full px-3 py-1.5 text-sm rounded-lg border border-border bg-background focus:outline-none focus:ring-1 focus:ring-[hsl(var(--brand-green)/0.35)] font-mono"
                       onKeyDown={e => e.key === 'Enter' && handleCreateNewSkill()}
                     />
                   </div>
@@ -468,7 +473,7 @@ export function EvolutionPage() {
                     <button
                       onClick={handleCreateNewSkill}
                       disabled={creatingSkill || !newSkillName.trim() || !newSkillDesc.trim()}
-                      className="flex items-center gap-1.5 px-4 py-1.5 text-xs font-medium rounded-lg bg-cyber text-white hover:bg-cyber/90 disabled:opacity-50 transition-colors"
+                      className="flex items-center gap-1.5 px-4 py-1.5 text-xs font-medium rounded-lg bg-[hsl(var(--brand-green))] text-white hover:bg-[hsl(var(--brand-green-strong))] disabled:opacity-50 transition-colors"
                     >
                       {creatingSkill ? <Loader2 size={12} className="animate-spin" /> : <Sparkles size={12} />}
                       {searchResults.length > 0 ? t('evolution.proceedCreate') : t('evolution.createSkill')}
@@ -492,7 +497,7 @@ export function EvolutionPage() {
               onClick={() => setTab(item.id)}
               className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
                 tab === item.id
-                  ? 'border-rust text-rust'
+                  ? 'border-[hsl(var(--brand-green))] text-[hsl(var(--brand-green))]'
                   : 'border-transparent text-muted-foreground hover:text-foreground'
               }`}
             >
@@ -512,7 +517,7 @@ export function EvolutionPage() {
                   onClick={() => setStatusFilter(f)}
                   className={`px-2 py-1 text-[10px] font-medium rounded uppercase tracking-wider transition-colors ${
                     statusFilter === f
-                      ? 'bg-rust/15 text-rust'
+                      ? 'bg-[hsl(var(--brand-green)/0.10)] text-[hsl(var(--brand-green))]'
                       : 'text-muted-foreground hover:text-foreground'
                   }`}
                 >
@@ -560,7 +565,7 @@ export function EvolutionPage() {
               {/* Loading overlay */}
               {(loadingSuggestion || testing) && (
                 <div className="absolute inset-0 z-10 flex flex-col items-center justify-center rounded-xl bg-background/80 backdrop-blur-sm">
-                  <Loader2 size={24} className="animate-spin text-cyber mb-3" />
+                  <Loader2 size={24} className="animate-spin text-[hsl(var(--brand-green))] mb-3" />
                   <span className="text-xs text-muted-foreground">
                     {loadingSuggestion ? t('evolution.loadingSuggestion') : t('evolution.executingTest')}
                   </span>
@@ -568,7 +573,7 @@ export function EvolutionPage() {
               )}
 
               <h3 className="text-sm font-semibold flex items-center gap-2">
-                <FlaskConical size={14} className="text-cyber" />
+                <FlaskConical size={14} className="text-[hsl(var(--brand-green))]" />
                 {t('evolution.testAndEvolveTitle')}
               </h3>
               <p className="text-xs text-muted-foreground">{t('evolution.testAndEvolveDesc')}</p>
@@ -581,7 +586,7 @@ export function EvolutionPage() {
                     value={testSkillName}
                     onChange={e => handleSkillSelect(e.target.value)}
                     disabled={loadingSuggestion || testing}
-                    className="w-full px-3 py-1.5 text-sm rounded-lg border border-border bg-background focus:outline-none focus:ring-1 focus:ring-cyber disabled:opacity-50"
+                    className="w-full px-3 py-1.5 text-sm rounded-lg border border-border bg-background focus:outline-none focus:ring-1 focus:ring-[hsl(var(--brand-green)/0.35)] disabled:opacity-50"
                   >
                     <option value="">{t('evolution.selectSkill')}</option>
                     {allSkillNames.map(name => (
@@ -593,7 +598,7 @@ export function EvolutionPage() {
                   <label className="text-xs text-muted-foreground mb-1 block">
                     {t('evolution.testInput')}
                     {testInput && !loadingSuggestion && (
-                      <span className="ml-2 text-[10px] text-cyber/60">{t('evolution.aiSuggested')}</span>
+                      <span className="ml-2 text-[10px] text-[hsl(var(--brand-green)/0.60)]">{t('evolution.aiSuggested')}</span>
                     )}
                   </label>
                   <textarea
@@ -602,7 +607,7 @@ export function EvolutionPage() {
                     placeholder={t('evolution.testInputPlaceholder')}
                     rows={4}
                     disabled={loadingSuggestion || testing}
-                    className="w-full px-3 py-2 text-sm rounded-lg border border-border bg-background focus:outline-none focus:ring-1 focus:ring-cyber resize-none font-mono disabled:opacity-50"
+                    className="w-full px-3 py-2 text-sm rounded-lg border border-border bg-background focus:outline-none focus:ring-1 focus:ring-[hsl(var(--brand-green)/0.35)] resize-none font-mono disabled:opacity-50"
                   />
                 </div>
               </div>
@@ -611,7 +616,7 @@ export function EvolutionPage() {
                 <button
                   onClick={handleTest}
                   disabled={testing || loadingSuggestion || !testSkillName.trim() || !testInput.trim()}
-                  className="flex items-center gap-1.5 px-4 py-1.5 text-xs font-medium rounded-lg bg-cyber/15 text-cyber border border-cyber/30 hover:bg-cyber/25 disabled:opacity-50 transition-colors"
+                  className="flex items-center gap-1.5 px-4 py-1.5 text-xs font-medium rounded-lg bg-[hsl(var(--brand-green)/0.12)] text-[hsl(var(--brand-green))] border border-[hsl(var(--brand-green)/0.28)] hover:bg-[hsl(var(--brand-green)/0.18)] disabled:opacity-50 transition-colors"
                 >
                   {testing ? <Loader2 size={12} className="animate-spin" /> : <Send size={12} />}
                   {t('evolution.runTest')}
@@ -624,17 +629,17 @@ export function EvolutionPage() {
                   <div className={`rounded-lg p-3 text-sm border ${
                     testResult.error || testResult.status === 'failed'
                       ? 'border-red-500/30 bg-red-500/5'
-                      : 'border-cyber/30 bg-cyber/5'
+                      : 'border-[hsl(var(--brand-green)/0.28)] bg-[hsl(var(--brand-green)/0.05)]'
                   }`}>
                     {/* Status header */}
                     <div className="flex items-center gap-2 mb-2">
                       {testResult.status === 'completed' ? (
-                        <CheckCircle size={14} className="text-cyber" />
+                        <CheckCircle size={14} className="text-[hsl(var(--brand-green))]" />
                       ) : (
                         <XCircle size={14} className="text-red-400" />
                       )}
                       <span className={`font-medium text-xs ${
-                        testResult.status === 'completed' ? 'text-cyber' : 'text-red-400'
+                        testResult.status === 'completed' ? 'text-[hsl(var(--brand-green))]' : 'text-red-400'
                       }`}>
                         {testResult.status === 'completed' ? 'Test Completed' : 'Test Failed'}
                       </span>
@@ -666,7 +671,7 @@ export function EvolutionPage() {
                       <span className="text-xs text-muted-foreground flex-1">{t('evolution.testAndEvolveDesc')}</span>
                       <button
                         onClick={() => { setTestResult(null); setShowEvolveForm(false); }}
-                        className="flex items-center gap-1.5 px-3 py-1.5 text-[11px] font-medium rounded-lg bg-cyber/10 text-cyber border border-cyber/30 hover:bg-cyber/20 transition-colors"
+                        className="flex items-center gap-1.5 px-3 py-1.5 text-[11px] font-medium rounded-lg bg-[hsl(var(--brand-green)/0.10)] text-[hsl(var(--brand-green))] border border-[hsl(var(--brand-green)/0.28)] hover:bg-[hsl(var(--brand-green)/0.16)] transition-colors"
                       >
                         <ThumbsUp size={11} />
                         {t('evolution.testResultSatisfied')}
@@ -760,9 +765,9 @@ function OverviewTab({
           <ArchLayer
             label={t('evolution.layerSkill')}
             desc={`SKILL.rhai + SKILL.md — ${inv.user_skills + inv.builtin_skills} ${t('evolution.registered')}`}
-            color="text-cyber"
-            borderColor="border-cyber/40"
-            bgColor="bg-cyber/5"
+            color="text-[hsl(var(--brand-green))]"
+            borderColor="border-[hsl(var(--brand-green)/0.28)]"
+            bgColor="bg-[hsl(var(--brand-green)/0.05)]"
             badge={se.active > 0 ? `${se.active} ${t('evolution.evolving').toLowerCase()}` : undefined}
           />
           <div className="flex justify-center text-muted-foreground">▼</div>
@@ -781,13 +786,13 @@ function OverviewTab({
         {/* Skill Evolution */}
         <div className="border border-border rounded-xl p-4 bg-card">
           <div className="flex items-center gap-2 mb-3">
-            <Dna size={14} className="text-cyber" />
+            <Dna size={14} className="text-[hsl(var(--brand-green))]" />
             <h3 className="text-sm font-semibold">{t('evolution.skillEvolution')}</h3>
           </div>
           <p className="text-[10px] text-muted-foreground mb-3">{t('evolution.skillDesc')}</p>
           <div className="grid grid-cols-3 gap-2 mb-3">
             <div className="text-center p-2 rounded-lg bg-muted/30">
-              <p className="text-lg font-bold text-cyber">{se.completed}</p>
+              <p className="text-lg font-bold text-[hsl(var(--brand-green))]">{se.completed}</p>
               <p className="text-[9px] text-muted-foreground uppercase">{t('evolution.completed')}</p>
             </div>
             <div className="text-center p-2 rounded-lg bg-muted/30">
@@ -801,7 +806,7 @@ function OverviewTab({
           </div>
           <div className="text-[10px] text-muted-foreground space-y-0.5">
             <div className="flex items-center gap-1.5">
-              <span className="w-1.5 h-1.5 rounded-full bg-cyber inline-block" />
+              <span className="w-1.5 h-1.5 rounded-full bg-[hsl(var(--brand-green))] inline-block" />
               {t('evolution.skillPipeline')}
             </div>
             <div className="flex items-center gap-1.5">
@@ -819,7 +824,7 @@ function OverviewTab({
           </div>
           <div className="grid grid-cols-3 gap-2 mb-3">
             <div className="text-center p-2 rounded-lg bg-muted/30">
-              <p className="text-lg font-bold text-cyber">{inv.user_skills}</p>
+              <p className="text-lg font-bold text-[hsl(var(--brand-green))]">{inv.user_skills}</p>
               <p className="text-[9px] text-muted-foreground uppercase">{t('evolution.userSkills')}</p>
             </div>
             <div className="text-center p-2 rounded-lg bg-muted/30">
@@ -833,7 +838,7 @@ function OverviewTab({
           </div>
           <div className="text-[10px] text-muted-foreground space-y-0.5">
             <div className="flex items-center gap-1.5">
-              <span className="w-1.5 h-1.5 rounded-full bg-cyber inline-block" />
+              <span className="w-1.5 h-1.5 rounded-full bg-[hsl(var(--brand-green))] inline-block" />
               {t('evolution.registered')}
             </div>
             <div className="flex items-center gap-1.5">
@@ -855,7 +860,7 @@ function OverviewTab({
               <div key={i} className="flex items-center gap-2.5 text-xs py-1">
                 {statusIcon(item.status)}
                 <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${
-                  item.kind === 'skill' ? 'bg-cyber/10 text-cyber' : 'bg-purple-400/10 text-purple-400'
+                  item.kind === 'skill' ? 'bg-[hsl(var(--brand-green)/0.10)] text-[hsl(var(--brand-green))]' : 'bg-purple-400/10 text-purple-400'
                 }`}>
                   {item.kind === 'skill' ? 'SKILL' : 'CAP'}
                 </span>
@@ -877,7 +882,7 @@ function OverviewTab({
         </h3>
         <div className="text-xs text-muted-foreground space-y-2">
           <div className="flex items-start gap-2">
-            <span className="text-cyber font-bold shrink-0">Skill →</span>
+            <span className="text-[hsl(var(--brand-green))] font-bold shrink-0">Skill →</span>
             <span>{t('evolution.decisionSkill')}</span>
           </div>
           <div className="flex items-start gap-2">
@@ -946,6 +951,23 @@ function SkillRecordCard({
 }) {
   const [showCode, setShowCode] = useState(false);
   const [deleteConfirm, setDeleteConfirm] = useState(false);
+  const [detail, setDetail] = useState<EvolutionRecord | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const detailFetched = useRef(false);
+
+  useEffect(() => {
+    if (expanded && !detailFetched.current) {
+      detailFetched.current = true;
+      setDetailLoading(true);
+      getEvolutionDetail(record.id)
+        .then(res => setDetail(res.record as EvolutionRecord))
+        .catch(() => setDetail(record))
+        .finally(() => setDetailLoading(false));
+    }
+  }, [expanded, record.id, record]);
+
+  const displayRecord = detail ?? record;
+  const shouldShowDetailLoading = expanded && (!detailFetched.current || detailLoading);
 
   return (
     <div className="border border-border rounded-xl bg-card overflow-hidden transition-all">
@@ -989,28 +1011,37 @@ function SkillRecordCard({
       {/* Expanded detail */}
       {expanded && (
         <div className="border-t border-border px-4 py-3 space-y-3 text-xs">
+          {shouldShowDetailLoading ? (
+            <div className="flex items-center gap-2 py-4 text-muted-foreground">
+              <Loader2 size={14} className="animate-spin" />
+              <span className="text-[11px]">Loading...</span>
+            </div>
+          ) : (
+            <>
           {/* Trigger info */}
           <DetailSection title={t('evolution.triggerInfo')}>
             <div className="grid grid-cols-2 gap-2">
-              <KV label={t('evolution.id')} value={record.id} />
-              <KV label={t('evolution.version')} value={record.context?.current_version || '—'} />
-              <KV label={t('evolution.created')} value={formatTime(record.created_at)} />
-              <KV label={t('evolution.updated')} value={formatTime(record.updated_at)} />
+              <KV label={t('evolution.id')} value={displayRecord.id} />
+              <KV label={t('evolution.version')} value={displayRecord.context?.current_version || '—'} />
+              <KV label={t('evolution.created')} value={formatTime(displayRecord.created_at)} />
+              <KV label={t('evolution.updated')} value={formatTime(displayRecord.updated_at)} />
             </div>
-            {record.context?.error_stack && (
+            {displayRecord.context?.error_stack && (
               <div className="mt-2">
                 <span className="text-muted-foreground">{t('evolution.errorStack')}:</span>
                 <pre className="mt-1 p-2 rounded bg-muted/50 text-[10px] font-mono whitespace-pre-wrap max-h-32 overflow-y-auto">
-                  {record.context.error_stack}
+                  {displayRecord.context.error_stack}
                 </pre>
               </div>
             )}
           </DetailSection>
 
           {/* Patch */}
-          {record.patch && (
+          {displayRecord.patch && (
             <DetailSection title={t('evolution.patch')}>
-              <p className="text-muted-foreground mb-1">{record.patch.explanation}</p>
+              <div className="text-muted-foreground mb-1 text-[11px]">
+                <MarkdownContent content={displayRecord.patch.explanation} />
+              </div>
               <button
                 onClick={() => setShowCode(!showCode)}
                 className="flex items-center gap-1 text-[10px] text-rust hover:underline"
@@ -1019,27 +1050,27 @@ function SkillRecordCard({
                 {showCode ? t('evolution.hideCode') : t('evolution.showCode')}
               </button>
               {showCode && (
-                <pre className="mt-1 p-2 rounded bg-muted/50 text-[10px] font-mono whitespace-pre-wrap max-h-48 overflow-y-auto">
-                  {record.patch.diff}
-                </pre>
+                <div className="mt-1 p-2 rounded bg-muted/50 text-[10px] max-h-72 overflow-y-auto">
+                  <MarkdownContent content={patchDiffToMarkdown(displayRecord.patch.diff)} />
+                </div>
               )}
             </DetailSection>
           )}
 
           {/* Audit */}
-          {record.audit && (
+          {displayRecord.audit && (
             <DetailSection title={t('evolution.audit')}>
               <div className="flex items-center gap-2 mb-1">
-                {record.audit.passed
-                  ? <CheckCircle size={12} className="text-cyber" />
+                {displayRecord.audit.passed
+                  ? <CheckCircle size={12} className="text-[hsl(var(--brand-green)/0.8)]" />
                   : <XCircle size={12} className="text-red-400" />}
-                <span className={record.audit.passed ? 'text-cyber' : 'text-red-400'}>
-                  {record.audit.passed ? t('evolution.auditPassed') : t('evolution.auditFailed')}
+                <span className={displayRecord.audit.passed ? 'text-[hsl(var(--brand-green)/0.8)]' : 'text-red-400'}>
+                  {displayRecord.audit.passed ? t('evolution.auditPassed') : t('evolution.auditFailed')}
                 </span>
               </div>
-              {record.audit.issues?.length > 0 && (
+              {displayRecord.audit.issues?.length > 0 && (
                 <div className="space-y-1">
-                  {record.audit.issues.map((issue, i) => (
+                  {displayRecord.audit.issues.map((issue, i) => (
                     <div key={i} className="flex items-start gap-1.5">
                       <AlertTriangle size={10} className={
                         issue.severity === 'critical' ? 'text-red-400 mt-0.5' :
@@ -1056,24 +1087,24 @@ function SkillRecordCard({
           )}
 
           {/* Shadow test */}
-          {record.shadow_test && (
+          {displayRecord.shadow_test && (
             <DetailSection title={t('evolution.shadowTest')}>
               <div className="flex items-center gap-2 mb-1">
-                {record.shadow_test.passed
-                  ? <CheckCircle size={12} className="text-cyber" />
+                {displayRecord.shadow_test.passed
+                  ? <CheckCircle size={12} className="text-[hsl(var(--brand-green))]" />
                   : <XCircle size={12} className="text-red-400" />}
-                <span className={record.shadow_test.passed ? 'text-cyber' : 'text-red-400'}>
-                  {record.shadow_test.passed ? t('evolution.testPassed') : t('evolution.testFailed')}
+                <span className={displayRecord.shadow_test.passed ? 'text-[hsl(var(--brand-green))]' : 'text-red-400'}>
+                  {displayRecord.shadow_test.passed ? t('evolution.testPassed') : t('evolution.testFailed')}
                 </span>
-                {record.shadow_test.test_cases_run != null && (
+                {displayRecord.shadow_test.test_cases_run != null && (
                   <span className="text-[10px] text-muted-foreground ml-auto">
-                    {record.shadow_test.test_cases_passed}/{record.shadow_test.test_cases_run} passed
+                    {displayRecord.shadow_test.test_cases_passed}/{displayRecord.shadow_test.test_cases_run} passed
                   </span>
                 )}
               </div>
-              {record.shadow_test.errors?.length > 0 && (
+              {displayRecord.shadow_test.errors?.length > 0 && (
                 <div className="space-y-0.5 mt-1">
-                  {record.shadow_test.errors.map((err, i) => (
+                  {displayRecord.shadow_test.errors.map((err, i) => (
                     <div key={i} className="flex items-start gap-1.5">
                       <AlertTriangle size={10} className="text-red-400 mt-0.5 shrink-0" />
                       <span className="text-[10px] text-red-400 font-mono">{err}</span>
@@ -1085,18 +1116,18 @@ function SkillRecordCard({
           )}
 
           {/* Rollout */}
-          {record.rollout && (
+          {displayRecord.rollout && (
             <DetailSection title={t('evolution.rollout')}>
               <div className="flex items-center gap-2 mb-1">
                 <span className="text-muted-foreground">{t('evolution.stage')}:</span>
-                <span className="font-medium">{record.rollout.current_stage + 1} / {record.rollout.stages.length}</span>
+                <span className="font-medium">{displayRecord.rollout.current_stage + 1} / {displayRecord.rollout.stages.length}</span>
               </div>
               <div className="flex gap-1">
-                {record.rollout.stages.map((stage, i) => (
+                {displayRecord.rollout.stages.map((stage, i) => (
                   <div
                     key={i}
                     className={`flex-1 h-1.5 rounded-full ${
-                      i <= record.rollout!.current_stage ? 'bg-cyber' : 'bg-muted'
+                      i <= displayRecord.rollout!.current_stage ? 'bg-[hsl(var(--brand-green))]' : 'bg-muted'
                     }`}
                     title={`${stage.percentage}% — ${stage.duration_minutes}min`}
                   />
@@ -1106,10 +1137,10 @@ function SkillRecordCard({
           )}
 
           {/* Feedback history */}
-          {record.feedback_history?.length > 0 && (
+          {displayRecord.feedback_history?.length > 0 && (
             <DetailSection title={t('evolution.feedbackHistory')}>
               <div className="space-y-2">
-                {record.feedback_history.map((fb, i) => (
+                {displayRecord.feedback_history.map((fb, i) => (
                   <div key={i} className="border border-border rounded-lg p-2 bg-muted/30">
                     <div className="flex items-center gap-2 mb-1">
                       <RotateCcw size={10} className="text-muted-foreground" />
@@ -1122,6 +1153,8 @@ function SkillRecordCard({
                 ))}
               </div>
             </DetailSection>
+          )}
+            </>
           )}
         </div>
       )}

@@ -1,11 +1,13 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Search, Plus, Trash2, RefreshCw, Brain, Loader2, AlertTriangle } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { useAgentStore } from '@/lib/store';
 import { getMemories, createMemory, deleteMemory, getMemoryStats } from '@/lib/api';
 import { useT } from '@/lib/i18n';
 
 export function MemoryPage() {
   const t = useT();
+  const selectedAgentId = useAgentStore((s) => s.selectedAgentId);
   const [memories, setMemories] = useState<any[]>([]);
   const [stats, setStats] = useState<any>(null);
   const [query, setQuery] = useState('');
@@ -14,29 +16,44 @@ export function MemoryPage() {
   const [showCreate, setShowCreate] = useState(false);
   const [newMemory, setNewMemory] = useState({ title: '', content: '', scope: 'long_term', type: 'note', tags: '' });
   const [deleteConfirm, setDeleteConfirm] = useState<{ id: string; title: string } | null>(null);
+  const selectedAgentRef = useRef(selectedAgentId);
+
+  selectedAgentRef.current = selectedAgentId;
 
   useEffect(() => {
     fetchMemories();
     fetchStats();
-  }, []);
+  }, [selectedAgentId]);
 
   async function fetchMemories() {
+    const agentId = selectedAgentId;
     setLoading(true);
     try {
-      const data = await getMemories({ q: query || undefined, scope: scope || undefined, limit: 50 });
+      const data = await getMemories({ q: query || undefined, scope: scope || undefined, limit: 50, agent: agentId });
+      if (selectedAgentRef.current !== agentId) {
+        return;
+      }
       const raw = Array.isArray(data) ? data : data.results || data.items || [];
       // API returns [{ item: {...}, score }] — unwrap .item if present
       setMemories(raw.map((entry: any) => entry.item ? { ...entry.item, _score: entry.score } : entry));
     } catch {
-      setMemories([]);
+      if (selectedAgentRef.current === agentId) {
+        setMemories([]);
+      }
     } finally {
-      setLoading(false);
+      if (selectedAgentRef.current === agentId) {
+        setLoading(false);
+      }
     }
   }
 
   async function fetchStats() {
+    const agentId = selectedAgentId;
     try {
-      const data = await getMemoryStats();
+      const data = await getMemoryStats(agentId);
+      if (selectedAgentRef.current !== agentId) {
+        return;
+      }
       setStats(data);
     } catch {
       // ignore
@@ -51,7 +68,7 @@ export function MemoryPage() {
         scope: newMemory.scope,
         type: newMemory.type,
         tags: newMemory.tags,
-      });
+      }, selectedAgentId);
       setShowCreate(false);
       setNewMemory({ title: '', content: '', scope: 'long_term', type: 'note', tags: '' });
       fetchMemories();
@@ -68,7 +85,7 @@ export function MemoryPage() {
   async function confirmDelete() {
     if (!deleteConfirm) return;
     try {
-      await deleteMemory(deleteConfirm.id);
+      await deleteMemory(deleteConfirm.id, selectedAgentId);
       setMemories((prev) => prev.filter((m) => m.id !== deleteConfirm.id));
       fetchStats();
     } catch {
@@ -88,6 +105,7 @@ export function MemoryPage() {
       <div className="border-b border-border px-6 py-4 flex items-center justify-between">
         <div>
           <h1 className="text-lg font-semibold">{t('memory.title')}</h1>
+          <p className="text-xs text-muted-foreground">{t('common.agent')}: {selectedAgentId}</p>
           {stats && (
             <p className="text-sm text-muted-foreground">
               {stats.total_active} active · {stats.long_term} long-term · {stats.short_term} short-term

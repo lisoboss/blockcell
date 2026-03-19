@@ -164,9 +164,9 @@ pub struct RolloutStage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeedbackEntry {
     pub attempt: u32,
-    pub stage: String,           // "audit", "compile", "test"
-    pub feedback: String,        // 具体的错误/问题描述
-    pub previous_code: String,   // 上一次生成的代码
+    pub stage: String,         // "audit", "compile", "test"
+    pub feedback: String,      // 具体的错误/问题描述
+    pub previous_code: String, // 上一次生成的代码
     pub timestamp: i64,
 }
 
@@ -195,7 +195,9 @@ pub struct EvolutionRecord {
     pub updated_at: i64,
 }
 
-fn default_attempt() -> u32 { 1 }
+fn default_attempt() -> u32 {
+    1
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum EvolutionStatus {
@@ -227,8 +229,12 @@ impl EvolutionStatus {
     /// 将旧状态映射到新状态（用于处理旧记录）
     pub fn normalize(&self) -> &EvolutionStatus {
         match self {
-            EvolutionStatus::DryRunPassed | EvolutionStatus::TestPassed => &EvolutionStatus::CompilePassed,
-            EvolutionStatus::DryRunFailed | EvolutionStatus::TestFailed | EvolutionStatus::Testing => &EvolutionStatus::CompileFailed,
+            EvolutionStatus::DryRunPassed | EvolutionStatus::TestPassed => {
+                &EvolutionStatus::CompilePassed
+            }
+            EvolutionStatus::DryRunFailed
+            | EvolutionStatus::TestFailed
+            | EvolutionStatus::Testing => &EvolutionStatus::CompileFailed,
             EvolutionStatus::RollingOut => &EvolutionStatus::Observing,
             other => other,
         }
@@ -236,17 +242,23 @@ impl EvolutionStatus {
 
     /// 检查状态是否等价于 CompilePassed（包括旧状态）
     pub fn is_compile_passed(&self) -> bool {
-        matches!(self, EvolutionStatus::CompilePassed | EvolutionStatus::DryRunPassed | EvolutionStatus::TestPassed)
+        matches!(
+            self,
+            EvolutionStatus::CompilePassed
+                | EvolutionStatus::DryRunPassed
+                | EvolutionStatus::TestPassed
+        )
     }
 }
 
 impl SkillEvolution {
     pub fn new(skills_dir: PathBuf, llm_timeout_secs: u64) -> Self {
-        let evolution_db = skills_dir.parent()
+        let evolution_db = skills_dir
+            .parent()
             .unwrap_or(Path::new("."))
             .join("evolution.db");
         let version_manager = VersionManager::new(skills_dir.clone());
-        
+
         Self {
             skills_dir,
             evolution_db,
@@ -264,9 +276,29 @@ impl SkillEvolution {
         &self.skills_dir
     }
 
+    fn is_openclaw_import_description(description: &str) -> bool {
+        description.contains("Convert the following OpenClaw-compatible skill into a Blockcell")
+    }
+
+    fn trigger_rules_prompt() -> &'static str {
+        "## meta.yaml rules\n\
+- Keep `meta.yaml` minimal.\n\
+- Required fields: `name`, `description`.\n\
+- Optional fields: `tools`, `requires`, `permissions`, `fallback`.\n\
+- `tools` must be a short YAML string list of ordinary host tools actually used by the skill.\n\
+- Do NOT include `exec_local` in `tools`; local execution belongs in `SKILL.md` instructions.\n\
+- `requires` may contain `bins` and `env` only when there is a real local dependency.\n\
+- `permissions` should be an empty list unless the skill truly needs explicit permission declarations.\n\
+- `fallback` is optional; when present, keep it simple with a `strategy` and user-facing `message`.\n\
+- Do NOT generate any legacy routing or formatting fields.\n\n"
+    }
+
     /// Get the evolution records directory path.
     pub fn records_dir(&self) -> PathBuf {
-        self.evolution_db.parent().unwrap().join("evolution_records")
+        self.evolution_db
+            .parent()
+            .unwrap()
+            .join("evolution_records")
     }
 
     fn skill_root_dir_for_record(&self, record: &EvolutionRecord) -> PathBuf {
@@ -359,10 +391,15 @@ impl SkillEvolution {
         info!(evolution_id = %evolution_id, "📝 [generate] Calling LLM...");
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(self.llm_timeout_secs),
-            llm_provider.generate(&prompt)
+            llm_provider.generate(&prompt),
         )
         .await
-        .map_err(|_| Error::Evolution(format!("LLM call timed out after {} seconds", self.llm_timeout_secs)))?
+        .map_err(|_| {
+            Error::Evolution(format!(
+                "LLM call timed out after {} seconds",
+                self.llm_timeout_secs
+            ))
+        })?
         .map_err(|e| Error::Evolution(format!("LLM generation failed: {}", e)))?;
 
         info!(
@@ -453,10 +490,15 @@ impl SkillEvolution {
         info!(evolution_id = %evolution_id, "🔄 [regenerate] Calling LLM...");
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(self.llm_timeout_secs),
-            llm_provider.generate(&prompt)
+            llm_provider.generate(&prompt),
         )
         .await
-        .map_err(|_| Error::Evolution(format!("LLM call timed out after {} seconds", self.llm_timeout_secs)))?
+        .map_err(|_| {
+            Error::Evolution(format!(
+                "LLM call timed out after {} seconds",
+                self.llm_timeout_secs
+            ))
+        })?
         .map_err(|e| Error::Evolution(format!("LLM generation failed: {}", e)))?;
 
         info!(
@@ -487,7 +529,11 @@ impl SkillEvolution {
         );
 
         let patch = GeneratedPatch {
-            patch_id: format!("patch_{}_{}", chrono::Utc::now().timestamp(), record.attempt),
+            patch_id: format!(
+                "patch_{}_{}",
+                chrono::Utc::now().timestamp(),
+                record.attempt
+            ),
             skill_name: record.skill_name.clone(),
             diff,
             explanation: response.clone(),
@@ -495,9 +541,9 @@ impl SkillEvolution {
         };
 
         record.patch = Some(patch.clone());
-        record.audit = None;       // 清除旧审计结果
-        record.shadow_test = None;  // 清除旧测试结果
-        record.observation = None;  // 清除观察窗口配置，确保状态一致性
+        record.audit = None; // 清除旧审计结果
+        record.shadow_test = None; // 清除旧测试结果
+        record.observation = None; // 清除观察窗口配置，确保状态一致性
         record.status = EvolutionStatus::Generated;
         record.updated_at = chrono::Utc::now().timestamp();
         self.save_record(&record)?;
@@ -524,7 +570,9 @@ impl SkillEvolution {
         record.status = EvolutionStatus::Auditing;
         self.save_record(&record)?;
 
-        let patch = record.patch.as_ref()
+        let patch = record
+            .patch
+            .as_ref()
             .ok_or_else(|| Error::Evolution("No patch to audit".to_string()))?;
 
         info!(evolution_id = %evolution_id, "Auditing patch");
@@ -554,10 +602,15 @@ impl SkillEvolution {
         info!(evolution_id = %evolution_id, "🔍 [audit] Calling LLM...");
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(self.llm_timeout_secs),
-            llm_provider.generate(&prompt)
+            llm_provider.generate(&prompt),
         )
         .await
-        .map_err(|_| Error::Evolution(format!("LLM call timed out after {} seconds", self.llm_timeout_secs)))?
+        .map_err(|_| {
+            Error::Evolution(format!(
+                "LLM call timed out after {} seconds",
+                self.llm_timeout_secs
+            ))
+        })?
         .map_err(|e| Error::Evolution(format!("LLM generation failed: {}", e)))?;
 
         info!(
@@ -611,7 +664,9 @@ impl SkillEvolution {
     /// P0-3: 单一编译步骤，返回 (是否通过, 编译错误信息)
     pub async fn compile_check(&self, evolution_id: &str) -> Result<(bool, Option<String>)> {
         let mut record = self.load_record(evolution_id)?;
-        let patch = record.patch.as_ref()
+        let patch = record
+            .patch
+            .as_ref()
             .ok_or_else(|| Error::Evolution("No patch for compile check".to_string()))?;
 
         info!(evolution_id = %evolution_id, "Running compile check");
@@ -623,11 +678,21 @@ impl SkillEvolution {
             let (passed, error) = if content.is_empty() {
                 (false, Some("SKILL.md content is empty".to_string()))
             } else if content.len() < 50 {
-                (false, Some(format!("SKILL.md content too short ({} chars, need >= 50)", content.len())))
+                (
+                    false,
+                    Some(format!(
+                        "SKILL.md content too short ({} chars, need >= 50)",
+                        content.len()
+                    )),
+                )
             } else {
                 (true, None)
             };
-            let new_status = if passed { EvolutionStatus::CompilePassed } else { EvolutionStatus::CompileFailed };
+            let new_status = if passed {
+                EvolutionStatus::CompilePassed
+            } else {
+                EvolutionStatus::CompileFailed
+            };
             info!(evolution_id = %evolution_id, passed = passed, "🔨 [compile] PromptOnly content check: {}", if passed { "PASSED" } else { "FAILED" });
             record.status = new_status;
             record.updated_at = chrono::Utc::now().timestamp();
@@ -660,7 +725,11 @@ impl SkillEvolution {
                 }
             };
 
-            let new_status = if passed { EvolutionStatus::CompilePassed } else { EvolutionStatus::CompileFailed };
+            let new_status = if passed {
+                EvolutionStatus::CompilePassed
+            } else {
+                EvolutionStatus::CompileFailed
+            };
             info!(evolution_id = %evolution_id, passed = passed, "🔨 [compile] Python syntax check: {}", if passed { "PASSED" } else { "FAILED" });
             record.status = new_status;
             record.updated_at = chrono::Utc::now().timestamp();
@@ -721,7 +790,9 @@ impl SkillEvolution {
                         let path = entry.path();
                         if path.extension().is_some_and(|e| e == "json") {
                             if let Ok(fixture_content) = std::fs::read_to_string(&path) {
-                                if serde_json::from_str::<serde_json::Value>(&fixture_content).is_err() {
+                                if serde_json::from_str::<serde_json::Value>(&fixture_content)
+                                    .is_err()
+                                {
                                     let err_msg = format!(
                                         "Invalid test fixture JSON: {}",
                                         path.file_name().unwrap_or_default().to_string_lossy()
@@ -761,7 +832,7 @@ impl SkillEvolution {
     /// P1: 简化模型 — 直接部署，进入观察期（无灰度百分比分流）
     pub async fn deploy_and_observe(&self, evolution_id: &str) -> Result<()> {
         let mut record = self.load_record(evolution_id)?;
-        
+
         // 检查前置条件（兼容旧状态 DryRunPassed/TestPassed）
         if !record.status.is_compile_passed() {
             return Err(Error::Evolution(format!(
@@ -803,8 +874,10 @@ impl SkillEvolution {
     /// 返回: Ok(Some(true)) = 观察完成可标记成功, Ok(Some(false)) = 需要回滚, Ok(None) = 仍在观察中
     pub fn check_observation(&self, evolution_id: &str, error_rate: f64) -> Result<Option<bool>> {
         let record = self.load_record(evolution_id)?;
-        
-        let obs = record.observation.as_ref()
+
+        let obs = record
+            .observation
+            .as_ref()
             .ok_or_else(|| Error::Evolution("No observation window".to_string()))?;
 
         // 错误率超阈值 → 回滚
@@ -834,7 +907,7 @@ impl SkillEvolution {
     /// 回滚
     pub async fn rollback(&self, evolution_id: &str, reason: &str) -> Result<()> {
         let mut record = self.load_record(evolution_id)?;
-        
+
         warn!(
             evolution_id = %evolution_id,
             reason = %reason,
@@ -867,29 +940,57 @@ impl SkillEvolution {
         let mut prompt = String::new();
 
         // System context: Rhai language
-        prompt.push_str("You are a Rhai skill evolution assistant for the blockcell agent framework.\n");
-        prompt.push_str("All skills MUST be written in the Rhai scripting language (.rhai files).\n");
-        prompt.push_str("Do NOT generate JavaScript, Python, TypeScript, or any other language.\n\n");
+        prompt.push_str(
+            "You are a Rhai skill evolution assistant for the blockcell agent framework.\n",
+        );
+        prompt
+            .push_str("All skills MUST be written in the Rhai scripting language (.rhai files).\n");
+        prompt
+            .push_str("Do NOT generate JavaScript, Python, TypeScript, or any other language.\n\n");
 
         prompt.push_str("## Rhai Language Quick Reference\n");
         prompt.push_str("- Variables: `let x = 42;` (immutable by default), `let x = 42; x = 100;` (reassign ok)\n");
         prompt.push_str("- Strings: `let s = \"hello\";` with interpolation `\"value: ${x}\"`\n");
         prompt.push_str("- Arrays: `let a = [1, 2, 3];` Maps: `let m = #{x: 1, y: 2};`\n");
         prompt.push_str("- Functions: `fn add(a, b) { a + b }`\n");
-        prompt.push_str("- Control: `if x > 0 { } else { }`, `for i in 0..10 { }`, `while x > 0 { }`\n");
+        prompt.push_str(
+            "- Control: `if x > 0 { } else { }`, `for i in 0..10 { }`, `while x > 0 { }`\n",
+        );
         prompt.push_str("- String methods: `.len()`, `.contains()`, `.split()`, `.trim()`, `.to_upper()`, `.to_lower()`\n");
         prompt.push_str("- Array methods: `.push()`, `.pop()`, `.len()`, `.filter()`, `.map()`\n");
+        prompt.push_str("- Built-in helpers: `len(value)`, `str_sub(text, start, len)`, `str_truncate(text, max_chars)`, `str_lines(text, max_lines)`, `arr_join(items, sep)`\n");
         prompt.push_str("- No classes/structs — use maps (object maps) `#{}` instead\n");
         prompt.push_str("- No `import`/`require` — all capabilities come from the host engine\n");
         prompt.push_str("- Print: `print(\"msg\");`\n\n");
 
+        prompt.push_str("## Stable Built-in Helper Functions\n");
+        prompt.push_str(
+            "- `len(value)` -> length of string / array / map, returns 0 for null-like values\n",
+        );
+        prompt.push_str("- `str_sub(text, start, len)` -> safe substring by character index\n");
+        prompt.push_str(
+            "- `str_truncate(text, max_chars)` -> truncate text safely at character boundary\n",
+        );
+        prompt.push_str("- `str_lines(text, max_lines)` -> return the first N lines as an array\n");
+        prompt.push_str("- `arr_join(items, sep)` -> join array items into a string\n\n");
+
         // Task description
         if is_manual {
             if let TriggerReason::ManualRequest { ref description } = context.trigger {
-                prompt.push_str(&format!("## Task\nCreate or improve a Rhai skill for: {}\n\n", description));
+                if Self::is_openclaw_import_description(description) {
+                    prompt.push_str(&format!("## Task\n{}\n\n", description));
+                } else {
+                    prompt.push_str(&format!(
+                        "## Task\nCreate or improve a Blockcell Rhai skill for: {}\n\n",
+                        description
+                    ));
+                }
             }
         } else {
-            prompt.push_str(&format!("## Task\nFix the following issue in Rhai skill '{}':\n\n", context.skill_name));
+            prompt.push_str(&format!(
+                "## Task\nFix the following issue in the existing Blockcell Rhai skill '{}'. Preserve the skill's purpose and only change what is necessary to correct the problem.\n\n",
+                context.skill_name
+            ));
             prompt.push_str(&format!("Trigger: {:?}\n\n", context.trigger));
         }
 
@@ -899,7 +1000,10 @@ impl SkillEvolution {
 
         // Existing source code
         if let Some(snippet) = &context.source_snippet {
-            prompt.push_str(&format!("## Current SKILL.rhai Source\n```rhai\n{}\n```\n\n", snippet));
+            prompt.push_str(&format!(
+                "## Current SKILL.rhai Source\n```rhai\n{}\n```\n\n",
+                snippet
+            ));
         }
 
         if !context.tool_schemas.is_empty() {
@@ -913,8 +1017,13 @@ impl SkillEvolution {
         // Output format — P0-2: always request complete script (never diff)
         prompt.push_str("## Output Format\n");
         prompt.push_str("Generate the COMPLETE SKILL.rhai file content.\n");
+        prompt.push_str("When the skill returns structured results, prefer returning `display_text` for final user-facing text. If the result still needs runtime/LLM polishing, return `summary_data` as a lightweight structured summary and keep large raw content out of `summary_data`.\n");
+        prompt.push_str("If you output `meta.yaml`, it must follow the minimal meta rules below.\n\n");
+        prompt.push_str(Self::trigger_rules_prompt());
         prompt.push_str("Output ONLY the Rhai code in a ```rhai code block.\n");
-        prompt.push_str("The script must be a valid, self-contained Rhai script with no syntax errors.\n");
+        prompt.push_str(
+            "The script must be a valid, self-contained Rhai script with no syntax errors.\n",
+        );
         let _ = has_existing_source; // suppress unused warning
 
         Ok(prompt)
@@ -925,8 +1034,12 @@ impl SkillEvolution {
         let mut prompt = String::new();
 
         prompt.push_str("You are a skill document writer for the blockcell agent framework.\n");
-        prompt.push_str("Your task is to write or improve a SKILL.md file — a prompt instruction document\n");
-        prompt.push_str("that tells the AI agent how to handle specific user requests for this skill.\n\n");
+        prompt.push_str(
+            "Your task is to write or improve a SKILL.md file — a prompt instruction document\n",
+        );
+        prompt.push_str(
+            "that tells the AI agent how to handle specific user requests for this skill.\n\n",
+        );
 
         prompt.push_str("## What is SKILL.md?\n");
         prompt.push_str("SKILL.md is an operation manual injected into the agent's system prompt when this skill is triggered.\n");
@@ -934,22 +1047,36 @@ impl SkillEvolution {
         prompt.push_str("- **Goal**: What the skill does and when it applies\n");
         prompt.push_str("- **Tools to use**: Which built-in tools to call and in what order\n");
         prompt.push_str("- **Output format**: What the final response should look like\n");
-        prompt.push_str("- **Scenarios**: 2-4 concrete usage scenarios with step-by-step guidance\n");
+        prompt
+            .push_str("- **Scenarios**: 2-4 concrete usage scenarios with step-by-step guidance\n");
         prompt.push_str("- **Fallback strategy**: What to do when tools fail\n\n");
 
         if is_manual {
             if let TriggerReason::ManualRequest { ref description } = context.trigger {
-                prompt.push_str(&format!("## Task\nCreate a SKILL.md for: {}\n\n", description));
+                if Self::is_openclaw_import_description(description) {
+                    prompt.push_str(&format!("## Task\n{}\n\n", description));
+                } else {
+                    prompt.push_str(&format!(
+                        "## Task\nCreate or improve a Blockcell SKILL.md for: {}\n\n",
+                        description
+                    ));
+                }
             }
         } else {
-            prompt.push_str(&format!("## Task\nImprove the SKILL.md for skill '{}' to address the following issue:\n\n", context.skill_name));
+            prompt.push_str(&format!(
+                "## Task\nFix the existing Blockcell SKILL.md for skill '{}' to address the following issue. Preserve the skill's original scope and intent; only tighten or correct the instructions as needed.\n\n",
+                context.skill_name
+            ));
             if let Some(error) = &context.error_stack {
                 prompt.push_str(&format!("## Issue\n```\n{}\n```\n\n", error));
             }
         }
 
         if let Some(snippet) = &context.source_snippet {
-            prompt.push_str(&format!("## Current SKILL.md Content\n```markdown\n{}\n```\n\n", snippet));
+            prompt.push_str(&format!(
+                "## Current SKILL.md Content\n```markdown\n{}\n```\n\n",
+                snippet
+            ));
         }
 
         if context.staged {
@@ -973,11 +1100,16 @@ impl SkillEvolution {
             }
         }
 
+        prompt.push_str("## Result Contract\n");
+        prompt.push_str("If the skill can directly produce final user-facing text, return `display_text`. Otherwise return `summary_data` as a lightweight structured summary for runtime/LLM polishing. Do NOT place complete webpages, long markdown, or large raw logs into `summary_data`.\n\n");
         prompt.push_str("## Output Format\n");
         prompt.push_str("Generate the COMPLETE SKILL.md content.\n");
         prompt.push_str("Output the markdown content in a ```markdown code block.\n");
         prompt.push_str("Also output an updated meta.yaml in a ```yaml code block.\n");
-        prompt.push_str("The document must be at least 200 characters, practical, and clearly structured.\n");
+        prompt.push_str(Self::trigger_rules_prompt());
+        prompt.push_str(
+            "The document must be at least 200 characters, practical, and clearly structured.\n",
+        );
 
         Ok(prompt)
     }
@@ -1000,62 +1132,107 @@ impl SkillEvolution {
         let mut prompt = String::new();
 
         // System context
-        prompt.push_str("You are a Rhai skill evolution assistant for the blockcell agent framework.\n");
-        prompt.push_str("All skills MUST be written in the Rhai scripting language (.rhai files).\n");
-        prompt.push_str("Do NOT generate JavaScript, Python, TypeScript, or any other language.\n\n");
+        prompt.push_str(
+            "You are a Rhai skill evolution assistant for the blockcell agent framework.\n",
+        );
+        prompt
+            .push_str("All skills MUST be written in the Rhai scripting language (.rhai files).\n");
+        prompt
+            .push_str("Do NOT generate JavaScript, Python, TypeScript, or any other language.\n\n");
 
         prompt.push_str("## Rhai Language Quick Reference\n");
         prompt.push_str("- Variables: `let x = 42;` (immutable by default), `let x = 42; x = 100;` (reassign ok)\n");
         prompt.push_str("- Strings: `let s = \"hello\";` with interpolation `\"value: ${x}\"`\n");
         prompt.push_str("- Arrays: `let a = [1, 2, 3];` Maps: `let m = #{x: 1, y: 2};`\n");
         prompt.push_str("- Functions: `fn add(a, b) { a + b }`\n");
-        prompt.push_str("- Control: `if x > 0 { } else { }`, `for i in 0..10 { }`, `while x > 0 { }`\n");
+        prompt.push_str(
+            "- Control: `if x > 0 { } else { }`, `for i in 0..10 { }`, `while x > 0 { }`\n",
+        );
         prompt.push_str("- String methods: `.len()`, `.contains()`, `.split()`, `.trim()`, `.to_upper()`, `.to_lower()`\n");
         prompt.push_str("- Array methods: `.push()`, `.pop()`, `.len()`, `.filter()`, `.map()`\n");
-        prompt.push_str("- Map access: `m.key` or `m[\"key\"]`, check existence with `\"key\" in m`\n");
-        prompt.push_str("- Null coalescing: `value ?? default` (use instead of .get with default)\n");
+        prompt.push_str("- Built-in helpers: `len(value)`, `str_sub(text, start, len)`, `str_truncate(text, max_chars)`, `str_lines(text, max_lines)`, `arr_join(items, sep)`\n");
+        prompt.push_str(
+            "- Map access: `m.key` or `m[\"key\"]`, check existence with `\"key\" in m`\n",
+        );
+        prompt
+            .push_str("- Null coalescing: `value ?? default` (use instead of .get with default)\n");
         prompt.push_str("- Type conversion: `.to_string()`, `.to_int()`, `.to_float()`\n");
         prompt.push_str("- String concat: use `+` only between strings, convert numbers with `.to_string()` first\n");
         prompt.push_str("- No classes/structs — use maps (object maps) `#{}` instead\n");
         prompt.push_str("- No `import`/`require` — all capabilities come from the host engine\n");
         prompt.push_str("- Print: `print(\"msg\");`\n\n");
 
+        prompt.push_str("## Stable Built-in Helper Functions\n");
+        prompt.push_str(
+            "- `len(value)` -> length of string / array / map, returns 0 for null-like values\n",
+        );
+        prompt.push_str("- `str_sub(text, start, len)` -> safe substring by character index\n");
+        prompt.push_str(
+            "- `str_truncate(text, max_chars)` -> truncate text safely at character boundary\n",
+        );
+        prompt.push_str("- `str_lines(text, max_lines)` -> return the first N lines as an array\n");
+        prompt.push_str("- `arr_join(items, sep)` -> join array items into a string\n\n");
+
         // Task description
         if is_manual {
             if let TriggerReason::ManualRequest { ref description } = context.trigger {
-                prompt.push_str(&format!("## Original Task\nCreate or improve a Rhai skill for: {}\n\n", description));
+                if Self::is_openclaw_import_description(description) {
+                    prompt.push_str(&format!("## Original Task\n{}\n\n", description));
+                } else {
+                    prompt.push_str(&format!(
+                        "## Original Task\nCreate or improve a Blockcell Rhai skill for: {}\n\n",
+                        description
+                    ));
+                }
             }
         } else {
-            prompt.push_str(&format!("## Original Task\nFix the following issue in Rhai skill '{}':\n\n", context.skill_name));
+            prompt.push_str(&format!(
+                "## Original Task\nFix the following issue in the existing Blockcell Rhai skill '{}'. Keep behavior changes minimal and targeted.\n\n",
+                context.skill_name
+            ));
         }
 
         // Previous code that had issues
         prompt.push_str("## Previous Code (has issues)\n");
-        prompt.push_str(&format!("```rhai\n{}\n```\n\n", current_feedback.previous_code));
+        prompt.push_str(&format!(
+            "```rhai\n{}\n```\n\n",
+            current_feedback.previous_code
+        ));
 
         // Current feedback
         prompt.push_str(&format!("## Issues Found ({})\n", current_feedback.stage));
         prompt.push_str(&format!("{}\n\n", current_feedback.feedback));
 
         // Show history of previous attempts if any (excluding current)
-        let prev_attempts: Vec<&FeedbackEntry> = history.iter()
+        let prev_attempts: Vec<&FeedbackEntry> = history
+            .iter()
             .filter(|h| h.attempt < current_feedback.attempt)
             .collect();
         if !prev_attempts.is_empty() {
             prompt.push_str("## Previous Attempt History\n");
             prompt.push_str("The following issues were found in earlier attempts. Make sure NOT to repeat them:\n\n");
             for entry in prev_attempts {
-                prompt.push_str(&format!("### Attempt #{} ({} failure)\n", entry.attempt, entry.stage));
+                prompt.push_str(&format!(
+                    "### Attempt #{} ({} failure)\n",
+                    entry.attempt, entry.stage
+                ));
                 prompt.push_str(&format!("{}\n\n", entry.feedback));
             }
         }
 
         // Output format
         prompt.push_str("## Instructions\n");
-        prompt.push_str("Fix ALL the issues listed above and generate the COMPLETE corrected Rhai script.\n");
+        prompt.push_str(
+            "Fix ALL the issues listed above and generate the COMPLETE corrected Rhai script.\n",
+        );
+        prompt.push_str("If the skill can directly produce final user-facing text, return `display_text`. Otherwise return `summary_data` as a lightweight structured summary for runtime/LLM polishing. Do NOT place complete webpages, long markdown, or large raw logs into `summary_data`.\n");
+        prompt.push_str("If you output `meta.yaml`, it must follow the minimal meta rules below.\n\n");
+        prompt.push_str(Self::trigger_rules_prompt());
         prompt.push_str("Do NOT leave any of the reported issues unfixed.\n");
         prompt.push_str("Output ONLY the corrected Rhai code in a ```rhai code block.\n");
-        prompt.push_str("The script must be a valid, self-contained Rhai script with no syntax errors.\n");
+        prompt.push_str(
+            "The script must be a valid, self-contained Rhai script with no syntax errors.\n",
+        );
 
         Ok(prompt)
     }
@@ -1070,29 +1247,47 @@ impl SkillEvolution {
         let mut prompt = String::new();
 
         prompt.push_str("You are a skill document writer for the blockcell agent framework.\n");
-        prompt.push_str("Your task is to fix issues in a SKILL.md prompt instruction document.\n\n");
+        prompt
+            .push_str("Your task is to fix issues in a SKILL.md prompt instruction document.\n\n");
 
         if is_manual {
             if let TriggerReason::ManualRequest { ref description } = context.trigger {
-                prompt.push_str(&format!("## Original Task\nCreate/improve SKILL.md for: {}\n\n", description));
+                if Self::is_openclaw_import_description(description) {
+                    prompt.push_str(&format!("## Original Task\n{}\n\n", description));
+                } else {
+                    prompt.push_str(&format!(
+                        "## Original Task\nCreate or improve a Blockcell SKILL.md for: {}\n\n",
+                        description
+                    ));
+                }
             }
         } else {
-            prompt.push_str(&format!("## Original Task\nImprove SKILL.md for skill '{}'.\n\n", context.skill_name));
+            prompt.push_str(&format!(
+                "## Original Task\nFix the existing Blockcell SKILL.md for skill '{}'. Keep the same skill scope and repair only the broken or unclear parts.\n\n",
+                context.skill_name
+            ));
         }
 
         prompt.push_str("## Previous Content (has issues)\n");
-        prompt.push_str(&format!("```markdown\n{}\n```\n\n", current_feedback.previous_code));
+        prompt.push_str(&format!(
+            "```markdown\n{}\n```\n\n",
+            current_feedback.previous_code
+        ));
 
         prompt.push_str(&format!("## Issues Found ({})\n", current_feedback.stage));
         prompt.push_str(&format!("{}\n\n", current_feedback.feedback));
 
-        let prev_attempts: Vec<&FeedbackEntry> = history.iter()
+        let prev_attempts: Vec<&FeedbackEntry> = history
+            .iter()
             .filter(|h| h.attempt < current_feedback.attempt)
             .collect();
         if !prev_attempts.is_empty() {
             prompt.push_str("## Previous Attempt History\n");
             for entry in prev_attempts {
-                prompt.push_str(&format!("### Attempt #{} ({} failure)\n{}\n\n", entry.attempt, entry.stage, entry.feedback));
+                prompt.push_str(&format!(
+                    "### Attempt #{} ({} failure)\n{}\n\n",
+                    entry.attempt, entry.stage, entry.feedback
+                ));
             }
         }
 
@@ -1100,6 +1295,7 @@ impl SkillEvolution {
         prompt.push_str("Fix ALL the issues listed above and generate the COMPLETE corrected SKILL.md content.\n");
         prompt.push_str("Output the markdown content in a ```markdown code block.\n");
         prompt.push_str("Also output an updated meta.yaml in a ```yaml code block.\n");
+        prompt.push_str(Self::trigger_rules_prompt());
 
         Ok(prompt)
     }
@@ -1117,7 +1313,9 @@ impl SkillEvolution {
                 }
             }
 
-            while i < response.len() && (response.as_bytes()[i] == b'\n' || response.as_bytes()[i] == b'\r') {
+            while i < response.len()
+                && (response.as_bytes()[i] == b'\n' || response.as_bytes()[i] == b'\r')
+            {
                 i += 1;
             }
 
@@ -1134,7 +1332,11 @@ impl SkillEvolution {
         extract_with_marker(response, "```yaml").or_else(|| extract_with_marker(response, "```yml"))
     }
 
-    fn build_audit_prompt(&self, context: &EvolutionContext, script_content: &str) -> Result<String> {
+    fn build_audit_prompt(
+        &self,
+        context: &EvolutionContext,
+        script_content: &str,
+    ) -> Result<String> {
         let mut prompt = String::new();
 
         prompt.push_str(&format!(
@@ -1160,7 +1362,11 @@ or\n\
         Ok(prompt)
     }
 
-    fn build_prompt_only_audit_prompt(&self, context: &EvolutionContext, md_content: &str) -> Result<String> {
+    fn build_prompt_only_audit_prompt(
+        &self,
+        context: &EvolutionContext,
+        md_content: &str,
+    ) -> Result<String> {
         let mut prompt = String::new();
 
         prompt.push_str(&format!(
@@ -1203,28 +1409,48 @@ or\n\
 
         if is_manual {
             if let TriggerReason::ManualRequest { ref description } = context.trigger {
-                prompt.push_str(&format!("## Task\nCreate a SKILL.py for: {}\n\n", description));
+                if Self::is_openclaw_import_description(description) {
+                    prompt.push_str(&format!("## Task\n{}\n\n", description));
+                } else {
+                    prompt.push_str(&format!(
+                        "## Task\nCreate or improve a Blockcell SKILL.py for: {}\n\n",
+                        description
+                    ));
+                }
             }
         } else {
-            prompt.push_str(&format!("## Task\nImprove the SKILL.py for skill '{}' to address the following issue:\n\n", context.skill_name));
+            prompt.push_str(&format!(
+                "## Task\nFix the existing Blockcell SKILL.py for skill '{}' to address the following issue. Preserve the skill's purpose and change only what is needed to fix it.\n\n",
+                context.skill_name
+            ));
             if let Some(error) = &context.error_stack {
                 prompt.push_str(&format!("## Issue\n```\n{}\n```\n\n", error));
             }
         }
 
         if let Some(snippet) = &context.source_snippet {
-            prompt.push_str(&format!("## Current SKILL.py Content\n```python\n{}\n```\n\n", snippet));
+            prompt.push_str(&format!(
+                "## Current SKILL.py Content\n```python\n{}\n```\n\n",
+                snippet
+            ));
         }
 
         prompt.push_str("## Output Format\n");
         prompt.push_str("Generate the COMPLETE SKILL.py content.\n");
+        prompt.push_str("If the skill can directly produce final user-facing text, return `display_text`. Otherwise return `summary_data` as a lightweight structured summary for runtime/LLM polishing. Do NOT place complete webpages, long markdown, or large raw logs into `summary_data`.\n");
         prompt.push_str("Output the Python code in a ```python code block.\n");
+        prompt.push_str("If you output `meta.yaml`, it must follow the minimal meta rules below.\n\n");
+        prompt.push_str(Self::trigger_rules_prompt());
         prompt.push_str("The script must be syntactically valid Python.\n");
 
         Ok(prompt)
     }
 
-    fn build_python_audit_prompt(&self, context: &EvolutionContext, script_content: &str) -> Result<String> {
+    fn build_python_audit_prompt(
+        &self,
+        context: &EvolutionContext,
+        script_content: &str,
+    ) -> Result<String> {
         let mut prompt = String::new();
 
         prompt.push_str(&format!(
@@ -1264,31 +1490,51 @@ or\n\
 
         if is_manual {
             if let TriggerReason::ManualRequest { ref description } = context.trigger {
-                prompt.push_str(&format!("## Original Task\nCreate/improve SKILL.py for: {}\n\n", description));
+                if Self::is_openclaw_import_description(description) {
+                    prompt.push_str(&format!("## Original Task\n{}\n\n", description));
+                } else {
+                    prompt.push_str(&format!(
+                        "## Original Task\nCreate or improve a Blockcell SKILL.py for: {}\n\n",
+                        description
+                    ));
+                }
             }
         } else {
-            prompt.push_str(&format!("## Original Task\nImprove SKILL.py for skill '{}'.\n\n", context.skill_name));
+            prompt.push_str(&format!(
+                "## Original Task\nFix the existing Blockcell SKILL.py for skill '{}'. Keep the same skill scope and repair only the broken parts.\n\n",
+                context.skill_name
+            ));
         }
 
         prompt.push_str("## Previous Content (has issues)\n");
-        prompt.push_str(&format!("```python\n{}\n```\n\n", current_feedback.previous_code));
+        prompt.push_str(&format!(
+            "```python\n{}\n```\n\n",
+            current_feedback.previous_code
+        ));
 
         prompt.push_str(&format!("## Issues Found ({})\n", current_feedback.stage));
         prompt.push_str(&format!("{}\n\n", current_feedback.feedback));
 
-        let prev_attempts: Vec<&FeedbackEntry> = history.iter()
+        let prev_attempts: Vec<&FeedbackEntry> = history
+            .iter()
             .filter(|h| h.attempt < current_feedback.attempt)
             .collect();
         if !prev_attempts.is_empty() {
             prompt.push_str("## Previous Attempt History\n");
             for entry in prev_attempts {
-                prompt.push_str(&format!("### Attempt #{} ({} failure)\n{}\n\n", entry.attempt, entry.stage, entry.feedback));
+                prompt.push_str(&format!(
+                    "### Attempt #{} ({} failure)\n{}\n\n",
+                    entry.attempt, entry.stage, entry.feedback
+                ));
             }
         }
 
         prompt.push_str("## Instructions\n");
         prompt.push_str("Fix ALL the issues listed above and generate the COMPLETE corrected SKILL.py content.\n");
+        prompt.push_str("If the skill can directly produce final user-facing text, return `display_text`. Otherwise return `summary_data` as a lightweight structured summary for runtime/LLM polishing. Do NOT place complete webpages, long markdown, or large raw logs into `summary_data`.\n");
         prompt.push_str("Output the Python code in a ```python code block.\n");
+        prompt.push_str("If you output `meta.yaml`, it must follow the minimal meta rules below.\n\n");
+        prompt.push_str(Self::trigger_rules_prompt());
 
         Ok(prompt)
     }
@@ -1333,7 +1579,8 @@ or\n\
         // Try generic ``` block
         if let Some(start) = response.find("```") {
             let after_marker = start + 3;
-            let content_start = response[after_marker..].find('\n')
+            let content_start = response[after_marker..]
+                .find('\n')
                 .map(|i| after_marker + i + 1)
                 .unwrap_or(after_marker);
             if let Some(end) = response[content_start..].find("```") {
@@ -1358,7 +1605,8 @@ or\n\
         } else if let Some(start) = response.find("```") {
             let after_marker = start + 3;
             // Skip optional language tag on same line
-            let content_start = response[after_marker..].find('\n')
+            let content_start = response[after_marker..]
+                .find('\n')
                 .map(|i| after_marker + i + 1)
                 .unwrap_or(after_marker);
             if let Some(end) = response[content_start..].find("```") {
@@ -1407,7 +1655,7 @@ or\n\
     async fn compile_skill(&self, skill_path: &Path) -> Result<(bool, Option<String>)> {
         let engine = rhai::Engine::new();
         let content = std::fs::read_to_string(skill_path)?;
-        
+
         match engine.compile(&content) {
             Ok(_ast) => {
                 info!("🔨 [compile] Rhai compilation succeeded");
@@ -1427,7 +1675,9 @@ or\n\
 
     /// P0-2: create_new_version 直接写入完整脚本（不再 apply diff）
     fn create_new_version(&self, record: &EvolutionRecord) -> Result<()> {
-        let patch = record.patch.as_ref()
+        let patch = record
+            .patch
+            .as_ref()
             .ok_or_else(|| Error::Evolution("No patch to deploy".to_string()))?;
 
         let skill_root = self.skill_root_dir_for_record(record);
@@ -1486,7 +1736,8 @@ or\n\
         // 通过 VersionManager 创建版本快照
         let changelog = Some(format!(
             "Evolution {}: {}",
-            record.id, patch.explanation.chars().take(200).collect::<String>()
+            record.id,
+            patch.explanation.chars().take(200).collect::<String>()
         ));
         let version = self.version_manager.create_version(
             &record.skill_name,
@@ -1500,11 +1751,81 @@ or\n\
             "New skill version deployed via evolution"
         );
 
+        // Clean up skill directory — remove temp/cache/backup files
+        let final_skill_dir = self.skills_dir.join(&record.skill_name);
+        self.cleanup_skill_dir(&final_skill_dir, &record.skill_name);
+
         Ok(())
     }
 
+    /// 清理技能目录：删除非必要文件，只保留 SKILL.rhai/SKILL.py/SKILL.md, meta.yaml, tests/, CHANGELOG.md
+    fn cleanup_skill_dir(&self, skill_dir: &Path, skill_name: &str) {
+        if !skill_dir.exists() {
+            return;
+        }
+
+        // Files/dirs we always keep
+        let keep_files: &[&str] = &[
+            "SKILL.rhai",
+            "SKILL.py",
+            "SKILL.md",
+            "meta.yaml",
+            "CHANGELOG.md",
+        ];
+        let keep_dirs: &[&str] = &["tests"];
+
+        let entries = match std::fs::read_dir(skill_dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        let mut removed = 0usize;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+
+            if path.is_dir() {
+                if keep_dirs.contains(&name_str.as_ref()) {
+                    continue;
+                }
+                // Remove __pycache__ and other cache dirs
+                if (name_str == "__pycache__" || name_str.starts_with('.'))
+                    && std::fs::remove_dir_all(&path).is_ok()
+                {
+                    removed += 1;
+                }
+            } else {
+                if keep_files.contains(&name_str.as_ref()) {
+                    continue;
+                }
+                // Remove temp files, .pyc, .bak, .tmp, .orig, swap files
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                let should_remove =
+                    matches!(ext, "pyc" | "pyo" | "bak" | "tmp" | "orig" | "swp" | "swo")
+                        || name_str.ends_with(".bak")
+                        || name_str.ends_with(".orig")
+                        || name_str.starts_with('.')
+                        || name_str.ends_with('~');
+                if should_remove && std::fs::remove_file(&path).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+
+        if removed > 0 {
+            info!(
+                skill = %skill_name,
+                removed = removed,
+                "🧹 [cleanup] Removed {} non-essential files from skill directory",
+                removed
+            );
+        }
+    }
+
     fn restore_previous_version(&self, skill_name: &str) -> Result<()> {
-        self.version_manager.rollback(skill_name)
+        self.version_manager
+            .rollback(skill_name)
             .map_err(|e| Error::Evolution(format!("Rollback failed: {}", e)))
     }
 
@@ -1514,9 +1835,13 @@ or\n\
 
     /// P2-7: 原子写入 — write-tmp-then-rename，避免崩溃时文件损坏
     fn save_record(&self, record: &EvolutionRecord) -> Result<()> {
-        let records_dir = self.evolution_db.parent().unwrap().join("evolution_records");
+        let records_dir = self
+            .evolution_db
+            .parent()
+            .unwrap()
+            .join("evolution_records");
         std::fs::create_dir_all(&records_dir)?;
-        
+
         let record_file = records_dir.join(format!("{}.json", record.id));
         // Use a unique temp file name to avoid races when multiple tick loops/processes
         // attempt to write the same record concurrently.
@@ -1530,22 +1855,26 @@ or\n\
             counter
         ));
         let json = serde_json::to_string_pretty(record)?;
-        
+
         // 先写入临时文件
         std::fs::write(&temp_file, &json)?;
         // 原子重命名（同一文件系统上是原子操作）
         std::fs::rename(&temp_file, &record_file)?;
-        
+
         Ok(())
     }
 
     pub fn load_record(&self, evolution_id: &str) -> Result<EvolutionRecord> {
-        let records_dir = self.evolution_db.parent().unwrap().join("evolution_records");
+        let records_dir = self
+            .evolution_db
+            .parent()
+            .unwrap()
+            .join("evolution_records");
         let record_file = records_dir.join(format!("{}.json", evolution_id));
-        
+
         let json = std::fs::read_to_string(record_file)?;
         let record = serde_json::from_str(&json)?;
-        
+
         Ok(record)
     }
 }
@@ -1556,4 +1885,3 @@ or\n\
 pub trait LLMProvider: Send + Sync {
     async fn generate(&self, prompt: &str) -> Result<String>;
 }
-

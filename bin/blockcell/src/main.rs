@@ -32,12 +32,34 @@ enum Commands {
         /// API key for the provider
         #[arg(long, name = "api-key")]
         api_key: Option<String>,
-        /// Model name (e.g. deepseek-chat, moonshot-v1-8k)
+        /// Model name (e.g. deepseek-chat, kimi-k2.5)
         #[arg(long)]
         model: Option<String>,
         /// Only update channel configuration, skip provider setup
         #[arg(long)]
         channels_only: bool,
+    },
+
+    /// Interactive setup wizard (provider + channel)
+    Setup {
+        /// Reset existing config to defaults before setup
+        #[arg(long)]
+        force: bool,
+        /// LLM provider name (deepseek/openai/kimi/anthropic/gemini/zhipu/minimax/ollama)
+        #[arg(long)]
+        provider: Option<String>,
+        /// API key for selected provider
+        #[arg(long, name = "api-key")]
+        api_key: Option<String>,
+        /// Model name override
+        #[arg(long)]
+        model: Option<String>,
+        /// Optional channel to configure (telegram/feishu/wecom/dingtalk/lark/qq/none)
+        #[arg(long)]
+        channel: Option<String>,
+        /// Skip provider config validation after saving config
+        #[arg(long)]
+        skip_provider_test: bool,
     },
 
     /// Show current configuration status
@@ -49,9 +71,13 @@ enum Commands {
         #[arg(short, long)]
         message: Option<String>,
 
-        /// Session ID
-        #[arg(short, long, default_value = "cli:default")]
-        session: String,
+        /// Target agent id (defaults to "default")
+        #[arg(short = 'a', long)]
+        agent: Option<String>,
+
+        /// Session ID (defaults to cli:<agent>)
+        #[arg(short, long)]
+        session: Option<String>,
 
         /// Override LLM model for this session
         #[arg(long)]
@@ -88,10 +114,10 @@ enum Commands {
         command: ToolsCommands,
     },
 
-    /// View and manage background tasks
-    Tasks {
+    /// Manage MCP servers
+    Mcp {
         #[command(subcommand)]
-        command: TasksCommands,
+        command: McpCommands,
     },
 
     /// Execute a tool or agent message directly
@@ -171,24 +197,6 @@ enum Commands {
     },
 }
 
-// ── P0: Tasks ───────────────────────────────────────────────────────────────
-
-#[derive(Subcommand)]
-enum TasksCommands {
-    /// List all background tasks
-    List,
-    /// Show details for a specific task
-    Show {
-        /// Task ID (prefix match)
-        task_id: String,
-    },
-    /// Cancel a running task (if supported)
-    Cancel {
-        /// Task ID (prefix match)
-        task_id: String,
-    },
-}
-
 // ── P0: Config ──────────────────────────────────────────────────────────────
 
 #[derive(Subcommand)]
@@ -261,6 +269,85 @@ enum ToolsCommands {
     },
 }
 
+#[allow(clippy::large_enum_variant)]
+#[derive(Subcommand)]
+enum McpCommands {
+    /// List MCP servers
+    List,
+    /// Show one MCP server
+    Show {
+        /// MCP server name
+        name: String,
+    },
+    /// Add an MCP server from template or raw config
+    Add {
+        /// Template name (github/sqlite/filesystem/postgres/puppeteer) or logical name for `--raw`
+        template_or_name: String,
+        /// Use raw command/args/env instead of template generation
+        #[arg(long)]
+        raw: bool,
+        /// Explicit server name override
+        #[arg(long)]
+        name: Option<String>,
+        /// Raw command executable
+        #[arg(long)]
+        command: Option<String>,
+        /// Repeatable raw argument
+        #[arg(long = "arg")]
+        args: Vec<String>,
+        /// Repeatable environment variable entry KEY=VALUE
+        #[arg(long = "env")]
+        env: Vec<String>,
+        /// Working directory
+        #[arg(long)]
+        cwd: Option<String>,
+        /// SQLite template database path
+        #[arg(long)]
+        db_path: Option<String>,
+        /// Filesystem template root path (repeatable)
+        #[arg(long = "path")]
+        filesystem_paths: Vec<String>,
+        /// Postgres template DSN
+        #[arg(long)]
+        dsn: Option<String>,
+        /// Overwrite existing file if present
+        #[arg(long)]
+        force: bool,
+        /// Create disabled
+        #[arg(long)]
+        disabled: bool,
+        /// Disable auto-start
+        #[arg(long)]
+        no_auto_start: bool,
+        /// Startup timeout override
+        #[arg(long)]
+        startup_timeout_secs: Option<u64>,
+        /// Call timeout override
+        #[arg(long)]
+        call_timeout_secs: Option<u64>,
+    },
+    /// Remove an MCP server
+    Remove {
+        /// MCP server name
+        name: String,
+    },
+    /// Enable an MCP server
+    Enable {
+        /// MCP server name
+        name: String,
+    },
+    /// Disable an MCP server
+    Disable {
+        /// MCP server name
+        name: String,
+    },
+    /// Open MCP config in editor
+    Edit {
+        /// Optional server name; edits mcp.d/<name>.json if present
+        name: Option<String>,
+    },
+}
+
 // ── P0: Run ─────────────────────────────────────────────────────────────────
 
 #[derive(Subcommand)]
@@ -271,6 +358,9 @@ enum RunCommands {
         tool_name: String,
         /// JSON parameters
         params: String,
+        /// Target agent id (defaults to "default")
+        #[arg(short = 'a', long)]
+        agent: Option<String>,
     },
     /// Send a message through the agent (shortcut for `agent -m`)
     #[command(name = "msg")]
@@ -280,6 +370,9 @@ enum RunCommands {
         /// Session ID
         #[arg(short, long, default_value = "cli:run")]
         session: String,
+        /// Target agent id (defaults to "default")
+        #[arg(short = 'a', long)]
+        agent: Option<String>,
     },
 }
 
@@ -302,7 +395,7 @@ enum AlertsCommands {
         /// Rule name
         #[arg(long)]
         name: String,
-        /// Data source (e.g. "finance_api:stock_quote:600519")
+        /// Data source (e.g. "stream_subscribe:ticker:BTCUSDT")
         #[arg(long)]
         source: String,
         /// Field to monitor (e.g. "price", "change_pct")
@@ -429,79 +522,57 @@ enum ChannelsCommands {
         /// Channel name
         channel: String,
     },
+    /// Manage channel owner bindings (channel -> agent)
+    Owner {
+        #[command(subcommand)]
+        command: ChannelOwnerCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum ChannelOwnerCommands {
+    /// List channel owner bindings
+    List,
+    /// Set owner agent for a channel or channel account
+    Set {
+        /// Channel name
+        #[arg(long)]
+        channel: String,
+        /// Optional account id for account-level binding
+        #[arg(long)]
+        account: Option<String>,
+        /// Agent id
+        #[arg(long)]
+        agent: String,
+    },
+    /// Clear owner binding for a channel or channel account
+    Clear {
+        /// Channel name
+        #[arg(long)]
+        channel: String,
+        /// Optional account id for account-level binding
+        #[arg(long)]
+        account: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
 enum CronCommands {
-    /// List all cron jobs
+    /// List cron jobs (read-only; manage jobs via the WebUI or chat channels)
     List {
         /// Show all jobs including disabled
         #[arg(long)]
         all: bool,
-    },
-    /// Pause (disable) a cron job
-    Pause {
-        /// Job ID
-        job_id: String,
-    },
-    /// Resume (enable) a paused cron job
-    Resume {
-        /// Job ID
-        job_id: String,
-    },
-    /// Add a new cron job
-    Add {
-        /// Job name
-        #[arg(long)]
-        name: String,
-        /// Message to send
-        #[arg(long)]
-        message: String,
-        /// Run every N seconds
-        #[arg(long)]
-        every: Option<u64>,
-        /// Cron expression
-        #[arg(long)]
-        cron: Option<String>,
-        /// Run at specific time (ISO format)
-        #[arg(long)]
-        at: Option<String>,
-        /// Deliver output to channel
-        #[arg(long)]
-        deliver: bool,
-        /// Target chat ID for delivery
-        #[arg(long)]
-        to: Option<String>,
-        /// Target channel for delivery
-        #[arg(long)]
-        channel: Option<String>,
-    },
-    /// Remove a cron job
-    Remove {
-        /// Job ID
-        job_id: String,
-    },
-    /// Enable or disable a cron job
-    Enable {
-        /// Job ID
-        job_id: String,
-        /// Disable instead of enable
-        #[arg(long)]
-        disable: bool,
-    },
-    /// Run a cron job immediately
-    Run {
-        /// Job ID
-        job_id: String,
-        /// Force run even if disabled
-        #[arg(long)]
-        force: bool,
+        /// Agent ID to query (default: "default")
+        #[arg(long, default_value = "default")]
+        agent: String,
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Default)]
 enum UpgradeCommands {
     /// Check for available updates
+    #[default]
     Check,
     /// Download available update
     Download,
@@ -515,12 +586,6 @@ enum UpgradeCommands {
     },
     /// Show upgrade status
     Status,
-}
-
-impl Default for UpgradeCommands {
-    fn default() -> Self {
-        UpgradeCommands::Check
-    }
 }
 
 #[derive(Subcommand)]
@@ -715,14 +780,38 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     match cli.command {
-        Commands::Onboard { force, interactive: _, provider, api_key, model, channels_only } => {
+        Commands::Onboard {
+            force,
+            interactive: _,
+            provider,
+            api_key,
+            model,
+            channels_only,
+        } => {
             commands::onboard::run(force, provider, api_key, model, channels_only).await?;
+        }
+        Commands::Setup {
+            force,
+            provider,
+            api_key,
+            model,
+            channel,
+            skip_provider_test,
+        } => {
+            commands::setup::run(force, provider, api_key, model, channel, skip_provider_test)
+                .await?;
         }
         Commands::Status => {
             commands::status::run().await?;
         }
-        Commands::Agent { message, session, model, provider } => {
-            commands::agent::run(message, session, model, provider).await?;
+        Commands::Agent {
+            message,
+            agent,
+            session,
+            model,
+            provider,
+        } => {
+            commands::agent::run(message, agent, session, model, provider).await?;
         }
         Commands::Gateway { port, host } => {
             commands::gateway::run(host, port).await?;
@@ -769,32 +858,89 @@ async fn main() -> anyhow::Result<()> {
             ToolsCommands::Test { tool_name, params } => {
                 commands::tools_cmd::test(&tool_name, &params).await?;
             }
-            ToolsCommands::Toggle { tool_name, enable, disable } => {
-                let enabled = if disable { false } else { enable || true };
+            ToolsCommands::Toggle {
+                tool_name,
+                enable: _,
+                disable,
+            } => {
+                let enabled = !disable;
                 commands::tools_cmd::toggle(&tool_name, enabled).await?;
             }
         },
 
-        // ── Tasks ───────────────────────────────────────────────────────
-        Commands::Tasks { command } => match command {
-            TasksCommands::List => {
-                commands::tasks_cmd::list().await?;
+        // ── P0: MCP ─────────────────────────────────────────────────────
+        Commands::Mcp { command } => match command {
+            McpCommands::List => {
+                commands::mcp::list().await?;
             }
-            TasksCommands::Show { task_id } => {
-                commands::tasks_cmd::show(&task_id).await?;
+            McpCommands::Show { name } => {
+                commands::mcp::show(&name).await?;
             }
-            TasksCommands::Cancel { task_id } => {
-                commands::tasks_cmd::cancel(&task_id).await?;
+            McpCommands::Add {
+                template_or_name,
+                raw,
+                name,
+                command,
+                args,
+                env,
+                cwd,
+                db_path,
+                filesystem_paths,
+                dsn,
+                force,
+                disabled,
+                no_auto_start,
+                startup_timeout_secs,
+                call_timeout_secs,
+            } => {
+                commands::mcp::add(
+                    &template_or_name,
+                    raw,
+                    name,
+                    command,
+                    args,
+                    env,
+                    cwd,
+                    db_path,
+                    filesystem_paths,
+                    dsn,
+                    force,
+                    disabled,
+                    no_auto_start,
+                    startup_timeout_secs,
+                    call_timeout_secs,
+                )
+                .await?;
+            }
+            McpCommands::Remove { name } => {
+                commands::mcp::remove(&name).await?;
+            }
+            McpCommands::Enable { name } => {
+                commands::mcp::set_enabled(&name, true).await?;
+            }
+            McpCommands::Disable { name } => {
+                commands::mcp::set_enabled(&name, false).await?;
+            }
+            McpCommands::Edit { name } => {
+                commands::mcp::edit(name.as_deref()).await?;
             }
         },
 
         // ── P0: Run ─────────────────────────────────────────────────────
         Commands::Run { command } => match command {
-            RunCommands::Tool { tool_name, params } => {
-                commands::run_cmd::tool(&tool_name, &params).await?;
+            RunCommands::Tool {
+                tool_name,
+                params,
+                agent,
+            } => {
+                commands::run_cmd::tool(&tool_name, &params, agent.as_deref()).await?;
             }
-            RunCommands::Message { message, session } => {
-                commands::run_cmd::message(&message, &session).await?;
+            RunCommands::Message {
+                message,
+                session,
+                agent,
+            } => {
+                commands::run_cmd::message(&message, &session, agent.as_deref()).await?;
             }
         },
 
@@ -806,37 +952,25 @@ async fn main() -> anyhow::Result<()> {
             ChannelsCommands::Login { channel } => {
                 commands::channels::login(&channel).await?;
             }
+            ChannelsCommands::Owner { command } => match command {
+                ChannelOwnerCommands::List => {
+                    commands::channels::owner_list().await?;
+                }
+                ChannelOwnerCommands::Set {
+                    channel,
+                    account,
+                    agent,
+                } => {
+                    commands::channels::owner_set(&channel, account.as_deref(), &agent).await?;
+                }
+                ChannelOwnerCommands::Clear { channel, account } => {
+                    commands::channels::owner_clear(&channel, account.as_deref()).await?;
+                }
+            },
         },
         Commands::Cron { command } => match command {
-            CronCommands::List { all } => {
-                commands::cron::list(all).await?;
-            }
-            CronCommands::Pause { job_id } => {
-                commands::cron::enable(&job_id, false).await?;
-            }
-            CronCommands::Resume { job_id } => {
-                commands::cron::enable(&job_id, true).await?;
-            }
-            CronCommands::Add {
-                name,
-                message,
-                every,
-                cron,
-                at,
-                deliver,
-                to,
-                channel,
-            } => {
-                commands::cron::add(name, message, every, cron, at, deliver, to, channel).await?;
-            }
-            CronCommands::Remove { job_id } => {
-                commands::cron::remove(&job_id).await?;
-            }
-            CronCommands::Enable { job_id, disable } => {
-                commands::cron::enable(&job_id, !disable).await?;
-            }
-            CronCommands::Run { job_id, force } => {
-                commands::cron::run_job(&job_id, force).await?;
+            CronCommands::List { all, agent } => {
+                commands::cron::list(all, &agent).await?;
             }
         },
         Commands::Upgrade { check, command } => {
@@ -890,10 +1024,18 @@ async fn main() -> anyhow::Result<()> {
             SkillsCommands::Forget { name } => {
                 commands::skills::forget(&name).await?;
             }
-            SkillsCommands::Test { path, input, verbose } => {
+            SkillsCommands::Test {
+                path,
+                input,
+                verbose,
+            } => {
                 commands::skills::test(&path, input, verbose).await?;
             }
-            SkillsCommands::TestAll { dir, input, verbose } => {
+            SkillsCommands::TestAll {
+                dir,
+                input,
+                verbose,
+            } => {
                 commands::skills::test_all(&dir, input, verbose).await?;
             }
         },
@@ -939,7 +1081,12 @@ async fn main() -> anyhow::Result<()> {
             MemoryCommands::Stats => {
                 commands::memory::stats().await?;
             }
-            MemoryCommands::Search { query, scope, item_type, top } => {
+            MemoryCommands::Search {
+                query,
+                scope,
+                item_type,
+                top,
+            } => {
                 commands::memory::search(&query, scope, item_type, top).await?;
             }
             MemoryCommands::Maintenance { recycle_days } => {
@@ -961,7 +1108,13 @@ async fn main() -> anyhow::Result<()> {
             AlertsCommands::Evaluate => {
                 commands::alerts_cmd::evaluate().await?;
             }
-            AlertsCommands::Add { name, source, field, operator, threshold } => {
+            AlertsCommands::Add {
+                name,
+                source,
+                field,
+                operator,
+                threshold,
+            } => {
                 commands::alerts_cmd::add(&name, &source, &field, &operator, &threshold).await?;
             }
             AlertsCommands::Remove { rule_id } => {
@@ -990,10 +1143,18 @@ async fn main() -> anyhow::Result<()> {
             KnowledgeCommands::Stats { graph } => {
                 commands::knowledge_cmd::stats(graph).await?;
             }
-            KnowledgeCommands::Search { query, graph, limit } => {
+            KnowledgeCommands::Search {
+                query,
+                graph,
+                limit,
+            } => {
                 commands::knowledge_cmd::search(&query, graph, limit).await?;
             }
-            KnowledgeCommands::Export { format, graph, output } => {
+            KnowledgeCommands::Export {
+                format,
+                graph,
+                output,
+            } => {
                 commands::knowledge_cmd::export(graph, &format, output).await?;
             }
             KnowledgeCommands::ListGraphs => {
@@ -1008,7 +1169,12 @@ async fn main() -> anyhow::Result<()> {
 
         // ── P2: Logs ────────────────────────────────────────────────────
         Commands::Logs { command } => match command {
-            LogsCommands::Show { lines, filter, last_n, session } => {
+            LogsCommands::Show {
+                lines,
+                filter,
+                last_n,
+                session,
+            } => {
                 let n = last_n.unwrap_or(lines);
                 commands::logs_cmd::show(n, filter, session).await?;
             }
@@ -1022,4 +1188,173 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn test_agent_subcommand_accepts_agent_flag() {
+        let cli = Cli::try_parse_from(["blockcell", "agent", "--agent", "ops"])
+            .expect("agent flag should parse");
+
+        match cli.command {
+            Commands::Agent { agent, session, .. } => {
+                assert_eq!(agent.as_deref(), Some("ops"));
+                assert!(session.is_none());
+            }
+            other => panic!("unexpected command: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn test_agent_subcommand_accepts_agent_short_flag() {
+        let cli = Cli::try_parse_from(["blockcell", "agent", "-a", "ops", "-m", "hello"])
+            .expect("short agent flag should parse");
+
+        match cli.command {
+            Commands::Agent { agent, message, .. } => {
+                assert_eq!(agent.as_deref(), Some("ops"));
+                assert_eq!(message.as_deref(), Some("hello"));
+            }
+            other => panic!("unexpected command: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn test_run_message_subcommand_accepts_agent_flag() {
+        let cli = Cli::try_parse_from(["blockcell", "run", "msg", "hello", "--agent", "ops"])
+            .expect("run msg agent flag should parse");
+
+        match cli.command {
+            Commands::Run { command } => match command {
+                RunCommands::Message {
+                    message,
+                    session,
+                    agent,
+                } => {
+                    assert_eq!(message, "hello");
+                    assert_eq!(session, "cli:run");
+                    assert_eq!(agent.as_deref(), Some("ops"));
+                }
+                other => panic!(
+                    "unexpected run command: {:?}",
+                    std::mem::discriminant(&other)
+                ),
+            },
+            other => panic!("unexpected command: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn test_run_tool_subcommand_accepts_agent_flag() {
+        let cli = Cli::try_parse_from([
+            "blockcell",
+            "run",
+            "tool",
+            "read_file",
+            r#"{"path":"README.md"}"#,
+            "--agent",
+            "ops",
+        ])
+        .expect("run tool agent flag should parse");
+
+        match cli.command {
+            Commands::Run { command } => match command {
+                RunCommands::Tool {
+                    tool_name,
+                    params,
+                    agent,
+                } => {
+                    assert_eq!(tool_name, "read_file");
+                    assert_eq!(params, r#"{"path":"README.md"}"#);
+                    assert_eq!(agent.as_deref(), Some("ops"));
+                }
+                other => panic!(
+                    "unexpected run command: {:?}",
+                    std::mem::discriminant(&other)
+                ),
+            },
+            other => panic!("unexpected command: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn test_channels_owner_set_accepts_account_flag() {
+        let cli = Cli::try_parse_from([
+            "blockcell",
+            "channels",
+            "owner",
+            "set",
+            "--channel",
+            "telegram",
+            "--account",
+            "bot2",
+            "--agent",
+            "ops",
+        ])
+        .expect("channels owner set --account should parse");
+
+        match cli.command {
+            Commands::Channels { command } => match command {
+                ChannelsCommands::Owner { command } => match command {
+                    ChannelOwnerCommands::Set {
+                        channel,
+                        account,
+                        agent,
+                    } => {
+                        assert_eq!(channel, "telegram");
+                        assert_eq!(account.as_deref(), Some("bot2"));
+                        assert_eq!(agent, "ops");
+                    }
+                    other => panic!(
+                        "unexpected owner command: {:?}",
+                        std::mem::discriminant(&other)
+                    ),
+                },
+                other => panic!(
+                    "unexpected channels command: {:?}",
+                    std::mem::discriminant(&other)
+                ),
+            },
+            other => panic!("unexpected command: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn test_channels_owner_clear_accepts_account_flag() {
+        let cli = Cli::try_parse_from([
+            "blockcell",
+            "channels",
+            "owner",
+            "clear",
+            "--channel",
+            "telegram",
+            "--account",
+            "bot2",
+        ])
+        .expect("channels owner clear --account should parse");
+
+        match cli.command {
+            Commands::Channels { command } => match command {
+                ChannelsCommands::Owner { command } => match command {
+                    ChannelOwnerCommands::Clear { channel, account } => {
+                        assert_eq!(channel, "telegram");
+                        assert_eq!(account.as_deref(), Some("bot2"));
+                    }
+                    other => panic!(
+                        "unexpected owner command: {:?}",
+                        std::mem::discriminant(&other)
+                    ),
+                },
+                other => panic!(
+                    "unexpected channels command: {:?}",
+                    std::mem::discriminant(&other)
+                ),
+            },
+            other => panic!("unexpected command: {:?}", std::mem::discriminant(&other)),
+        }
+    }
 }

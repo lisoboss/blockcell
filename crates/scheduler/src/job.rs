@@ -55,13 +55,17 @@ pub struct JobPayload {
     pub channel: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub to: Option<String>,
-    /// For kind="skill_rhai" / "skill_python": the skill directory name (e.g. "stock_monitor")
+    /// For kind="script": the script runtime kind ("rhai" | "python")
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub script_kind: Option<String>,
+    /// For kind="script": the skill directory name (e.g. "stock_monitor")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "skillName")]
     pub skill_name: Option<String>,
 }
 
 fn default_payload_kind() -> String {
-    "agent_turn".to_string()
+    "reminder".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

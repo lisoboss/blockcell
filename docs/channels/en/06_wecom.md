@@ -52,7 +52,7 @@ WeCom's `sender_id` is usually the enterprise's account (UserID).
 
 ## 5. Configure Blockcell
 
-Edit `~/.blockcell/config.json` and modify the `wecom` section:
+Edit `~/.blockcell/config.json5` and modify the `wecom` section:
 
 ```json
 {
@@ -83,6 +83,16 @@ Edit `~/.blockcell/config.json` and modify the `wecom` section:
 | `callbackToken` | For callback mode signature verification. Can be empty if using polling |
 | `encodingAesKey` | For callback mode message encryption/decryption. Can be empty if using polling |
 | `allowFrom` | List of allowed user `UserID`s. If left empty `[]`, anyone within the enterprise's visibility range can interact with the bot |
+
+> If you enable this external channel through `blockcell gateway`, you also need an owner binding in `config.json5`, for example:
+>
+> ```json
+> { "channelOwners": { "wecom": "default" } }
+>
+> If you configure multiple accounts / bots for the same channel, you can additionally set `channelAccountOwners.wecom.<accountId> = "ops"` to route one specific account to a different agent.
+> ```
+>
+> Otherwise Gateway refuses to start because the enabled external channel has no owner.
 
 ## 6. Start Gateway
 

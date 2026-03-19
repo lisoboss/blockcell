@@ -18,14 +18,14 @@ For security reasons, it's recommended to configure an allowlist (`allowFrom`) t
 
 ## 3. Configure Blockcell
 
-In Blockcell's configuration file (e.g., `~/.blockcell/config.json` or `config.json` in the project directory), find the `channels` configuration block and modify the `telegram` section:
+In Blockcell's configuration file (e.g., `~/.blockcell/config.json5` or `config.json5` in the project directory), find the `channels` configuration block and modify the `telegram` section:
 
 ```json
 {
   "channels": {
     "telegram": {
       "enabled": true,
-      "botToken": "YOUR_BOT_TOKEN",
+      "token": "YOUR_BOT_TOKEN",
       "allowFrom": ["YOUR_USER_ID", "OTHER_USER_ID"]
     }
   }
@@ -35,8 +35,51 @@ In Blockcell's configuration file (e.g., `~/.blockcell/config.json` or `config.j
 ### Configuration Options
 
 - `enabled`: Whether to enable the Telegram channel (`true` or `false`).
-- `botToken`: The API Token obtained from BotFather.
+- `token`: The API Token obtained from BotFather.
 - `allowFrom`: List of allowed user IDs (string array). If left empty `[]`, anyone can call the bot in group chats or private messages. It's recommended to configure specific IDs in production environments.
+
+> If you enable Telegram through `blockcell gateway`, you also need an owner binding in `config.json5`, for example:
+>
+> ```json
+> { "channelOwners": { "telegram": "default" } }
+> ```
+>
+> If the same channel carries multiple accounts / bots, you can further use `channels.telegram.accounts` together with `channelAccountOwners.telegram.<accountId>`, for example:
+>
+> ```json
+> {
+>   "channelAccountOwners": {
+>     "telegram": {
+>       "bot1": "default",
+>       "bot2": "ops"
+>     }
+>   },
+>   "channels": {
+>     "telegram": {
+>       "enabled": true,
+>       "defaultAccountId": "bot1",
+>       "accounts": {
+>         "bot1": {
+>           "enabled": true,
+>           "token": "BOT1_TOKEN",
+>           "allowFrom": ["YOUR_USER_ID"]
+>         },
+>         "bot2": {
+>           "enabled": true,
+>           "token": "BOT2_TOKEN",
+>           "allowFrom": ["YOUR_USER_ID"]
+>         }
+>       }
+>     }
+>   }
+> }
+> ```
+>
+> This routes `bot1` to the `default` agent and `bot2` to the `ops` agent. Because both enabled accounts are explicitly bound, you do not need an extra `channelOwners.telegram` fallback here.
+>
+> You can also configure the bindings from CLI: `blockcell channels owner set --channel telegram --account bot1 --agent default` and `blockcell channels owner set --channel telegram --account bot2 --agent ops`.
+>
+> Otherwise Gateway refuses to start because the enabled external channel has no owner.
 
 ## 4. Interaction Methods
 

@@ -21,11 +21,11 @@ const KNOWN_PROVIDERS: KnownProvider[] = [
   { id: 'openai',       label: 'OpenAI',              defaultBase: 'https://api.openai.com/v1',                          models: ['gpt-5.1', 'gpt-4o', 'gpt-4o', 'gpt-4o-mini'],                                   keyHint: 'sk-proj-...' },
   { id: 'anthropic',    label: 'Anthropic',            defaultBase: 'https://api.anthropic.com/v1',                       models: ['claude-opus-4-6', 'claude-sonnet-4-5', 'claude-opus-4-5'],               keyHint: 'sk-ant-...' },
   { id: 'gemini',       label: 'Google Gemini',        defaultBase: 'https://generativelanguage.googleapis.com/v1beta/openai', models: ['gemini-3-pro-preview', 'gemini-3-flash-preview', 'gemini-2.5-flash'],                               keyHint: 'AIza...' },
-  { id: 'kimi',         label: 'Moonshot AI (Kimi)',   defaultBase: 'https://api.moonshot.ai/v1',                         models: ['kimi-k2.5', 'kimi-k2-thinking', 'kimi-k2-turbo-preview'],                                   keyHint: 'sk-...' },
+  { id: 'kimi',         label: 'Moonshot AI (Kimi)',   defaultBase: 'https://api.moonshot.cn/v1',                         models: ['kimi-k2.5', 'kimi-k2-thinking', 'kimi-k2-turbo-preview'],                                   keyHint: 'sk-...' },
   { id: 'deepseek',     label: 'DeepSeek',             defaultBase: 'https://api.deepseek.com/v1',                        models: ['deepseek-chat', 'deepseek-reasoner'],                                     keyHint: 'sk-...' },
   { id: 'xai',          label: 'xAI (Grok)',           defaultBase: 'https://api.x.ai/v1',                                models: ['grok-beta', 'grok-vision-beta'],              keyHint: 'xai-...' },
   { id: 'mistral',      label: 'Mistral',              defaultBase: 'https://api.mistral.ai/v1',                          models: ['mistral-large-latest', 'mistral-small-latest'],              keyHint: '...' },
-  { id: 'minimax',      label: 'MiniMax',              defaultBase: 'https://api.minimax.chat/v1',                        models: ['m2.5', 'm2.1'],              keyHint: '...' },
+  { id: 'minimax',      label: 'MiniMax',              defaultBase: 'https://api.minimaxi.com/v1',                        models: ['m2.5', 'm2.1'],              keyHint: '...' },
   { id: 'qwen',         label: 'Qwen (千问)',          defaultBase: 'https://api.qwen.ai/v1',                             models: ['coder-model', 'vision-model'],              keyHint: 'sk-...' },
   { id: 'glm',          label: 'Z.AI (GLM)',           defaultBase: 'https://api.z.ai/v1',                                models: ['glm-4.7', 'glm-5'],              keyHint: '...' },
   { id: 'groq',         label: 'Groq',                 defaultBase: 'https://api.groq.com/openai/v1',                     models: ['llama-3.3-70b-versatile', 'mixtral-8x7b-32768'],              keyHint: 'gsk_...' },
@@ -44,6 +44,7 @@ interface ModelEntry {
   provider: string;
   weight: number;
   priority: number;
+  toolCallMode?: 'native' | 'text' | 'none' | 'auto';
   temperature?: number;
   maxTokens?: number;
   inputPrice?: number;  // USD/1M tokens
@@ -96,6 +97,7 @@ export function LLMPage() {
           provider: defaults.provider || '',
           weight: 1,
           priority: 1,
+          toolCallMode: 'native',
           temperature: defaults.temperature,
           maxTokens: defaults.maxTokens,
         };
@@ -126,6 +128,7 @@ export function LLMPage() {
           provider: e.provider,
           weight: e.weight,
           priority: e.priority,
+          toolCallMode: e.toolCallMode ?? 'native',
           temperature: e.temperature,
           maxTokens: e.maxTokens,
           inputPrice: e.inputPrice,
@@ -220,15 +223,23 @@ export function LLMPage() {
     if (!selectedProvider) return;
     const cfg = providers[selectedProvider];
     if (!cfg) return;
-    
+
+    const firstModelEntry = modelPool.find(m => m.provider === selectedProvider);
+    if (!firstModelEntry?.model?.trim()) {
+      setTestResult({
+        ok: false,
+        msg: t('llm.testConnectionNoModel'),
+      });
+      return;
+    }
+
     setTesting(true); setTestResult(null);
     try {
       const kp = knownFor(selectedProvider);
-      const model = kp?.models[0] || 'gpt-3.5-turbo';
       const res = await testProvider({
-        model,
+        model: firstModelEntry.model.trim(),
         api_key: cfg.apiKey || '',
-        api_base: cfg.apiBase,
+        api_base: cfg.apiBase || kp?.defaultBase,
         proxy: cfg.proxy || undefined,
       });
       setTestResult({ ok: res.status === 'ok', msg: res.message });
@@ -277,7 +288,7 @@ export function LLMPage() {
             onClick={handleSave}
             disabled={saving}
             className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg transition-colors disabled:opacity-50 ${
-              saveStatus === 'saved' ? 'bg-cyber/10 text-cyber border border-cyber/30'
+              saveStatus === 'saved' ? 'bg-[hsl(var(--brand-green)/0.10)] text-[hsl(var(--brand-green))] border border-[hsl(var(--brand-green)/0.28)]'
               : saveStatus === 'error' ? 'bg-destructive/10 text-destructive border border-destructive/30'
               : 'bg-rust text-white hover:bg-rust/90'
             }`}
@@ -324,7 +335,7 @@ export function LLMPage() {
                     {isActive && <ChevronRight size={12} className="text-rust shrink-0" />}
                   </div>
                   <p className="text-[10px] text-muted-foreground mt-0.5">
-                    {t('skills.count', { n: modelCount })}
+                    {t('models.count', { n: modelCount })}
                   </p>
                 </button>
               );
@@ -343,7 +354,7 @@ export function LLMPage() {
               {/* Save message */}
               {saveStatus !== 'idle' && saveMsg && (
                 <div className={`flex items-center gap-2 p-3 rounded-lg text-sm ${
-                  saveStatus === 'saved' ? 'bg-cyber/10 text-cyber border border-cyber/30' : 'bg-destructive/10 text-destructive border border-destructive/30'
+                  saveStatus === 'saved' ? 'bg-[hsl(var(--brand-green)/0.10)] text-[hsl(var(--brand-green))] border border-[hsl(var(--brand-green)/0.28)]' : 'bg-destructive/10 text-destructive border border-destructive/30'
                 }`}>
                   {saveStatus === 'saved' ? <CheckCircle size={13} /> : <AlertTriangle size={13} />}
                   {saveMsg}
@@ -452,7 +463,7 @@ export function LLMPage() {
                         <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
                           <span className="font-medium">{t('llm.currentEffect')}</span>
                           {selectedProviderConfig.proxy
-                            ? <span className="text-cyber font-mono">{selectedProviderConfig.proxy}</span>
+                            ? <span className="text-[hsl(var(--brand-green))] font-mono">{selectedProviderConfig.proxy}</span>
                             : <span className="text-amber-500">{t('llm.forceDirect')}</span>
                           }
                         </div>
@@ -476,7 +487,7 @@ export function LLMPage() {
                       {t('llm.testConnection')}
                     </button>
                     {testResult && (
-                      <div className={`flex items-center gap-1.5 text-xs ${testResult.ok ? 'text-cyber' : 'text-red-400'}`}>
+                      <div className={`flex items-center gap-1.5 text-xs ${testResult.ok ? 'text-[hsl(var(--brand-green))]' : 'text-red-400'}`}>
                         {testResult.ok ? <CheckCircle size={12} /> : <XCircle size={12} />}
                         <span>{testResult.msg}</span>
                       </div>
@@ -576,6 +587,29 @@ export function LLMPage() {
                                   onChange={e => updateModel(index, { weight: parseInt(e.target.value) || 1 })}
                                   className="w-full px-3 py-1.5 text-sm bg-muted/30 border border-border rounded-lg focus:outline-none focus:ring-1 focus:ring-rust/40"
                                 />
+                              </div>
+                            </div>
+
+                            {/* Tool Call Mode */}
+                            <div>
+                              <label className="block text-xs font-medium text-muted-foreground mb-1.5">
+                                {t('llm.toolCallMode')}
+                              </label>
+                              <div className="mb-1.5 text-[10px] text-muted-foreground">
+                                {t('llm.toolCallModeDesc')}
+                              </div>
+                              <select
+                                value={model.toolCallMode ?? 'native'}
+                                onChange={e => updateModel(index, { toolCallMode: e.target.value as ModelEntry['toolCallMode'] })}
+                                className="w-full px-3 py-1.5 text-sm bg-muted/30 border border-border rounded-lg focus:outline-none focus:ring-1 focus:ring-rust/40"
+                              >
+                                <option value="native">{t('llm.toolCallMode.native')}</option>
+                                <option value="text">{t('llm.toolCallMode.text')}</option>
+                                <option value="none">{t('llm.toolCallMode.none')}</option>
+                                <option value="auto">{t('llm.toolCallMode.auto')}</option>
+                              </select>
+                              <div className="mt-1 text-[10px] text-muted-foreground">
+                                {t('llm.toolCallMode.help')}
                               </div>
                             </div>
 

@@ -1,6 +1,6 @@
 [package]
 name = "blockcell"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 default-run = "blockcell"
 
@@ -24,6 +24,7 @@ clap_complete = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 chrono = { workspace = true }
@@ -41,9 +42,10 @@ reqwest = { workspace = true }
 zip = { workspace = true }
 urlencoding = { workspace = true }
 rhai = { workspace = true }
+crossterm = "0.28"
 
 [features]
-default = ["telegram", "whatsapp", "feishu", "slack", "discord", "dingtalk", "wecom", "lark"]
+default = ["telegram", "whatsapp", "feishu", "slack", "discord", "dingtalk", "wecom", "lark", "qq"]
 telegram = ["blockcell-channels/telegram"]
 whatsapp = ["blockcell-channels/whatsapp"]
 feishu = ["blockcell-channels/feishu"]
@@ -52,3 +54,4 @@ discord = ["blockcell-channels/discord"]
 dingtalk = ["blockcell-channels/dingtalk"]
 wecom = ["blockcell-channels/wecom"]
 lark = ["blockcell-channels/lark"]
+qq = ["blockcell-channels/qq"]

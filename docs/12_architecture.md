@@ -1,7 +1,6 @@
 # 第12篇：blockcell 架构深度解析 —— 为什么用 Rust 写 AI 框架
 
-> 系列文章：《blockcell 开源项目深度解析》第 12/14 篇
-
+> 系列文章：《blockcell 开源项目深度解析》第 12 篇
 ---
 
 ## 开篇：一个反直觉的选择
@@ -24,14 +23,14 @@ blockcell 选择了 Rust。
                               ↕
 ┌─────────────────────────────────────────────────────────────┐
 │                    消息路由层                                │
-│  InboundMessage → AgentRuntime → OutboundMessage            │
+│  InboundMessage → AgentRouter/RuntimePool → OutboundMessage │
 │  渠道：Telegram │ Slack │ Discord │ 飞书 │ WhatsApp         │
 └─────────────────────────────────────────────────────────────┘
                               ↕
 ┌─────────────────────────────────────────────────────────────┐
 │                    Agent 核心层（TCB）                       │
-│  ContextBuilder │ IntentClassifier │ TaskManager            │
-│  AgentRuntime   │ EvolutionService │ CapabilityRegistry     │
+│  RuntimePool │ ContextBuilder │ IntentToolResolver         │
+│  AgentRuntime │ TaskManager │ EvolutionService │ Registry  │
 └─────────────────────────────────────────────────────────────┘
                               ↕
 ┌──────────────────────┐    ┌────────────────────────────────┐
@@ -43,7 +42,7 @@ blockcell 选择了 Rust。
                               ↕
 ┌─────────────────────────────────────────────────────────────┐
 │                    存储层（Storage）                         │
-│  SQLite（记忆/会话/审计）  │  文件系统（技能/媒体/配置）      │
+│  SQLite（记忆）  │  文件系统（会话/审计/技能/媒体/任务/配置） │
 └─────────────────────────────────────────────────────────────┘
                               ↕
 ┌─────────────────────────────────────────────────────────────┐
@@ -51,6 +50,47 @@ blockcell 选择了 Rust。
 │  OpenAI │ Anthropic │ Gemini │ Ollama │ DeepSeek │ Kimi     │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## 当前版本补充：多 Agent 运行时池
+
+当前版本的 blockcell 已不是“单个 `AgentRuntime` 处理所有入口”的结构，而是：
+
+- `default` agent 继续复用 `~/.blockcell/` 根目录
+- 非 `default` agent 使用 `~/.blockcell/agents/<ID>/` 下的独立 `workspace / sessions / audit`
+- Gateway 会为启用的 agent 建立独立 runtime，并按 `channelAccountOwners.<channel>.<accountId>` → `channelOwners.<channel>` 的优先级路由外部消息
+- `intentRouter` 负责把“意图 → 工具集合”的映射完全放进配置，而不是写死在运行时代码里
+- 后台任务仅存在于运行中进程的内存里，完成后立即移除；实时任务状态以 WebUI 为准
+
+这套设计让“多 agent + 可配置工具路由 + WebUI 实时任务视图”成为默认能力，而不再依赖过期的文件快照。
+
+---
+
+## 当前版本补充：SystemEventOrchestrator 与后台主动汇报
+
+blockcell 现在多了一条结构化的后台事件链路，用来承接“系统在后台做了什么，何时该主动告诉用户”：
+
+- `HeartbeatService` 仍然只是**定时 Prompt 注入器**
+  - 它继续读取 `HEARTBEAT.md` 并向 Agent 投递内部消息
+  - 它**不负责**事件聚合、摘要合并、主动通知编排
+- `AgentRuntime::run_loop` 的 `tick_interval` 分支里新增了 `SystemEventOrchestrator` 调用
+  - 负责读取 `system_event store`
+  - 将 `Critical` 事件转成即时通知
+  - 将 `Normal` 事件压入 `main session summary queue`
+  - 在到达阈值或等待超时后，统一渲染为简洁摘要并投递
+- Phase 1 只接入两个 producer：
+  - `TaskManager`：后台子任务生命周期事件（`task.created / running / completed / failed`）
+  - `CronService`：定时任务派发生命周期事件（`cron.job_started / completed / failed`）
+
+当前限制也需要明确：
+
+- 只支持 `MainSession` 汇总与投递
+- 事件存储与摘要队列都还是**进程内内存**，重启后不会恢复
+- 主会话目标通过“每个 agent 最近一次交互式入站消息”记忆
+- 若当前 agent 还没有主会话目标，事件仍会被记录，但不会强行外发
+
+这意味着 blockcell 的“主动性”已经开始从某个 prompt/agent 的临时判断，下沉为平台级基础设施。
 
 ---
 
@@ -423,9 +463,9 @@ blockcell 的架构设计体现了几个核心原则：
 
 ---
 
-## 系列总结
+## 阶段总结
 
-恭喜你读完了整个系列！正文共 14 篇文章，我们覆盖了：
+读到这里，你已经完成了系列前 12 篇的核心篇章。到目前为止，我们覆盖了：
 
 | 篇 | 主题 |
 |----|------|
@@ -441,8 +481,8 @@ blockcell 的架构设计体现了几个核心原则：
 | 10 | 金融场景实战 |
 | 11 | 子智能体并发 |
 | 12 | 架构深度解析 |
-| 13 | 消息处理与自进化生命周期 |
-| 14 | 名字由来 |
+
+接下来，系列会继续进入消息处理与自进化生命周期、名字由来、幽灵智能体，以及 Hub 社区与技能分发等主题。
 
 blockcell 是一个还在快速发展的开源项目。如果你觉得它有用，欢迎：
 - ⭐ 给项目 Star

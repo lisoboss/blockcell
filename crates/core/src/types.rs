@@ -13,32 +13,44 @@ pub struct ToolCallRequest {
 }
 
 impl Serialize for ToolCallRequest {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
         let mut map = serializer.serialize_map(Some(3))?;
         map.serialize_entry("id", &self.id)?;
         map.serialize_entry("type", "function")?;
-        map.serialize_entry("function", &serde_json::json!({
-            "name": self.name,
-            "arguments": self.arguments.to_string()
-        }))?;
+        map.serialize_entry(
+            "function",
+            &serde_json::json!({
+                "name": self.name,
+                "arguments": self.arguments.to_string()
+            }),
+        )?;
         map.end()
     }
 }
 
 impl<'de> Deserialize<'de> for ToolCallRequest {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
         let value = serde_json::Value::deserialize(deserializer)?;
-        let obj = value.as_object().ok_or_else(|| serde::de::Error::custom("expected object"))?;
+        let obj = value
+            .as_object()
+            .ok_or_else(|| serde::de::Error::custom("expected object"))?;
 
-        let id = obj.get("id")
+        let id = obj
+            .get("id")
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
 
         // New format: {id, type, function: {name, arguments}}
         if let Some(func) = obj.get("function").and_then(|v| v.as_object()) {
-            let name = func.get("name")
+            let name = func
+                .get("name")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
@@ -66,11 +78,13 @@ impl<'de> Deserialize<'de> for ToolCallRequest {
         }
 
         // Old flat format: {id, name, arguments}
-        let name = obj.get("name")
+        let name = obj
+            .get("name")
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
-        let arguments = obj.get("arguments")
+        let arguments = obj
+            .get("arguments")
             .cloned()
             .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
 
@@ -190,6 +204,59 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: Some(tool_call_id.to_string()),
             name: None,
+        }
+    }
+}
+
+/// 流式响应的单个块
+#[derive(Debug, Clone)]
+pub enum StreamChunk {
+    /// 文本内容增量
+    TextDelta { delta: String },
+    /// 推理内容增量 (思考过程，如 DeepSeek reasoning)
+    ReasoningDelta { delta: String },
+    /// 工具调用开始
+    ToolCallStart {
+        index: usize,
+        id: String,
+        name: String,
+    },
+    /// 工具调用参数增量 (JSON 字符串片段)
+    ToolCallDelta {
+        index: usize,
+        id: String,
+        delta: String,
+    },
+    /// 流结束，包含完整响应
+    Done { response: LLMResponse },
+    /// 错误
+    Error { message: String },
+}
+
+/// 用于累积工具调用参数的辅助结构
+#[derive(Debug, Default, Clone)]
+pub struct ToolCallAccumulator {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+impl ToolCallAccumulator {
+    /// 构建完整的 ToolCallRequest
+    pub fn to_tool_call_request(&self) -> ToolCallRequest {
+        let arguments: serde_json::Value = if self.arguments.is_empty() {
+            serde_json::Value::Object(serde_json::Map::new())
+        } else {
+            serde_json::from_str(&self.arguments).unwrap_or_else(|e| {
+                warn!(error = %e, raw = %self.arguments, "Failed to parse accumulated tool call arguments, using empty object");
+                serde_json::Value::Object(serde_json::Map::new())
+            })
+        };
+        ToolCallRequest {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            arguments,
+            thought_signature: None,
         }
     }
 }

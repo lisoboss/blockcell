@@ -10,6 +10,7 @@
 /// - Discord  :  5 msg/s  (REST channel message endpoint)
 /// - Feishu   :  5 msg/s  (Open Platform recommendation)
 /// - WhatsApp :  2 msg/s  (bridge-dependent, conservative)
+/// - QQ       : 20 msg/s  (QQ Official Bot API limit)
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
@@ -88,6 +89,7 @@ impl ChannelRateLimiter {
 /// Default limits (conservative, well within free-tier quotas):
 /// - DingTalk  : 20 msg/s  (企业内部应用 limit)
 /// - WeCom     : 20 msg/s  (企业微信 message API limit)
+/// - QQ        : 20 msg/s  (QQ Official Bot API limit)
 use std::sync::OnceLock;
 
 static TELEGRAM_RL: OnceLock<ChannelRateLimiter> = OnceLock::new();
@@ -98,6 +100,7 @@ static WHATSAPP_RL: OnceLock<ChannelRateLimiter> = OnceLock::new();
 static DINGTALK_RL: OnceLock<ChannelRateLimiter> = OnceLock::new();
 static WECOM_RL: OnceLock<ChannelRateLimiter> = OnceLock::new();
 static LARK_RL: OnceLock<ChannelRateLimiter> = OnceLock::new();
+static QQ_RL: OnceLock<ChannelRateLimiter> = OnceLock::new();
 
 pub fn telegram_limiter() -> &'static ChannelRateLimiter {
     TELEGRAM_RL.get_or_init(|| ChannelRateLimiter::new(30, 30.0))
@@ -131,6 +134,10 @@ pub fn lark_limiter() -> &'static ChannelRateLimiter {
     LARK_RL.get_or_init(|| ChannelRateLimiter::new(5, 5.0))
 }
 
+pub fn qq_limiter() -> &'static ChannelRateLimiter {
+    QQ_RL.get_or_init(|| ChannelRateLimiter::new(20, 20.0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,7 +165,7 @@ mod tests {
     #[tokio::test]
     async fn test_channel_rate_limiter_acquire() {
         let limiter = ChannelRateLimiter::new(3, 100.0); // high rate so test is fast
-        // Should acquire 3 tokens without sleeping
+                                                         // Should acquire 3 tokens without sleeping
         for _ in 0..3 {
             limiter.acquire().await;
         }

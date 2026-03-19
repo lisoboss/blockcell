@@ -1,18 +1,29 @@
 export type WsEventType =
   | 'token'
+  | 'stream_reset'
   | 'tool_call_start'
   | 'tool_call_result'
   | 'message_done'
+  | 'session_bound'
   | 'task_update'
   | 'confirm_request'
   | 'error'
   | 'thinking'
   | 'alert_triggered'
-  | 'skills_updated';
+  | 'skills_updated'
+  | 'evolution_triggered'
+  | 'session_renamed'
+  | 'system_event_notification'
+  | 'system_event_summary';
 
 export interface WsEvent {
   type: WsEventType;
+  agent_id?: string;
   chat_id?: string;
+  client_chat_id?: string;
+  background_delivery?: boolean;
+  delivery_kind?: string;
+  cron_kind?: string;
   task_id?: string;
   delta?: string;
   content?: string;
@@ -31,9 +42,17 @@ export interface WsEvent {
   alert_value?: number;
   new_skills?: string[];
   media?: string[];
+  name?: string;
+  // system event fields
+  event_id?: string;
+  priority?: string;
+  title?: string;
+  body?: string;
+  compact_text?: string;
+  items?: any[];
 }
 
-export type DisconnectReason = 'none' | 'auth_failed' | 'network_error' | 'server_down' | 'connecting';
+export type DisconnectReason = 'none' | 'auth_failed' | 'network_error' | 'server_down' | 'connecting' | 'reconnect_exhausted';
 
 export interface ConnectionState {
   connected: boolean;
@@ -73,6 +92,7 @@ class WebSocketManager {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectDelay = 1000;
   private maxReconnectDelay = 30000;
+  private maxReconnectAttempts = 60;
   private url: string;
   private shouldReconnect = true;
   private _reconnectAttempt = 0;
@@ -86,6 +106,8 @@ class WebSocketManager {
 
   connect() {
     if (this.ws?.readyState === WebSocket.OPEN || this.ws?.readyState === WebSocket.CONNECTING) return;
+
+    if (this._reason === 'reconnect_exhausted') return;
 
     this.shouldReconnect = true;
     this._reason = 'connecting';
@@ -186,6 +208,7 @@ class WebSocketManager {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    this.shouldReconnect = true;
     this.ws?.close();
     this.ws = null;
     this.reconnectDelay = 1000;
@@ -229,6 +252,12 @@ class WebSocketManager {
 
   private scheduleReconnect() {
     if (this.reconnectTimer) return;
+    if (this._reconnectAttempt >= this.maxReconnectAttempts) {
+      this.shouldReconnect = false;
+      this._reason = 'reconnect_exhausted';
+      this.emitConnectionState();
+      return;
+    }
     this._reconnectAttempt++;
     const delay = this.reconnectDelay;
     this.emitConnectionState();
@@ -239,18 +268,18 @@ class WebSocketManager {
     }, delay);
   }
 
-  send(data: { type: string; content?: string; chat_id?: string; media?: string[]; [key: string]: unknown }) {
+  send(data: { type: string; content?: string; chat_id?: string; media?: string[]; agent_id?: string; [key: string]: unknown }) {
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(data));
     }
   }
 
-  sendChat(content: string, chatId = 'default', media: string[] = []) {
-    this.send({ type: 'chat', content, chat_id: chatId, media });
+  sendChat(content: string, chatId?: string, media: string[] = [], agentId?: string) {
+    this.send({ type: 'chat', content, chat_id: chatId, media, agent_id: agentId });
   }
 
-  sendCancel(chatId = 'default') {
-    this.send({ type: 'cancel', chat_id: chatId });
+  sendCancel(chatId = 'default', agentId?: string) {
+    this.send({ type: 'cancel', chat_id: chatId, agent_id: agentId });
   }
 
   sendConfirmResponse(requestId: string, approved: boolean) {

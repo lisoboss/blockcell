@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use crate::session_file_stem;
+
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub base: PathBuf,
@@ -18,7 +20,33 @@ impl Paths {
     }
 
     pub fn config_file(&self) -> PathBuf {
-        self.base.join("config.json")
+        self.base.join("config.json5")
+    }
+
+    pub fn env_file(&self) -> PathBuf {
+        self.base.join(".env")
+    }
+
+    pub fn mcp_config_file(&self) -> PathBuf {
+        self.base.join("mcp.json")
+    }
+
+    pub fn mcp_dir(&self) -> PathBuf {
+        self.base.join("mcp.d")
+    }
+
+    pub fn mcp_state_file(&self) -> PathBuf {
+        self.base.join("mcp-state.json")
+    }
+
+    pub fn for_agent(&self, agent_id: &str) -> Self {
+        let agent_id = agent_id.trim();
+        if agent_id.is_empty() || agent_id == "default" {
+            return self.clone();
+        }
+        Self {
+            base: self.base.join("agents").join(agent_id),
+        }
     }
 
     pub fn workspace(&self) -> PathBuf {
@@ -30,7 +58,7 @@ impl Paths {
     }
 
     pub fn session_file(&self, session_key: &str) -> PathBuf {
-        let safe_key = session_key.replace([':', '/', '\\'], "_");
+        let safe_key = session_file_stem(session_key);
         self.sessions_dir().join(format!("{}.jsonl", safe_key))
     }
 
@@ -75,10 +103,6 @@ impl Paths {
         self.workspace().join("USER.md")
     }
 
-    pub fn tools_md(&self) -> PathBuf {
-        self.workspace().join("TOOLS.md")
-    }
-
     pub fn heartbeat_md(&self) -> PathBuf {
         self.workspace().join("HEARTBEAT.md")
     }
@@ -105,6 +129,14 @@ impl Paths {
 
     pub fn evolved_tools_dir(&self) -> PathBuf {
         self.workspace().join("evolved_tools")
+    }
+
+    pub fn channel_contacts_file(&self) -> PathBuf {
+        self.base.join("channel_contacts.json")
+    }
+
+    pub fn path_access_file(&self) -> PathBuf {
+        self.base.join("path_access.json5")
     }
 
     pub fn toggles_file(&self) -> PathBuf {
@@ -147,6 +179,7 @@ impl Paths {
         std::fs::create_dir_all(self.update_dir())?;
         std::fs::create_dir_all(self.bridge_dir())?;
         std::fs::create_dir_all(self.whatsapp_auth_dir())?;
+        std::fs::create_dir_all(self.mcp_dir())?;
         std::fs::create_dir_all(self.memory_dir())?;
         std::fs::create_dir_all(self.skills_dir())?;
         std::fs::create_dir_all(self.import_staging_skills_dir())?;
@@ -160,5 +193,59 @@ impl Paths {
 impl Default for Paths {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_for_agent_reuses_root_layout_for_default() {
+        let paths = Paths::with_base(PathBuf::from("/tmp/blockcell"));
+        let default_paths = paths.for_agent("default");
+
+        assert_eq!(default_paths.base, PathBuf::from("/tmp/blockcell"));
+        assert_eq!(
+            default_paths.workspace(),
+            PathBuf::from("/tmp/blockcell/workspace")
+        );
+        assert_eq!(
+            default_paths.sessions_dir(),
+            PathBuf::from("/tmp/blockcell/sessions")
+        );
+        assert_eq!(
+            default_paths.audit_dir(),
+            PathBuf::from("/tmp/blockcell/audit")
+        );
+    }
+
+    #[test]
+    fn test_config_file_uses_json5_extension() {
+        let paths = Paths::with_base(PathBuf::from("/tmp/blockcell"));
+        assert_eq!(
+            paths.config_file(),
+            PathBuf::from("/tmp/blockcell/config.json5")
+        );
+    }
+
+    #[test]
+    fn test_for_agent_scopes_non_default_under_agents_dir() {
+        let paths = Paths::with_base(PathBuf::from("/tmp/blockcell"));
+        let ops_paths = paths.for_agent("ops");
+
+        assert_eq!(ops_paths.base, PathBuf::from("/tmp/blockcell/agents/ops"));
+        assert_eq!(
+            ops_paths.workspace(),
+            PathBuf::from("/tmp/blockcell/agents/ops/workspace")
+        );
+        assert_eq!(
+            ops_paths.sessions_dir(),
+            PathBuf::from("/tmp/blockcell/agents/ops/sessions")
+        );
+        assert_eq!(
+            ops_paths.audit_dir(),
+            PathBuf::from("/tmp/blockcell/agents/ops/audit")
+        );
     }
 }

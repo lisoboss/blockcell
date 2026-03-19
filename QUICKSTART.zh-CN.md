@@ -5,6 +5,10 @@
 - 你可以用交互式 CLI 运行（`blockcell agent`），也可以用守护进程模式运行（`blockcell gateway`）。
 - 支持 Tool Calling（工具调用）、内置工具注册表、子任务/子代理后台执行、以及 WebUI。
 
+本指南是推荐的 **单 agent 最佳实践**。
+
+如果你需要多 agent 路由和多渠道账号，请改看 `QUICKSTART.multi-agent.zh-CN.md`。
+
 ## 1）安装
 
 ### 方式 A：安装脚本（推荐）
@@ -27,13 +31,70 @@ cargo build -p blockcell --release
 
 ## 2）生成配置
 
-首次运行初始化：
+首次运行推荐直接使用配置向导：
 
 ```bash
-blockcell onboard
+blockcell setup
 ```
 
-然后编辑 `~/.blockcell/config.json`，至少填入一个模型服务商的 API Key（例如 `providers.openrouter.apiKey`）。
+它会自动创建 `~/.blockcell/`、写入 provider 配置，也可以顺手帮你启用一个外部渠道。
+
+最小示例（`~/.blockcell/config.json5`）：
+
+```json
+{
+  "providers": {
+    "deepseek": {
+      "apiKey": "YOUR_DEEPSEEK_API_KEY",
+      "apiBase": "https://api.deepseek.com"
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": "deepseek-chat"
+    }
+  }
+}
+```
+
+单 agent 最佳实践：
+
+- 先把所有能力都跑在隐式 `default` agent 上。
+- 只有在确实需要独立路由或独立行为时，再增加 `agents.list`。
+- 一开始不要同时接太多外部渠道，最多先启用一个渠道验证主流程。
+- 如果要对外暴露 daemon，先把 `gateway.apiToken` 和 `gateway.webuiPass` 配好。
+
+可选的单 Telegram 渠道示例：
+
+```json
+{
+  "providers": {
+    "deepseek": {
+      "apiKey": "YOUR_DEEPSEEK_API_KEY",
+      "apiBase": "https://api.deepseek.com"
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": "deepseek-chat"
+    }
+  },
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "token": "123456:SINGLE_BOT_TOKEN",
+      "allowFrom": ["alice"]
+    }
+  },
+  "channelOwners": {
+    "telegram": "default"
+  },
+  "gateway": {
+    "apiToken": "YOUR_STABLE_API_TOKEN",
+    "webuiPass": "YOUR_WEBUI_PASSWORD"
+  }
+}
+```
 
 ## 3）交互模式运行
 
@@ -44,6 +105,7 @@ blockcell agent
 
 小技巧：
 
+- `blockcell agent` 进入隐式的 `default` agent。
 - 输入 `/tasks` 查看后台任务。
 - 输入 `/quit` 退出。
 
@@ -63,7 +125,13 @@ blockcell gateway
 如果配置了 `gateway.apiToken`：
 
 - HTTP 调用：`Authorization: Bearer <token>`（或 `?token=<token>`）
-- WebUI 登录：密码就是同一个 token
+- WebSocket：也可用 `?token=<token>`
+
+WebUI 登录密码与 API token 现在分离：
+
+- 若设置了 `gateway.webuiPass`，WebUI 使用该固定密码
+- 若未设置，Gateway 启动时会打印一个临时密码
+- 若 `gateway.apiToken` 为空，Gateway 会自动生成并持久化一个 token
 
 ## 项目截图
 

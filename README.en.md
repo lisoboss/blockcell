@@ -1,4 +1,9 @@
-# BlockCell
+# BlueClaw
+<div align="center">
+
+<img src="screenshot/logo-blueclaw.png" alt="BlueClaw Logo" width="320" />
+
+**BlockCell进化为BlueClaw - 蓝虾**
 
 <div align="center">
 
@@ -81,12 +86,13 @@ Error detected → LLM generates fix → Audit → Test → Canary deploy → Fu
 Run BlockCell as a daemon and connect it to:
 
 - **Telegram** (long polling)
-- **WhatsApp** (Webhook)
-- **Feishu/Lark** (WebSocket / Webhook)
-- **Slack** (Socket Mode)
+- **WhatsApp** (bridge WebSocket)
+- **Feishu** (long-connection WebSocket)
+- **Lark** (webhook)
+- **Slack** (Socket Mode, with polling fallback when `appToken` is absent)
 - **Discord** (Gateway WebSocket)
 - **DingTalk** (Stream SDK)
-- **WeCom** (Polling / Webhook)
+- **WeCom** (polling / webhook)
 
 #### 📖 Channel Integration Guides
 
@@ -110,7 +116,7 @@ Each guide includes:
 - 💬 Interaction methods
 - ⚠️ Troubleshooting common issues
 
-### 🏗️ Rust Host + Rhai Skills Architecture
+### 🏗️ Rust Host + Three Skill Forms
 
 ```
 ┌─────────────────────────────────────────────┐
@@ -120,14 +126,16 @@ Each guide includes:
 └─────────────────────────────────────────────┘
                      ↕
 ┌─────────────────────────────────────────────┐
-│       Rhai Skills (Mutable Layer)           │
-│  Custom skills | Auto-generated code        │
-│  Evolvable | Sandboxed | Hot-reloadable     │
+│         Skills Layer (Mutable Layer)        │
+│  Pure Markdown | Markdown + Rhai            │
+│  Markdown + Python                          │
 └─────────────────────────────────────────────┘
 ```
 
 - **Rust host**: Immutable, secure, high-performance foundation
-- **Rhai skills**: Flexible, evolvable, AI-generated capabilities
+- **Pure Markdown skills**: define behavior with `SKILL.md` only, ideal for knowledge and workflow-oriented skills
+- **Markdown + Rhai skills**: combine `SKILL.md` with `SKILL.rhai` for structured orchestration and tool calling
+- **Markdown + Python skills**: combine `SKILL.md` with Python scripts for heavier data processing, integrations, and execution logic
 
 ---
 
@@ -159,15 +167,14 @@ cargo build --release
 ### First Run
 
 ```bash
-# Initialize configuration
-blockcell onboard
-
-# Edit config and add your API key
-# ~/.blockcell/config.json
+# Recommended: interactive setup wizard
+blockcell setup
 
 # Start interactive mode
 blockcell agent
 ```
+
+`setup` creates `~/.blockcell/`, saves provider settings, and auto-binds newly enabled external channels to the `default` agent when no owner is set yet.
 
 ### Daemon Mode (with WebUI)
 
@@ -177,6 +184,7 @@ blockcell gateway
 
 - **API Server**: `http://localhost:18790`
 - **WebUI**: `http://localhost:18791`
+- **Default routing**: CLI / WebUI / WebSocket go to the `default` agent; external channels first check `channelAccountOwners.<channel>.<accountId>` and fall back to `channelOwners.<channel>`
 
 ---
 
@@ -196,23 +204,118 @@ blockcell gateway
 
 ## ⚙️ Configuration
 
-Minimal configuration example (`~/.blockcell/config.json`):
+Minimal configuration example (`~/.blockcell/config.json5`):
 
 ```json
 {
   "providers": {
-    "openrouter": {
+    "deepseek": {
       "apiKey": "YOUR_API_KEY",
-      "apiBase": "https://openrouter.ai/api/v1"
+      "apiBase": "https://api.deepseek.com"
     }
   },
   "agents": {
     "defaults": {
-      "model": "anthropic/claude-sonnet-4-20250514"
+      "model": "deepseek-chat"
     }
   }
 }
 ```
+
+To enable multi-agent routing plus external channels, extend it using the structure currently supported by the codebase. For example, this is a valid "2 agents + 2 Telegram accounts" layout:
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "model": "deepseek-chat"
+    },
+    "list": [
+      {
+        "id": "default",
+        "enabled": true,
+        "name": "General Assistant",
+        "intentProfile": "default"
+      },
+      {
+        "id": "ops",
+        "enabled": true,
+        "name": "Operations Assistant",
+        "intentProfile": "ops",
+        "maxToolIterations": 12
+      }
+    ]
+  },
+  "intentRouter": {
+    "enabled": true,
+    "defaultProfile": "default",
+    "agentProfiles": {
+      "default": "default",
+      "ops": "ops"
+    },
+    "profiles": {
+      "default": {
+        "coreTools": ["read_file", "write_file", "list_dir", "web_fetch", "message"],
+        "intentTools": {
+          "Chat": { "inheritBase": false, "tools": [] },
+          "FileOps": ["read_file", "write_file", "list_dir"],
+          "WebSearch": ["web_search", "web_fetch"]
+        }
+      },
+      "ops": {
+        "coreTools": ["http_request", "message", "notification", "alert_rule", "list_tasks"],
+        "intentTools": {
+          "DevOps": ["http_request", "notification", "alert_rule", "list_tasks"],
+          "Communication": ["message", "notification"]
+        },
+        "denyTools": ["write_file", "exec"]
+      }
+    }
+  },
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "accounts": {
+        "main_bot": {
+          "enabled": true,
+          "token": "123456:MAIN_BOT_TOKEN",
+          "allowFrom": ["alice"]
+        },
+        "ops_bot": {
+          "enabled": true,
+          "token": "123456:OPS_BOT_TOKEN",
+          "allowFrom": ["oncall_group"]
+        }
+      },
+      "defaultAccountId": "main_bot"
+    }
+  },
+  "channelOwners": {
+    "telegram": "default"
+  },
+  "channelAccountOwners": {
+    "telegram": {
+      "main_bot": "default",
+      "ops_bot": "ops"
+    }
+  },
+  "gateway": {
+    "apiToken": "YOUR_STABLE_API_TOKEN",
+    "webuiPass": "YOUR_WEBUI_PASSWORD"
+  }
+}
+```
+
+Notes:
+
+- `agents.list` should use fields actually supported by the code, such as `id`, `enabled`, `name`, `intentProfile`, and `maxToolIterations`
+- `intentRouter` currently supports `enabled`, `defaultProfile`, `agentProfiles`, and `profiles`
+- Each `profiles.<name>` entry can define `coreTools`, `intentTools`, and `denyTools`
+- Telegram multi-account config belongs under `channels.telegram.accounts`, and each account uses `enabled`, `token`, and `allowFrom`
+- Channel-level routing uses `channelOwners`
+- Account-level overrides use `channelAccountOwners`
+- If you only need a single agent, use the minimal config above or read `QUICKSTART.md`
+- If you want the full multi-agent walkthrough, read `QUICKSTART.multi-agent.md`
 
 ### Supported LLM Providers
 
@@ -243,7 +346,8 @@ For full functionality, install these tools:
 
 ## 📚 Documentation
 
-- [Quick Start Guide](QUICKSTART.md)
+- [Quick Start Guide (Single Agent)](QUICKSTART.md)
+- [Quick Start Guide (Multi-Agent)](QUICKSTART.multi-agent.md)
 - [Architecture Deep Dive](docs/en/12_architecture.md)
 - [Tool System](docs/en/03_tools_system.md)
 - [Skill System](docs/en/04_skill_system.md)

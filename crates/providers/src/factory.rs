@@ -1,6 +1,10 @@
+use blockcell_core::config::ToolCallMode;
 use blockcell_core::Config;
 
-use crate::{AnthropicProvider, GeminiProvider, OllamaProvider, OpenAIProvider, Provider};
+use crate::{
+    AnthropicProvider, GeminiProvider, OllamaProvider, OpenAIProvider, OpenAIResponsesProvider,
+    Provider,
+};
 
 /// 默认的 OpenAI 兼容 provider 的 api_base
 fn default_api_base(provider_name: &str) -> &'static str {
@@ -26,7 +30,11 @@ pub fn infer_provider_from_model(model: &str) -> Option<&'static str> {
         Some("ollama")
     } else if model.starts_with("kimi") || model.starts_with("moonshot") {
         Some("kimi")
-    } else if model.starts_with("openai/") || model.starts_with("gpt-") || model.starts_with("o1") || model.starts_with("o3") {
+    } else if model.starts_with("openai/")
+        || model.starts_with("gpt-")
+        || model.starts_with("o1")
+        || model.starts_with("o3")
+    {
         Some("openai")
     } else if model.starts_with("deepseek") {
         Some("deepseek")
@@ -41,8 +49,16 @@ pub fn infer_provider_from_model(model: &str) -> Option<&'static str> {
 /// 这比旧的 get_api_key() 更合理：先按 model 前缀确认优先 provider
 fn fallback_provider_name(config: &Config) -> Option<&str> {
     let priority = [
-        "anthropic", "openai", "openrouter", "deepseek", "kimi",
-        "gemini", "zhipu", "groq", "vllm", "ollama",
+        "anthropic",
+        "openai",
+        "openrouter",
+        "deepseek",
+        "kimi",
+        "gemini",
+        "zhipu",
+        "groq",
+        "vllm",
+        "ollama",
     ];
     for name in priority {
         if let Some(p) = config.providers.get(name) {
@@ -72,6 +88,15 @@ pub fn create_provider(
     config: &Config,
     model: &str,
     explicit_provider: Option<&str>,
+) -> anyhow::Result<Box<dyn Provider>> {
+    create_provider_with_tool_mode(config, model, explicit_provider, None)
+}
+
+pub fn create_provider_with_tool_mode(
+    config: &Config,
+    model: &str,
+    explicit_provider: Option<&str>,
+    tool_call_mode: Option<ToolCallMode>,
 ) -> anyhow::Result<Box<dyn Provider>> {
     let max_tokens = config.agents.defaults.max_tokens;
     let temperature = config.agents.defaults.temperature;
@@ -126,32 +151,30 @@ pub fn create_provider(
     let no_proxy = &config.network.no_proxy;
 
     match effective_provider {
-        "anthropic" => {
-            Ok(Box::new(AnthropicProvider::new_with_proxy(
-                &resolved_cfg.api_key,
-                resolved_cfg.api_base.as_deref(),
-                model,
-                max_tokens,
-                temperature,
-                provider_proxy,
-                global_proxy,
-                no_proxy,
-            )) as Box<dyn Provider>)
-        }
-        "gemini" => {
-            Ok(Box::new(GeminiProvider::new_with_proxy(
-                &resolved_cfg.api_key,
-                resolved_cfg.api_base.as_deref(),
-                model,
-                max_tokens,
-                temperature,
-                provider_proxy,
-                global_proxy,
-                no_proxy,
-            )) as Box<dyn Provider>)
-        }
+        "anthropic" => Ok(Box::new(AnthropicProvider::new_with_proxy(
+            &resolved_cfg.api_key,
+            resolved_cfg.api_base.as_deref(),
+            model,
+            max_tokens,
+            temperature,
+            provider_proxy,
+            global_proxy,
+            no_proxy,
+        )) as Box<dyn Provider>),
+        "gemini" => Ok(Box::new(GeminiProvider::new_with_proxy(
+            &resolved_cfg.api_key,
+            resolved_cfg.api_base.as_deref(),
+            model,
+            max_tokens,
+            temperature,
+            provider_proxy,
+            global_proxy,
+            no_proxy,
+        )) as Box<dyn Provider>),
         "ollama" => {
-            let api_base = resolved_cfg.api_base.as_deref()
+            let api_base = resolved_cfg
+                .api_base
+                .as_deref()
                 .or(Some("http://localhost:11434"));
             Ok(Box::new(OllamaProvider::new_with_proxy(
                 api_base,
@@ -166,32 +189,30 @@ pub fn create_provider(
         _ => {
             // 对于自定义 provider 名（非内置），用 api_type 决定使用哪种协议实现
             match resolved_cfg.api_type.as_str() {
-                "anthropic" => {
-                    Ok(Box::new(AnthropicProvider::new_with_proxy(
-                        &resolved_cfg.api_key,
-                        resolved_cfg.api_base.as_deref(),
-                        model,
-                        max_tokens,
-                        temperature,
-                        provider_proxy,
-                        global_proxy,
-                        no_proxy,
-                    )) as Box<dyn Provider>)
-                }
-                "gemini" => {
-                    Ok(Box::new(GeminiProvider::new_with_proxy(
-                        &resolved_cfg.api_key,
-                        resolved_cfg.api_base.as_deref(),
-                        model,
-                        max_tokens,
-                        temperature,
-                        provider_proxy,
-                        global_proxy,
-                        no_proxy,
-                    )) as Box<dyn Provider>)
-                }
+                "anthropic" => Ok(Box::new(AnthropicProvider::new_with_proxy(
+                    &resolved_cfg.api_key,
+                    resolved_cfg.api_base.as_deref(),
+                    model,
+                    max_tokens,
+                    temperature,
+                    provider_proxy,
+                    global_proxy,
+                    no_proxy,
+                )) as Box<dyn Provider>),
+                "gemini" => Ok(Box::new(GeminiProvider::new_with_proxy(
+                    &resolved_cfg.api_key,
+                    resolved_cfg.api_base.as_deref(),
+                    model,
+                    max_tokens,
+                    temperature,
+                    provider_proxy,
+                    global_proxy,
+                    no_proxy,
+                )) as Box<dyn Provider>),
                 "ollama" => {
-                    let api_base = resolved_cfg.api_base.as_deref()
+                    let api_base = resolved_cfg
+                        .api_base
+                        .as_deref()
                         .or(Some("http://localhost:11434"));
                     Ok(Box::new(OllamaProvider::new_with_proxy(
                         api_base,
@@ -203,9 +224,28 @@ pub fn create_provider(
                         no_proxy,
                     )) as Box<dyn Provider>)
                 }
+                "openai_responses" => {
+                    let api_base = resolved_cfg
+                        .api_base
+                        .as_deref()
+                        .unwrap_or_else(|| default_api_base(effective_provider));
+                    Ok(Box::new(OpenAIResponsesProvider::new_with_proxy(
+                        &resolved_cfg.api_key,
+                        Some(api_base),
+                        model,
+                        max_tokens,
+                        temperature,
+                        provider_proxy,
+                        global_proxy,
+                        no_proxy,
+                        tool_call_mode.unwrap_or(ToolCallMode::Native),
+                    )) as Box<dyn Provider>)
+                }
                 _ => {
                     // 默认：OpenAI 兼容（openrouter, openai, deepseek, groq, zhipu, vllm, kimi 等）
-                    let api_base = resolved_cfg.api_base.as_deref()
+                    let api_base = resolved_cfg
+                        .api_base
+                        .as_deref()
                         .unwrap_or_else(|| default_api_base(effective_provider));
                     Ok(Box::new(OpenAIProvider::new_with_proxy(
                         &resolved_cfg.api_key,
@@ -216,6 +256,7 @@ pub fn create_provider(
                         provider_proxy,
                         global_proxy,
                         no_proxy,
+                        tool_call_mode.unwrap_or(ToolCallMode::Native),
                     )) as Box<dyn Provider>)
                 }
             }
@@ -227,20 +268,28 @@ pub fn create_provider(
 pub fn create_main_provider(config: &Config) -> anyhow::Result<Box<dyn Provider>> {
     let model = &config.agents.defaults.model;
     let explicit_provider = config.agents.defaults.provider.as_deref();
-    create_provider(config, model, explicit_provider)
+    create_provider_with_tool_mode(config, model, explicit_provider, None)
 }
 
 /// 为自进化创建独立的 provider
 /// 优先级：evolutionProvider > evolution_model 前缀 > provider > model 前缀 > fallback
 pub fn create_evolution_provider(config: &Config) -> anyhow::Result<Box<dyn Provider>> {
-    let model = config.agents.defaults.evolution_model.as_deref()
+    let model = config
+        .agents
+        .defaults
+        .evolution_model
+        .as_deref()
         .unwrap_or(&config.agents.defaults.model);
 
     // evolution_provider 显式 > 主 provider 显式（作为 evolution fallback）
-    let explicit_provider = config.agents.defaults.evolution_provider.as_deref()
+    let explicit_provider = config
+        .agents
+        .defaults
+        .evolution_provider
+        .as_deref()
         .or(config.agents.defaults.provider.as_deref());
 
-    create_provider(config, model, explicit_provider)
+    create_provider_with_tool_mode(config, model, explicit_provider, None)
 }
 
 #[cfg(test)]
@@ -249,14 +298,29 @@ mod tests {
 
     #[test]
     fn test_infer_provider_from_model() {
-        assert_eq!(infer_provider_from_model("anthropic/claude-sonnet-4"), Some("anthropic"));
-        assert_eq!(infer_provider_from_model("claude-3-5-sonnet"), Some("anthropic"));
-        assert_eq!(infer_provider_from_model("gemini-2.0-flash"), Some("gemini"));
-        assert_eq!(infer_provider_from_model("gemini/gemini-pro"), Some("gemini"));
+        assert_eq!(
+            infer_provider_from_model("anthropic/claude-sonnet-4"),
+            Some("anthropic")
+        );
+        assert_eq!(
+            infer_provider_from_model("claude-3-5-sonnet"),
+            Some("anthropic")
+        );
+        assert_eq!(
+            infer_provider_from_model("gemini-2.0-flash"),
+            Some("gemini")
+        );
+        assert_eq!(
+            infer_provider_from_model("gemini/gemini-pro"),
+            Some("gemini")
+        );
         assert_eq!(infer_provider_from_model("ollama/llama3"), Some("ollama"));
         assert_eq!(infer_provider_from_model("kimi-moonshot-v1"), Some("kimi"));
         assert_eq!(infer_provider_from_model("gpt-4o"), Some("openai"));
-        assert_eq!(infer_provider_from_model("deepseek-coder"), Some("deepseek"));
+        assert_eq!(
+            infer_provider_from_model("deepseek-coder"),
+            Some("deepseek")
+        );
         assert_eq!(infer_provider_from_model("some-unknown-model"), None);
     }
 

@@ -1,10 +1,22 @@
 pub mod bus;
+pub mod response_cache;
 pub mod capability_adapter;
 pub mod context;
+pub(crate) mod error;
 pub mod health;
+pub mod history_projector;
 pub mod intent;
 pub mod memory_adapter;
+pub(crate) mod metrics;
+pub mod prompt_skill_executor;
 pub mod runtime;
+pub mod skill_executor;
+pub mod skill_kernel;
+pub mod skill_decision;
+pub mod skill_summary;
+pub mod summary_queue;
+pub mod system_event_orchestrator;
+pub mod system_event_store;
 pub mod task_manager;
 
 pub use bus::MessageBus;
@@ -15,3 +27,4 @@ pub use intent::{IntentCategory, IntentClassifier};
 pub use memory_adapter::MemoryStoreAdapter;
 pub use runtime::{AgentRuntime, ConfirmRequest};
 pub use task_manager::TaskManager;
+pub use response_cache::ResponseCache;

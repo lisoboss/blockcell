@@ -60,7 +60,7 @@ The bot needs appropriate permissions to read and send messages.
 
 ## 6. Configure Blockcell
 
-In `~/.blockcell/config.json`, modify the `feishu` section:
+In `~/.blockcell/config.json5`, modify the `feishu` section:
 
 ```json
 {
@@ -83,6 +83,16 @@ In `~/.blockcell/config.json`, modify the `feishu` section:
 | `appId` | App ID from Credentials & Basic Info |
 | `appSecret` | App Secret from Credentials & Basic Info |
 | `allowFrom` | List of allowed user `open_id`s. Leave empty `[]` to allow all enterprise users |
+
+> If you enable this external channel through `blockcell gateway`, you also need an owner binding in `config.json5`, for example:
+>
+> ```json
+> { "channelOwners": { "feishu": "default" } }
+>
+> If you configure multiple accounts / bots for the same channel, you can additionally set `channelAccountOwners.feishu.<accountId> = "ops"` to route one specific account to a different agent.
+> ```
+>
+> Otherwise Gateway refuses to start because the enabled external channel has no owner.
 
 ## 7. Start Blockcell and Switch to Long Connection
 

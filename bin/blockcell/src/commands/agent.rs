@@ -2,27 +2,38 @@ use blockcell_agent::{
     AgentRuntime, CapabilityRegistryAdapter, ConfirmRequest, CoreEvolutionAdapter,
     MemoryStoreAdapter, MessageBus, ProviderLLMBridge, TaskManager,
 };
-use blockcell_channels::ChannelManager;
-#[cfg(feature = "telegram")]
-use blockcell_channels::telegram::TelegramChannel;
-#[cfg(feature = "whatsapp")]
-use blockcell_channels::whatsapp::WhatsAppChannel;
+#[cfg(feature = "dingtalk")]
+use blockcell_channels::dingtalk::DingTalkChannel;
+#[cfg(feature = "discord")]
+use blockcell_channels::discord::DiscordChannel;
 #[cfg(feature = "feishu")]
 use blockcell_channels::feishu::FeishuChannel;
 #[cfg(feature = "slack")]
 use blockcell_channels::slack::SlackChannel;
-#[cfg(feature = "discord")]
-use blockcell_channels::discord::DiscordChannel;
-#[cfg(feature = "dingtalk")]
-use blockcell_channels::dingtalk::DingTalkChannel;
+#[cfg(feature = "telegram")]
+use blockcell_channels::telegram::TelegramChannel;
 #[cfg(feature = "wecom")]
 use blockcell_channels::wecom::WeComChannel;
+#[cfg(feature = "whatsapp")]
+use blockcell_channels::whatsapp::WhatsAppChannel;
+use blockcell_channels::ChannelManager;
 use blockcell_core::{Config, InboundMessage, Paths};
 use blockcell_providers::{Provider, ProviderPool};
 use blockcell_scheduler::CronService;
 use blockcell_skills::{is_builtin_tool, new_registry_handle, CoreEvolution};
 use blockcell_storage::MemoryStore;
-use blockcell_tools::{CapabilityRegistryHandle, CoreEvolutionHandle, MemoryStoreHandle, ToolRegistry};
+use blockcell_tools::mcp::manager::McpManager;
+use blockcell_tools::{
+    build_tool_registry_for_agent_config, CapabilityRegistryHandle, CoreEvolutionHandle,
+    MemoryStoreHandle,
+};
+use crossterm::{
+    cursor,
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    execute,
+    style::Print,
+    terminal::{self, Clear, ClearType},
+};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tracing::{info, warn};
@@ -30,85 +41,118 @@ use tracing::{info, warn};
 /// Built-in tools grouped by category for /tools display.
 /// This must include ALL tools registered in ToolRegistry::with_defaults().
 const BUILTIN_TOOLS: &[(&str, &[(&str, &str)])] = &[
-    ("📁 Filesystem", &[
-        ("read_file",   "Read files (text/Office/PDF)"),
-        ("write_file",  "Create and write files"),
-        ("edit_file",   "Precise file content editing"),
-        ("list_dir",    "Browse directory structure"),
-        ("file_ops",    "Delete/move/copy/compress/decompress/PDF"),
-    ]),
-    ("⚡ Commands & System", &[
-        ("exec",           "Execute shell commands"),
-        ("system_info",    "Hardware/software/network detection"),
-    ]),
-    ("🌐 Web & Browser", &[
-        ("web_search",     "Search engine queries"),
-        ("web_fetch",      "Fetch web page content"),
-        ("browse",         "CDP browser automation (35+ actions, tabs/screenshots/PDF/network)"),
-        ("http_request",   "Generic HTTP/REST API calls"),
-    ]),
-    ("🖥️ GUI Automation", &[
-        ("app_control",    "macOS app control (System Events)"),
-    ]),
-    ("🎨 Media", &[
-        ("camera_capture",    "Camera capture"),
-        ("audio_transcribe",  "Speech-to-text (Whisper/API)"),
-        ("tts",               "Text-to-speech (say/piper/edge-tts/OpenAI)"),
-        ("ocr",               "Image text recognition (Tesseract/Vision/API)"),
-        ("image_understand",  "Multimodal image understanding (GPT-4o/Claude/Gemini)"),
-        ("video_process",     "Video processing (ffmpeg cut/merge/subtitle/watermark/compress)"),
-        ("chart_generate",    "Chart generation (matplotlib/plotly)"),
-    ]),
-    ("📊 Data Processing", &[
-        ("data_process",      "CSV read/write/stats/query/transform"),
-        ("office_write",      "Generate PPTX/DOCX/XLSX documents"),
-        ("knowledge_graph",   "Knowledge graph (entities/relations/paths/export DOT/Mermaid)"),
-    ]),
-    ("📬 Communication", &[
-        ("email",          "Email send/receive (SMTP/IMAP, attachments)"),
-        ("message",        "Channel messaging (Telegram/Slack/Discord)"),
-        ("notification",   "Multi-channel notifications (SMS/Push/Webhook/Desktop)"),
-        ("social_media",   "Social media (Twitter/Medium/WordPress)"),
-        ("contacts",       "Contacts management (macOS/Google/CardDAV)"),
-    ]),
-    ("📅 Business Integration", &[
-        ("calendar_api",   "Calendar/Notion/CRM/Ticketing"),
-        ("iot_control",    "IoT smart home (Home Assistant/MQTT)"),
-        ("cloud_api",      "Cloud platform management (AWS/GCP/Azure)"),
-        ("git_api",        "GitHub integration (PR/Issue/CI/Release)"),
-        ("health_api",     "Health data (Apple Health/Fitbit/Google Fit)"),
-        ("map_api",        "Maps & navigation (Google Maps/Amap)"),
-    ]),
-    ("💰 Finance", &[
-        ("finance_api",       "Stock/crypto/forex quotes (Alpha Vantage/CoinGecko)"),
-        ("stream_subscribe",  "Real-time data streams (WebSocket/SSE, CEX feeds)"),
-        ("alert_rule",        "Conditional monitoring alerts (price/indicator/change rate)"),
-    ]),
-    ("⛓️ Blockchain", &[
-        ("blockchain_rpc",     "EVM JSON-RPC + ABI encode/decode"),
-        ("blockchain_tx",      "On-chain transactions (build/sign/send, multi-wallet)"),
-        ("exchange_api",       "CEX trading (Binance/OKX/Bybit)"),
-        ("contract_security",  "Contract security audit (GoPlus API)"),
-        ("bridge_api",         "Cross-chain bridges (LI.FI/Stargate/LayerZero)"),
-        ("nft_market",         "NFT marketplace (OpenSea)"),
-        ("multisig",           "Multisig wallets (Gnosis Safe)"),
-    ]),
-    ("🔒 Security & Network", &[
-        ("encrypt",           "Encrypt/decrypt/password/hash/encode"),
-        ("network_monitor",   "Network diagnostics (ping/traceroute/port scan/SSL/DNS/WHOIS)"),
-    ]),
-    ("🧠 Memory & Cognition", &[
-        ("memory_query",  "Full-text memory search (SQLite FTS5)"),
-        ("memory_upsert", "Structured memory storage"),
-        ("memory_forget", "Memory delete and restore"),
-    ]),
-    ("🤖 Autonomy & Evolution", &[
-        ("spawn",             "Spawn sub-agents for parallel execution"),
-        ("list_tasks",        "View task status"),
-        ("cron",              "Scheduled task management"),
-        ("list_skills",       "Skill learning status query"),
-        ("capability_evolve", "Self-learn new tools via evolution"),
-    ]),
+    (
+        "📁 Filesystem",
+        &[
+            ("read_file", "Read files (text/Office/PDF)"),
+            ("write_file", "Create and write files"),
+            ("edit_file", "Precise file content editing"),
+            ("list_dir", "Browse directory structure"),
+            ("file_ops", "Delete/move/copy/compress/decompress/PDF"),
+        ],
+    ),
+    (
+        "⚡ Commands & System",
+        &[
+            ("exec", "Execute shell commands"),
+            ("system_info", "Hardware/software/network detection"),
+        ],
+    ),
+    (
+        "🌐 Web & Browser",
+        &[
+            ("web_search", "Search engine queries"),
+            ("web_fetch", "Fetch web page content"),
+            (
+                "browse",
+                "CDP browser automation (35+ actions, tabs/screenshots/PDF/network)",
+            ),
+            ("http_request", "Generic HTTP/REST API calls"),
+        ],
+    ),
+    (
+        "🖥️ GUI Automation",
+        &[("app_control", "macOS app control (System Events)")],
+    ),
+    (
+        "🎨 Media",
+        &[
+            ("camera_capture", "Camera capture"),
+            ("audio_transcribe", "Speech-to-text (Whisper/API)"),
+            ("tts", "Text-to-speech (say/piper/edge-tts/OpenAI)"),
+            ("ocr", "Image text recognition (Tesseract/Vision/API)"),
+            (
+                "image_understand",
+                "Multimodal image understanding (GPT-4o/Claude/Gemini)",
+            ),
+            (
+                "video_process",
+                "Video processing (ffmpeg cut/merge/subtitle/watermark/compress)",
+            ),
+            ("chart_generate", "Chart generation (matplotlib/plotly)"),
+        ],
+    ),
+    (
+        "📊 Data Processing",
+        &[
+            ("data_process", "CSV read/write/stats/query/transform"),
+            ("office_write", "Generate PPTX/DOCX/XLSX documents"),
+            (
+                "knowledge_graph",
+                "Knowledge graph (entities/relations/paths/export DOT/Mermaid)",
+            ),
+        ],
+    ),
+    (
+        "📬 Communication",
+        &[
+            ("email", "Email send/receive (SMTP/IMAP, attachments)"),
+            ("message", "Channel messaging (Telegram/Slack/Discord)"),
+        ],
+    ),
+    ("📅 Business Integration", &[]),
+    (
+        "💰 Finance",
+        &[
+            (
+                "stream_subscribe",
+                "Real-time data streams (WebSocket/SSE, CEX feeds)",
+            ),
+            (
+                "alert_rule",
+                "Conditional monitoring alerts (price/indicator/change rate)",
+            ),
+        ],
+    ),
+    ("⛓️ Blockchain", &[]),
+    (
+        "🔒 Security & Network",
+        &[
+            ("encrypt", "Encrypt/decrypt/password/hash/encode"),
+            (
+                "network_monitor",
+                "Network diagnostics (ping/traceroute/port scan/SSL/DNS/WHOIS)",
+            ),
+        ],
+    ),
+    (
+        "🧠 Memory & Cognition",
+        &[
+            ("memory_query", "Full-text memory search (SQLite FTS5)"),
+            ("memory_upsert", "Structured memory storage"),
+            ("memory_forget", "Memory delete and restore"),
+        ],
+    ),
+    (
+        "🤖 Autonomy & Evolution",
+        &[
+            ("spawn", "Spawn sub-agents for parallel execution"),
+            ("list_tasks", "View task status"),
+            ("cron", "Scheduled task management"),
+            ("list_skills", "Skill learning status query"),
+            ("capability_evolve", "Self-learn new tools via evolution"),
+        ],
+    ),
 ];
 
 /// Extract image file paths from user input.
@@ -116,6 +160,7 @@ const BUILTIN_TOOLS: &[(&str, &[(&str, &str)])] = &[
 /// - Inline absolute paths: `/path/to/image.png what is this image`
 /// - @-prefixed paths: `@/path/to/image.png recognize this`
 /// - ~ home dir paths: `~/Desktop/photo.jpg take a look`
+///
 /// Returns (cleaned_text, media_paths).
 fn extract_media_from_input(input: &str) -> (String, Vec<String>) {
     let image_extensions = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "heic"];
@@ -125,9 +170,9 @@ fn extract_media_from_input(input: &str) -> (String, Vec<String>) {
     for token in input.split_whitespace() {
         let path_str = token.strip_prefix('@').unwrap_or(token);
         // Expand ~ to home dir
-        let expanded: String = if path_str.starts_with("~/") {
+        let expanded: String = if let Some(rest) = path_str.strip_prefix("~/") {
             if let Some(home) = dirs::home_dir() {
-                home.join(&path_str[2..]).to_string_lossy().into_owned()
+                home.join(rest).to_string_lossy().into_owned()
             } else {
                 path_str.to_string()
             }
@@ -136,7 +181,8 @@ fn extract_media_from_input(input: &str) -> (String, Vec<String>) {
         };
 
         let path = std::path::Path::new(&expanded);
-        let is_image = path.extension()
+        let is_image = path
+            .extension()
             .and_then(|e| e.to_str())
             .map(|e| image_extensions.contains(&e.to_lowercase().as_str()))
             .unwrap_or(false);
@@ -175,9 +221,68 @@ fn build_pool_with_overrides(
     ProviderPool::from_config(config)
 }
 
-pub async fn run(message: Option<String>, session: String, model: Option<String>, provider: Option<String>) -> anyhow::Result<()> {
-    let paths = Paths::new();
-    let mut config = Config::load_or_default(&paths)?;
+#[derive(Debug)]
+struct AgentCliContext {
+    agent_id: String,
+    session: String,
+    config: Config,
+    paths: Paths,
+}
+
+fn resolve_agent_context(
+    config: &Config,
+    paths: &Paths,
+    requested_agent: Option<&str>,
+    requested_session: Option<&str>,
+) -> anyhow::Result<AgentCliContext> {
+    let agent_id = requested_agent
+        .map(str::trim)
+        .filter(|agent_id| !agent_id.is_empty())
+        .unwrap_or("default");
+
+    if !config.agent_exists(agent_id) {
+        anyhow::bail!("Unknown agent '{}'", agent_id);
+    }
+
+    let agent_config = config
+        .config_for_agent(agent_id)
+        .ok_or_else(|| anyhow::anyhow!("Unknown agent '{}'", agent_id))?;
+    let agent_paths = paths.for_agent(agent_id);
+    let session = requested_session
+        .map(str::trim)
+        .filter(|session| !session.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("cli:{}", agent_id));
+
+    Ok(AgentCliContext {
+        agent_id: agent_id.to_string(),
+        session,
+        config: agent_config,
+        paths: agent_paths,
+    })
+}
+
+pub async fn run(
+    message: Option<String>,
+    agent: Option<String>,
+    session: Option<String>,
+    model: Option<String>,
+    provider: Option<String>,
+) -> anyhow::Result<()> {
+    let root_paths = Paths::new();
+    let root_config = Config::load_or_default(&root_paths)?;
+    let resolved = resolve_agent_context(
+        &root_config,
+        &root_paths,
+        agent.as_deref(),
+        session.as_deref(),
+    )?;
+    let agent_id = resolved.agent_id.clone();
+    let session = resolved.session;
+    let paths = resolved.paths;
+    paths.ensure_dirs()?;
+    let mut config = resolved.config;
+    let mcp_manager = Arc::new(McpManager::load(&root_paths).await?);
     let provider_pool = build_pool_with_overrides(&mut config, model, provider)?;
 
     // Ensure builtin skills are extracted to workspace/skills/ (silent, skips existing)
@@ -195,7 +300,10 @@ pub async fn run(message: Option<String>, session: String, model: Option<String>
             Some(Arc::new(adapter))
         }
         Err(e) => {
-            eprintln!("Warning: failed to open memory store: {}. Memory tools will be unavailable.", e);
+            eprintln!(
+                "Warning: failed to open memory store: {}. Memory tools will be unavailable.",
+                e
+            );
             None
         }
     };
@@ -238,10 +346,18 @@ pub async fn run(message: Option<String>, session: String, model: Option<String>
 
     if let Some(msg) = message {
         // Single message mode — no need for CronService
-        let tool_registry = ToolRegistry::with_defaults();
-        let mut runtime = AgentRuntime::new(config.clone(), paths.clone(), Arc::clone(&provider_pool), tool_registry)?;
-        runtime.mount_mcp_servers().await;
-        
+        let tool_registry =
+            build_tool_registry_for_agent_config(&config, Some(&mcp_manager)).await?;
+        let mut runtime = AgentRuntime::new(
+            config.clone(),
+            paths.clone(),
+            Arc::clone(&provider_pool),
+            tool_registry,
+        )?;
+        runtime.validate_intent_router()?;
+        runtime.set_agent_id(Some(agent_id.clone()));
+        runtime.set_task_manager(TaskManager::new());
+
         // 如果配置了独立的 evolution_model 或 evolution_provider，创建独立的 evolution provider
         if config.agents.defaults.evolution_model.is_some()
             || config.agents.defaults.evolution_provider.is_some()
@@ -252,19 +368,61 @@ pub async fn run(message: Option<String>, session: String, model: Option<String>
                     info!("Evolution provider configured with independent model");
                 }
                 Err(e) => {
-                    warn!("Failed to create evolution provider: {}, using main provider", e);
+                    warn!(
+                        "Failed to create evolution provider: {}, using main provider",
+                        e
+                    );
                 }
             }
         }
-        
+
         if let Some(ref store) = memory_store_handle {
             runtime.set_memory_store(store.clone());
         }
         runtime.set_capability_registry(cap_registry_handle.clone());
         runtime.set_core_evolution(core_evo_handle.clone());
 
+        // Create event broadcast channel for streaming output
+        let (event_tx, mut event_rx) = broadcast::channel::<String>(256);
+        runtime.set_event_tx(event_tx.clone());
+
+        // Spawn event handler for streaming token output
+        let event_handler = tokio::spawn(async move {
+            use std::io::Write;
+            let mut stdout = std::io::stdout();
+            while let Ok(event_str) = event_rx.recv().await {
+                if let Ok(event) = serde_json::from_str::<serde_json::Value>(&event_str) {
+                    let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    match event_type {
+                        "token" => {
+                            if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
+                                print!("{}", delta);
+                                let _ = stdout.flush();
+                            }
+                        }
+                        "thinking" => {
+                            if let Some(content) = event.get("content").and_then(|v| v.as_str()) {
+                                print!("{}", content);
+                                let _ = stdout.flush();
+                            }
+                        }
+                        "tool_call_start" => {
+                            if let Some(tool) = event.get("tool").and_then(|v| v.as_str()) {
+                                eprintln!("\n🔧 Calling tool: {}...", tool);
+                            }
+                        }
+                        "message_done" => {
+                            println!();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+
         let inbound = InboundMessage {
             channel: "cli".to_string(),
+            account_id: None,
             sender_id: "user".to_string(),
             chat_id: session.split(':').nth(1).unwrap_or("default").to_string(),
             content: msg,
@@ -274,10 +432,16 @@ pub async fn run(message: Option<String>, session: String, model: Option<String>
         };
 
         let response = runtime.process_message(inbound).await?;
-        println!("{}", response);
+        // Event handler already printed streaming output, just print final newline if needed
+        if !response.is_empty() {
+            println!();
+        }
+        // Clean up event handler
+        event_handler.abort();
     } else {
         // Interactive mode with CronService
         println!("blockcell interactive mode (Ctrl+C to exit)");
+        println!("Agent: {}", agent_id);
         println!("Session: {}", session);
         println!("Type /help to see all available commands.");
         println!();
@@ -296,77 +460,86 @@ pub async fn run(message: Option<String>, session: String, model: Option<String>
         let task_manager = TaskManager::new();
 
         // Create channel manager for outbound message dispatch (before config is moved)
-        let channel_manager = ChannelManager::new(config.clone(), paths.clone(), inbound_tx.clone());
+        let channel_manager =
+            ChannelManager::new(config.clone(), paths.clone(), inbound_tx.clone());
 
         // Start messaging channels (before config is moved into runtime)
+        let mut channel_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
         #[cfg(feature = "telegram")]
-        let telegram_handle = {
-            let telegram = Arc::new(TelegramChannel::new(config.clone(), inbound_tx.clone()));
+        for listener in blockcell_channels::account::telegram_listener_configs(&config) {
+            let telegram = Arc::new(TelegramChannel::new(listener.config, inbound_tx.clone()));
             let shutdown_rx = shutdown_tx.subscribe();
-            tokio::spawn(async move {
+            channel_handles.push(tokio::spawn(async move {
                 telegram.run_loop(shutdown_rx).await;
-            })
-        };
+            }));
+        }
 
         #[cfg(feature = "whatsapp")]
-        let whatsapp_handle = {
-            let whatsapp = Arc::new(WhatsAppChannel::new(config.clone(), inbound_tx.clone()));
+        for listener in blockcell_channels::account::whatsapp_listener_configs(&config) {
+            let whatsapp = Arc::new(WhatsAppChannel::new(listener.config, inbound_tx.clone()));
             let shutdown_rx = shutdown_tx.subscribe();
-            tokio::spawn(async move {
+            channel_handles.push(tokio::spawn(async move {
                 whatsapp.run_loop(shutdown_rx).await;
-            })
-        };
+            }));
+        }
 
         #[cfg(feature = "feishu")]
-        let feishu_handle = {
-            let feishu = Arc::new(FeishuChannel::new(config.clone(), inbound_tx.clone()));
+        for listener in blockcell_channels::account::feishu_scoped_configs(&config) {
+            let feishu = Arc::new(FeishuChannel::new(listener.config, inbound_tx.clone()));
             let shutdown_rx = shutdown_tx.subscribe();
-            tokio::spawn(async move {
+            channel_handles.push(tokio::spawn(async move {
                 feishu.run_loop(shutdown_rx).await;
-            })
-        };
+            }));
+        }
 
         #[cfg(feature = "slack")]
-        let slack_handle = {
-            let slack = Arc::new(SlackChannel::new(config.clone(), inbound_tx.clone()));
+        for listener in blockcell_channels::account::slack_listener_configs(&config) {
+            let slack = Arc::new(SlackChannel::new(listener.config, inbound_tx.clone()));
             let shutdown_rx = shutdown_tx.subscribe();
-            tokio::spawn(async move {
+            channel_handles.push(tokio::spawn(async move {
                 slack.run_loop(shutdown_rx).await;
-            })
-        };
+            }));
+        }
 
         #[cfg(feature = "discord")]
-        let discord_handle = {
-            let discord = Arc::new(DiscordChannel::new(config.clone(), inbound_tx.clone()));
+        for listener in blockcell_channels::account::discord_listener_configs(&config) {
+            let discord = Arc::new(DiscordChannel::new(listener.config, inbound_tx.clone()));
             let shutdown_rx = shutdown_tx.subscribe();
-            tokio::spawn(async move {
+            channel_handles.push(tokio::spawn(async move {
                 discord.run_loop(shutdown_rx).await;
-            })
-        };
+            }));
+        }
 
         #[cfg(feature = "dingtalk")]
-        let dingtalk_handle = {
-            let dingtalk = Arc::new(DingTalkChannel::new(config.clone(), inbound_tx.clone()));
+        for listener in blockcell_channels::account::dingtalk_listener_configs(&config) {
+            let dingtalk = Arc::new(DingTalkChannel::new(listener.config, inbound_tx.clone()));
             let shutdown_rx = shutdown_tx.subscribe();
-            tokio::spawn(async move {
+            channel_handles.push(tokio::spawn(async move {
                 dingtalk.run_loop(shutdown_rx).await;
-            })
-        };
+            }));
+        }
 
         #[cfg(feature = "wecom")]
-        let wecom_handle = {
-            let wecom = Arc::new(WeComChannel::new(config.clone(), inbound_tx.clone()));
+        for listener in blockcell_channels::account::wecom_listener_configs(&config) {
+            let wecom = Arc::new(WeComChannel::new(listener.config, inbound_tx.clone()));
             let shutdown_rx = shutdown_tx.subscribe();
-            tokio::spawn(async move {
+            channel_handles.push(tokio::spawn(async move {
                 wecom.run_loop(shutdown_rx).await;
-            })
-        };
+            }));
+        }
 
         // Create agent runtime with outbound channel (consumes config)
-        let tool_registry = ToolRegistry::with_defaults();
-        let mut runtime = AgentRuntime::new(config.clone(), paths.clone(), Arc::clone(&provider_pool), tool_registry)?;
-        runtime.mount_mcp_servers().await;
-        
+        let tool_registry =
+            build_tool_registry_for_agent_config(&config, Some(&mcp_manager)).await?;
+        let mut runtime = AgentRuntime::new(
+            config.clone(),
+            paths.clone(),
+            Arc::clone(&provider_pool),
+            tool_registry,
+        )?;
+        runtime.validate_intent_router()?;
+
         // 如果配置了独立的 evolution_model 或 evolution_provider，创建独立的 evolution provider
         if config.agents.defaults.evolution_model.is_some()
             || config.agents.defaults.evolution_provider.is_some()
@@ -377,22 +550,32 @@ pub async fn run(message: Option<String>, session: String, model: Option<String>
                     info!("Evolution provider configured with independent model");
                 }
                 Err(e) => {
-                    warn!("Failed to create evolution provider: {}, using main provider", e);
+                    warn!(
+                        "Failed to create evolution provider: {}, using main provider",
+                        e
+                    );
                 }
             }
         }
-        
+
+        // Create event broadcast channel for streaming output
+        let (event_tx, mut event_rx) = broadcast::channel::<String>(256);
+
         runtime.set_outbound(outbound_tx);
         runtime.set_confirm(confirm_tx);
         runtime.set_task_manager(task_manager.clone());
+        runtime.set_agent_id(Some(agent_id.clone()));
+        runtime.set_event_tx(event_tx.clone());
         if let Some(ref store) = memory_store_handle {
             runtime.set_memory_store(store.clone());
         }
         runtime.set_capability_registry(cap_registry_handle.clone());
         runtime.set_core_evolution(core_evo_handle.clone());
+        let event_emitter = runtime.event_emitter_handle();
 
         // Create and start CronService
         let cron_service = Arc::new(CronService::new(paths.clone(), inbound_tx.clone()));
+        cron_service.set_event_emitter(event_emitter);
         cron_service.load().await?;
 
         let cron_handle = {
@@ -403,17 +586,63 @@ pub async fn run(message: Option<String>, session: String, model: Option<String>
             })
         };
 
+        // Spawn event handler for streaming token output
+        let event_handler_handle = tokio::spawn(async move {
+            use std::io::Write;
+            let mut stdout = std::io::stdout();
+            while let Ok(event_str) = event_rx.recv().await {
+                if let Ok(event) = serde_json::from_str::<serde_json::Value>(&event_str) {
+                    let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    match event_type {
+                        "token" => {
+                            // Streaming text token - print immediately
+                            if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
+                                print!("{}", delta);
+                                let _ = stdout.flush();
+                            }
+                        }
+                        "thinking" => {
+                            // Thinking/reasoning content
+                            if let Some(content) = event.get("content").and_then(|v| v.as_str()) {
+                                print!("{}", content);
+                                let _ = stdout.flush();
+                            }
+                        }
+                        "tool_call_start" => {
+                            // Tool call started
+                            if let (Some(tool), Some(_call_id)) = (
+                                event.get("tool").and_then(|v| v.as_str()),
+                                event.get("call_id").and_then(|v| v.as_str()),
+                            ) {
+                                println!("\n🔧 Calling tool: {}...", tool);
+                            }
+                        }
+                        "message_done" => {
+                            // Message complete - print newline
+                            println!();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+
         // Spawn runtime loop
         let runtime_handle = tokio::spawn(async move {
             runtime.run_loop(inbound_rx, None).await;
         });
 
         // Split outbound: channel messages go to ChannelManager, CLI messages go to printer
+        // Note: "cli" messages are already printed via streaming events (token + message_done),
+        // so we skip them here to avoid duplicate output.
         let (printer_tx, mut printer_rx) = mpsc::channel(100);
         let outbound_dispatch_handle = tokio::spawn(async move {
             while let Some(msg) = outbound_rx.recv().await {
                 match msg.channel.as_str() {
-                    "cli" | "cron" => {
+                    "cli" => {
+                        // Skip: already printed via streaming events
+                    }
+                    "cron" => {
                         let _ = printer_tx.send(msg).await;
                     }
                     _ => {
@@ -475,8 +704,6 @@ pub async fn run(message: Option<String>, session: String, model: Option<String>
         let session_clone = session.clone();
         let stdin_task_manager = task_manager.clone();
         let stdin_handle = tokio::task::spawn_blocking(move || {
-            use std::io::{BufRead, Write};
-            let stdin = std::io::stdin();
             let mut stdout = std::io::stdout();
             // Create a small tokio runtime for blocking task manager queries
             let local_rt = tokio::runtime::Builder::new_current_thread()
@@ -485,18 +712,20 @@ pub async fn run(message: Option<String>, session: String, model: Option<String>
                 .expect("Failed to create local runtime for stdin");
 
             loop {
-                print!("> ");
-                let _ = stdout.flush();
+                // Note: prompt is printed inside read_line_with_command_picker
+                // to avoid double printing after raw mode is enabled
 
-                let mut raw_input = String::new();
-                if stdin.lock().read_line(&mut raw_input).unwrap_or(0) == 0 {
-                    break;
-                }
+                // Read input character by character to detect "/" immediately
+                let input = read_line_with_command_picker(
+                    &stdin_paths,
+                    &mut stdout,
+                    &session_clone,
+                    &stdin_tx,
+                );
 
-                // After reading a line, check if a confirmation request arrived
-                // (it may have arrived while we were blocked on read_line)
+                // Check if a confirmation request arrived
                 if let Ok(response_tx) = confirm_answer_rx.try_recv() {
-                    let answer = raw_input.trim().to_lowercase();
+                    let answer = input.trim().to_lowercase();
                     let allowed = answer == "y" || answer == "yes";
                     if allowed {
                         eprintln!("✅ Access granted");
@@ -508,7 +737,7 @@ pub async fn run(message: Option<String>, session: String, model: Option<String>
                     continue;
                 }
 
-                let input = raw_input.trim().to_string();
+                let input = input.trim().to_string();
                 if input.is_empty() {
                     continue;
                 }
@@ -530,6 +759,7 @@ pub async fn run(message: Option<String>, session: String, model: Option<String>
                     println!("  /clear-skills       Clear all skill evolution records");
                     println!("  /forget-skill <n>   Delete records for a specific skill");
                     println!("  /quit  /exit        Exit interactive mode");
+                    println!("  /<name>             Quick invoke a tool or skill");
                     println!();
                     continue;
                 }
@@ -550,8 +780,10 @@ pub async fn run(message: Option<String>, session: String, model: Option<String>
                         (q, r, c, f, tasks)
                     });
                     println!();
-                    println!("📋 Task overview: {} queued | {} running | {} completed | {} failed",
-                        queued, running, completed, failed);
+                    println!(
+                        "📋 Task overview: {} queued | {} running | {} completed | {} failed",
+                        queued, running, completed, failed
+                    );
                     if tasks.is_empty() {
                         println!("  (No tasks)");
                     } else {
@@ -565,8 +797,10 @@ pub async fn run(message: Option<String>, session: String, model: Option<String>
                             };
                             let short_id_str: String = t.id.chars().take(12).collect();
                             let short_id = short_id_str.as_str();
-                            println!("  {} [{}] {} - {}",
-                                status_icon, short_id, t.status, t.label);
+                            println!(
+                                "  {} [{}] {} - {}",
+                                status_icon, short_id, t.status, t.label
+                            );
                             if let Some(ref progress) = t.progress {
                                 println!("    Progress: {}", progress);
                             }
@@ -635,8 +869,13 @@ pub async fn run(message: Option<String>, session: String, model: Option<String>
                     );
                     let inbound = InboundMessage {
                         channel: "cli".to_string(),
+                        account_id: None,
                         sender_id: "user".to_string(),
-                        chat_id: session_clone.split(':').nth(1).unwrap_or("default").to_string(),
+                        chat_id: session_clone
+                            .split(':')
+                            .nth(1)
+                            .unwrap_or("default")
+                            .to_string(),
                         content: learn_msg,
                         media: vec![],
                         metadata: serde_json::Value::Null,
@@ -655,8 +894,13 @@ pub async fn run(message: Option<String>, session: String, model: Option<String>
                 }
                 let inbound = InboundMessage {
                     channel: "cli".to_string(),
+                    account_id: None,
                     sender_id: "user".to_string(),
-                    chat_id: session_clone.split(':').nth(1).unwrap_or("default").to_string(),
+                    chat_id: session_clone
+                        .split(':')
+                        .nth(1)
+                        .unwrap_or("default")
+                        .to_string(),
                     content: if media.is_empty() { input } else { text },
                     media,
                     metadata: serde_json::Value::Null,
@@ -679,29 +923,14 @@ pub async fn run(message: Option<String>, session: String, model: Option<String>
         drop(inbound_tx);
 
         let mut handles: Vec<tokio::task::JoinHandle<()>> = vec![
-            runtime_handle, cron_handle, printer_handle, confirm_handle, outbound_dispatch_handle,
+            runtime_handle,
+            cron_handle,
+            printer_handle,
+            confirm_handle,
+            outbound_dispatch_handle,
+            event_handler_handle,
         ];
-
-        #[cfg(feature = "telegram")]
-        handles.push(telegram_handle);
-
-        #[cfg(feature = "whatsapp")]
-        handles.push(whatsapp_handle);
-
-        #[cfg(feature = "feishu")]
-        handles.push(feishu_handle);
-
-        #[cfg(feature = "slack")]
-        handles.push(slack_handle);
-
-        #[cfg(feature = "discord")]
-        handles.push(discord_handle);
-
-        #[cfg(feature = "dingtalk")]
-        handles.push(dingtalk_handle);
-
-        #[cfg(feature = "wecom")]
-        handles.push(wecom_handle);
+        handles.extend(channel_handles);
 
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(3),
@@ -711,6 +940,458 @@ pub async fn run(message: Option<String>, session: String, model: Option<String>
     }
 
     Ok(())
+}
+
+/// Read a line of input with real-time command picker support.
+/// When user types "/", immediately show command suggestions below the input line.
+/// Supports backspace to delete and escape to cancel picker.
+fn read_line_with_command_picker(
+    paths: &Paths,
+    stdout: &mut std::io::Stdout,
+    _session: &str,
+    _stdin_tx: &mpsc::Sender<InboundMessage>,
+) -> String {
+    let mut input = String::new();
+    let all_items = collect_command_items(paths);
+    let mut selected_index: usize = 0;
+    let mut showing_picker = false;
+    let mut visible_count: usize = 0;
+    let mut visible_limit: usize = 16; // Initial items to show
+    let mut prev_visible_limit: usize = 0; // Track previous limit for proper clearing
+    let mut command_start_pos: Option<usize> = None; // Position of '/' for command
+    const LOAD_MORE_COUNT: usize = 10; // Items to load when scrolling to end
+
+    // Enable raw mode for character-by-character input
+    // This disables line buffering and echo on both Unix and Windows
+    // If raw mode fails, we fall back to standard input mode
+    if let Err(e) = terminal::enable_raw_mode() {
+        // Raw mode failed - use fallback with std::io::stdin
+        // This means we won't have command picker, but basic input will work
+        eprintln!("Warning: Failed to enable raw mode: {}. Using fallback input.", e);
+        let _ = terminal::disable_raw_mode(); // Ensure clean state
+        use std::io::{self, BufRead};
+        let stdin = io::stdin();
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line).is_ok() {
+            return line.trim_end_matches('\n').trim_end_matches('\r').to_string();
+        }
+        return String::new();
+    }
+
+    // Initial prompt - use crossterm commands for proper terminal control
+    let _ = execute!(
+        stdout,
+        Print("\r"),
+        Clear(ClearType::CurrentLine),
+        Print("> ")
+    );
+
+    loop {
+        match event::read() {
+            Ok(Event::Key(key)) => {
+                // On Windows, we receive both Press and Release events.
+                // Only process Press events to avoid double input.
+                if key.kind == KeyEventKind::Release {
+                    continue;
+                }
+
+                match key.code {
+                    KeyCode::Char(c) => {
+                        if c == 'c' && key.modifiers.contains(KeyModifiers::CONTROL) {
+                            // Ctrl+C - exit
+                            let _ = terminal::disable_raw_mode();
+                            println!();
+                            std::process::exit(0);
+                        }
+
+                        // Add character to input
+                        input.push(c);
+
+                        // Check if we should show suggestions - detect '/' anywhere
+                        if let Some((pos, query)) = extract_command_query(&input) {
+                            if !showing_picker {
+                                showing_picker = true;
+                            }
+                            command_start_pos = Some(pos);
+                            // Always reset selection when typing new characters
+                            selected_index = 0;
+                            visible_limit = 16;
+                            // Render suggestions with the query part
+                            visible_count = render_suggestions(&all_items, query, &input, selected_index, visible_limit, prev_visible_limit, stdout);
+                            prev_visible_limit = visible_limit;
+                        } else if showing_picker {
+                            clear_suggestions(prev_visible_limit, &input, stdout);
+                            prev_visible_limit = 0;
+                            showing_picker = false;
+                            visible_count = 0;
+                            command_start_pos = None;
+                        } else {
+                            // Render input line only
+                            let _ = execute!(
+                                stdout,
+                                Print("\r"),
+                                Clear(ClearType::CurrentLine),
+                                Print(format!("> {}", input))
+                            );
+                        }
+
+                        // Flush to ensure output is immediately visible
+                        use std::io::Write;
+                        let _ = stdout.flush();
+                    }
+                    KeyCode::Enter => {
+                        // If showing picker, select current item
+                        if showing_picker && visible_count > 0 {
+                            let query = extract_command_query(&input).map(|(_, q)| q).unwrap_or("");
+                            let filtered = filter_items(&all_items, query);
+
+                            if let Some(item) = filtered.get(selected_index) {
+                                // Clear suggestions first
+                                clear_suggestions(prev_visible_limit, &input, stdout);
+                                prev_visible_limit = 0;
+                                // Replace command part with selected item
+                                if let Some(pos) = command_start_pos {
+                                    input = format!("{} /{} ", &input[..pos], item.name);
+                                } else {
+                                    input = format!("/{} ", item.name);
+                                }
+                                render_input_line(&input, stdout);
+                                showing_picker = false;
+                                visible_count = 0;
+                                command_start_pos = None;
+                                continue;
+                            }
+                        }
+
+                        // Submit the input
+                        if showing_picker {
+                            clear_suggestions(prev_visible_limit, &input, stdout);
+                        }
+                        let _ = terminal::disable_raw_mode();
+                        println!();
+                        return input;
+                    }
+                    KeyCode::Tab => {
+                        // Select current item in picker
+                        if showing_picker && visible_count > 0 {
+                            let query = extract_command_query(&input).map(|(_, q)| q).unwrap_or("");
+                            let filtered = filter_items(&all_items, query);
+
+                            if let Some(item) = filtered.get(selected_index) {
+                                // Clear suggestions first
+                                clear_suggestions(prev_visible_limit, &input, stdout);
+                                prev_visible_limit = 0;
+                                // Replace command part with selected item
+                                if let Some(pos) = command_start_pos {
+                                    input = format!("{} /{} ", &input[..pos], item.name);
+                                } else {
+                                    input = format!("/{} ", item.name);
+                                }
+                                render_input_line(&input, stdout);
+                                showing_picker = false;
+                                visible_count = 0;
+                                command_start_pos = None;
+                            }
+                        }
+                    }
+                    KeyCode::Up => {
+                        if showing_picker && visible_count > 0 && selected_index > 0 {
+                            selected_index -= 1;
+                            let query = extract_command_query(&input).map(|(_, q)| q).unwrap_or("");
+                            visible_count = render_suggestions(&all_items, query, &input, selected_index, visible_limit, prev_visible_limit, stdout);
+                            prev_visible_limit = visible_limit;
+                        }
+                    }
+                    KeyCode::Down => {
+                        if showing_picker && visible_count > 0 {
+                            // visible_limit is how many we're showing, visible_count is total available
+                            let displayed_count = visible_limit.min(visible_count);
+                            let last_displayed_idx = displayed_count.saturating_sub(1);
+                            let last_total_idx = visible_count.saturating_sub(1);
+
+                            let query = extract_command_query(&input).map(|(_, q)| q).unwrap_or("");
+
+                            // Check if we're at the last displayed item and there are more items to load
+                            if selected_index == last_displayed_idx && selected_index < last_total_idx {
+                                // Load more items
+                                visible_limit += LOAD_MORE_COUNT;
+                                selected_index += 1;
+                                visible_count = render_suggestions(&all_items, query, &input, selected_index, visible_limit, prev_visible_limit, stdout);
+                                prev_visible_limit = visible_limit;
+                            } else if selected_index < last_displayed_idx {
+                                // Normal navigation within displayed items
+                                selected_index += 1;
+                                visible_count = render_suggestions(&all_items, query, &input, selected_index, visible_limit, prev_visible_limit, stdout);
+                                prev_visible_limit = visible_limit;
+                            }
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        if !input.is_empty() {
+                            // Remove last character
+                            input.pop();
+
+                            // Re-show suggestions if still in command mode
+                            if let Some((_, query)) = extract_command_query(&input) {
+                                // Show picker again
+                                showing_picker = true;
+                                selected_index = 0;
+                                visible_limit = 16; // Reset on new search
+                                visible_count = render_suggestions(&all_items, query, &input, selected_index, visible_limit, prev_visible_limit, stdout);
+                                prev_visible_limit = visible_limit;
+                            } else {
+                                // Clear suggestions if was showing
+                                if showing_picker && visible_count > 0 {
+                                    clear_suggestions(prev_visible_limit, &input, stdout);
+                                    prev_visible_limit = 0;
+                                }
+                                showing_picker = false;
+                                visible_count = 0;
+                                command_start_pos = None;
+                                render_input_line(&input, stdout);
+                            }
+
+                            // Flush to ensure output is immediately visible
+                            use std::io::Write;
+                            let _ = stdout.flush();
+                        }
+                    }
+                    KeyCode::Esc => {
+                        if showing_picker {
+                            clear_suggestions(prev_visible_limit, &input, stdout);
+                            prev_visible_limit = 0;
+                            showing_picker = false;
+                            visible_count = 0;
+                            command_start_pos = None;
+                            render_input_line(&input, stdout);
+                            use std::io::Write;
+                            let _ = stdout.flush();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Resize(_, _)) => {
+                // Terminal resize - re-render if showing picker
+                if showing_picker {
+                    let query = extract_command_query(&input).map(|(_, q)| q).unwrap_or("");
+                    visible_count = render_suggestions(&all_items, query, &input, selected_index, visible_limit, prev_visible_limit, stdout);
+                    prev_visible_limit = visible_limit;
+                } else {
+                    render_input_line(&input, stdout);
+                }
+            }
+            Ok(_) => {
+                // Ignore other events
+            }
+            Err(_) => {
+                let _ = terminal::disable_raw_mode();
+                return input;
+            }
+        }
+    }
+}
+
+/// Render the input line using crossterm commands
+/// Uses \r to overwrite any potential terminal echo (Windows raw mode issue)
+fn render_input_line(input: &str, stdout: &mut std::io::Stdout) {
+    use std::io::Write;
+    let _ = execute!(
+        stdout,
+        Print("\r"),
+        Clear(ClearType::CurrentLine),
+        Print(format!("> {}", input))
+    );
+    // Flush to ensure the output is immediately visible
+    let _ = stdout.flush();
+}
+
+/// Extract command query from input - finds the last '/' and returns the text after it
+/// Only triggers if '/' is at the start or preceded by a space
+/// Returns (position of '/', query string) if found and no space after '/'
+fn extract_command_query(input: &str) -> Option<(usize, &str)> {
+    // Find the last '/' in input
+    if let Some(slash_pos) = input.rfind('/') {
+        // Check if '/' is at the start or preceded by a space
+        let is_at_start = slash_pos == 0;
+        // Check if the part before '/' ends with a space (or is empty for start)
+        let before_slash = &input[..slash_pos];
+        let is_after_space = before_slash.ends_with(' ');
+
+        if !is_at_start && !is_after_space {
+            return None;
+        }
+
+        let after_slash = &input[slash_pos + 1..];
+        // Check if there's no space in the command part (means still typing command)
+        if !after_slash.contains(' ') {
+            Some((slash_pos, after_slash))
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+/// Filter items based on query - returns all matching items sorted by relevance
+fn filter_items<'a>(items: &'a [CommandItem], query: &str) -> Vec<&'a CommandItem> {
+    if query.is_empty() {
+        items.iter().collect()
+    } else {
+        let q = query.to_lowercase();
+        // Score each item: name starts with query = 3, name contains query = 2, description contains query = 1
+        let mut scored: Vec<(usize, &CommandItem)> = items
+            .iter()
+            .filter_map(|item| {
+                let name_lower = item.name.to_lowercase();
+                let desc_lower = item.description.to_lowercase();
+                let score = if name_lower.starts_with(&q) {
+                    3
+                } else if name_lower.contains(&q) {
+                    2
+                } else if desc_lower.contains(&q) {
+                    1
+                } else {
+                    0
+                };
+                if score > 0 {
+                    Some((score, item))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Sort by score first (higher is better), then by name
+        scored.sort_by(|a, b| {
+            if b.0 != a.0 {
+                b.0.cmp(&a.0)
+            } else {
+                a.1.name.cmp(&b.1.name)
+            }
+        });
+
+        scored.into_iter().map(|(_, item)| item).collect()
+    }
+}
+
+/// Render suggestions below the input line
+/// Returns the total number of filtered items (not just displayed)
+fn render_suggestions(
+    all_items: &[CommandItem],
+    query: &str,
+    input: &str,
+    selected: usize,
+    visible_limit: usize,
+    prev_lines_to_clear: usize,
+    stdout: &mut std::io::Stdout,
+) -> usize {
+    let filtered = filter_items(all_items, query);
+    let total_count = filtered.len();
+    let display_count = filtered.len().min(visible_limit);
+    let has_more = total_count > visible_limit;
+
+    // First, clear all previously displayed lines plus potential new lines
+    // Use the maximum of prev_lines_to_clear and current visible_limit
+    let lines_to_clear = prev_lines_to_clear.max(visible_limit) + 1; // +1 for "show more" line
+    let _ = execute!(stdout, cursor::SavePosition);
+    for _ in 0..lines_to_clear {
+        let _ = execute!(stdout, Print("\r\n"), Clear(ClearType::CurrentLine));
+    }
+    let _ = execute!(stdout, cursor::RestorePosition);
+
+    if display_count == 0 {
+        // Just render input line if no suggestions
+        let _ = execute!(
+            stdout,
+            Print("\r"),
+            Clear(ClearType::CurrentLine),
+            Print(format!("> {}", input))
+        );
+        return 0;
+    }
+
+    // Calculate max name width for alignment
+    let max_name_width = filtered
+        .iter()
+        .take(display_count)
+        .map(|item| item.name.chars().count())
+        .max()
+        .unwrap_or(0);
+
+    // Now print the suggestions - move down one line at a time
+    for (i, item) in filtered.iter().take(display_count).enumerate() {
+        let is_selected = i == selected;
+        let icon = if item.kind == "tool" { "🔧" } else { "✨" };
+        let kind_label = if item.kind == "tool" { "tool" } else { "skill" };
+        let desc: String = item.description.chars().take(25).collect();
+
+        // Pad name to align descriptions
+        let name_width = item.name.chars().count();
+        let padding = " ".repeat(max_name_width.saturating_sub(name_width));
+
+        // Move to next line, clear it, print content
+        let _ = execute!(stdout, Print("\r\n"), Clear(ClearType::CurrentLine));
+
+        if is_selected {
+            // Selected item with reverse video and bold
+            let _ = execute!(stdout, Print(format!("\x1b[7m\x1b[1m {} {}{} \x1b[0m\x1b[90m[{}]\x1b[0m \x1b[2m{}\x1b[0m", icon, item.name, padding, kind_label, desc)));
+        } else {
+            let _ = execute!(stdout, Print(format!("   {} {}{}  \x1b[90m[{}]\x1b[0m \x1b[2m{}\x1b[0m", icon, item.name, padding, kind_label, desc)));
+        }
+    }
+
+    // Show "show more" indicator if there are more items
+    let mut extra_lines = 0;
+    if has_more {
+        let remaining = total_count - visible_limit;
+        let _ = execute!(stdout, Print("\r\n"), Clear(ClearType::CurrentLine));
+        let _ = execute!(stdout, Print(format!("\x1b[90m   ↓ show more ({} remaining)\x1b[0m", remaining)));
+        extra_lines = 1;
+    }
+
+    // Move cursor back up to input line
+    for _ in 0..(display_count + extra_lines) {
+        let _ = execute!(stdout, cursor::MoveUp(1));
+    }
+
+    // Render input line
+    let _ = execute!(
+        stdout,
+        Print("\r"),
+        Clear(ClearType::CurrentLine),
+        Print(format!("> {}", input))
+    );
+
+    // Flush to ensure output is immediately visible
+    use std::io::Write;
+    let _ = stdout.flush();
+
+    total_count
+}
+
+/// Clear the suggestion list
+fn clear_suggestions(visible_limit: usize, input: &str, stdout: &mut std::io::Stdout) {
+    // Save position, clear all suggestion lines (+1 for potential "show more" line), restore position
+    let lines_to_clear = visible_limit + 1;
+    let _ = execute!(stdout, cursor::SavePosition);
+    for _ in 0..lines_to_clear {
+        let _ = execute!(stdout, Print("\r\n"), Clear(ClearType::CurrentLine));
+    }
+    let _ = execute!(stdout, cursor::RestorePosition);
+
+    // Render input line
+    let _ = execute!(
+        stdout,
+        Print("\r"),
+        Clear(ClearType::CurrentLine),
+        Print(format!("> {}", input))
+    );
+
+    // Flush to ensure output is immediately visible
+    use std::io::Write;
+    let _ = stdout.flush();
 }
 
 /// Scan a directory for skill subdirectories and collect (name, description) pairs.
@@ -729,9 +1410,14 @@ fn scan_skill_dirs(dir: &std::path::Path) -> Vec<(String, String)> {
             if !p.join("SKILL.rhai").exists() && !p.join("SKILL.md").exists() {
                 continue;
             }
-            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
+            let name = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown")
+                .to_string();
             // Try to read description from meta.yaml
-            let desc = p.join("meta.yaml")
+            let desc = p
+                .join("meta.yaml")
                 .exists()
                 .then(|| std::fs::read_to_string(p.join("meta.yaml")).ok())
                 .flatten()
@@ -760,37 +1446,75 @@ fn scan_skill_dirs(dir: &std::path::Path) -> Vec<(String, String)> {
 
 /// Skill domain categories for grouping skills in /skills display.
 const SKILL_CATEGORIES: &[(&str, &[&str])] = &[
-    ("💰 Finance", &[
-        "stock_monitor", "stock_screener", "bond_monitor", "futures_monitor",
-        "futures_strategy", "portfolio_advisor", "macro_monitor", "daily_finance_report",
-    ]),
-    ("⛓️ Blockchain/DeFi", &[
-        "crypto_research", "crypto_onchain", "crypto_sentiment", "crypto_tax",
-        "quant_crypto", "defi_analysis", "nft_analysis", "dao_analysis",
-        "token_security", "contract_audit", "wallet_security", "whale_tracker",
-        "address_monitor", "treasury_management",
-    ]),
-    ("📧 Email", &[
-        "email_digest", "email_auto_reply", "email_cleanup", "email_backup",
-        "email_report", "email_to_tasks",
-    ]),
-    ("🖥️ GUI Automation", &[
-        "app_control", "camera",
-    ]),
-    ("📅 Productivity", &[
-        "daily_digest", "weekly_review", "calendar_manager", "calendar_reminders",
-        "personal_life", "smart_home", "learning_assistant",
-    ]),
-    ("🔧 DevOps", &[
-        "dev_workflow", "dev_security", "devops_monitor", "log_monitor",
-        "site_monitor", "security_privacy",
-    ]),
-    ("📰 Content", &[
-        "news_monitor", "content_creator",
-    ]),
-    ("🏢 Business", &[
-        "business_ops",
-    ]),
+    (
+        "💰 Finance",
+        &[
+            "stock_monitor",
+            "stock_screener",
+            "bond_monitor",
+            "futures_monitor",
+            "futures_strategy",
+            "portfolio_advisor",
+            "macro_monitor",
+            "daily_finance_report",
+        ],
+    ),
+    (
+        "⛓️ Blockchain/DeFi",
+        &[
+            "crypto_research",
+            "crypto_onchain",
+            "crypto_sentiment",
+            "crypto_tax",
+            "quant_crypto",
+            "defi_analysis",
+            "nft_analysis",
+            "dao_analysis",
+            "token_security",
+            "contract_audit",
+            "wallet_security",
+            "whale_tracker",
+            "address_monitor",
+            "treasury_management",
+        ],
+    ),
+    (
+        "📧 Email",
+        &[
+            "email_digest",
+            "email_auto_reply",
+            "email_cleanup",
+            "email_backup",
+            "email_report",
+            "email_to_tasks",
+        ],
+    ),
+    ("🖥️ GUI Automation", &["app_control", "camera"]),
+    (
+        "📅 Productivity",
+        &[
+            "daily_digest",
+            "weekly_review",
+            "calendar_manager",
+            "calendar_reminders",
+            "personal_life",
+            "smart_home",
+            "learning_assistant",
+        ],
+    ),
+    (
+        "🔧 DevOps",
+        &[
+            "dev_workflow",
+            "dev_security",
+            "devops_monitor",
+            "log_monitor",
+            "site_monitor",
+            "security_privacy",
+        ],
+    ),
+    ("📰 Content", &["news_monitor", "content_creator"]),
+    ("🏢 Business", &["business_ops"]),
 ];
 
 /// Print skill status (local filesystem operation, no LLM needed).
@@ -805,7 +1529,8 @@ fn print_skills_status(paths: &Paths) {
     let workspace_skills = scan_skill_dirs(&paths.skills_dir());
 
     // Merge: workspace overrides built-in
-    let mut skill_map: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    let mut skill_map: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
     for (name, desc) in &builtin_skills {
         skill_map.insert(name.clone(), desc.clone());
     }
@@ -848,7 +1573,8 @@ fn print_skills_status(paths: &Paths) {
     }
 
     // Show uncategorized skills (user-created or newly added)
-    let uncategorized: Vec<_> = skill_map.iter()
+    let uncategorized: Vec<_> = skill_map
+        .iter()
         .filter(|(name, _)| !categorized.contains(name.as_str()))
         .collect();
     if !uncategorized.is_empty() {
@@ -902,7 +1628,9 @@ fn print_skills_status(paths: &Paths) {
         let status_str = format!("{:?}", r.status);
         match status_str.as_str() {
             "Completed" => learned.push(r),
-            "Failed" | "RolledBack" | "AuditFailed" | "DryRunFailed" | "TestFailed" => failed.push(r),
+            "Failed" | "RolledBack" | "AuditFailed" | "DryRunFailed" | "TestFailed" => {
+                failed.push(r)
+            }
             _ => learning.push(r),
         }
     }
@@ -915,7 +1643,11 @@ fn print_skills_status(paths: &Paths) {
     if !learned.is_empty() {
         println!("  ✅ Learned ({}):", learned.len());
         for r in &learned {
-            println!("    • {} ({})", r.skill_name, format_timestamp(r.created_at));
+            println!(
+                "    • {} ({})",
+                r.skill_name,
+                format_timestamp(r.created_at)
+            );
         }
     }
 
@@ -933,21 +1665,36 @@ fn print_skills_status(paths: &Paths) {
                 "Observing" | "RollingOut" => "observing",
                 _ => "in progress",
             };
-            println!("    • {} [{}] ({})", r.skill_name, status_desc, format_timestamp(r.created_at));
+            println!(
+                "    • {} [{}] ({})",
+                r.skill_name,
+                status_desc,
+                format_timestamp(r.created_at)
+            );
         }
     }
 
     if !failed.is_empty() {
         println!("  ❌ Failed ({}):", failed.len());
         for r in &failed {
-            println!("    • {} ({})", r.skill_name, format_timestamp(r.created_at));
+            println!(
+                "    • {} ({})",
+                r.skill_name,
+                format_timestamp(r.created_at)
+            );
         }
     }
 
-    let builtin_err_count = records.iter().filter(|r| is_builtin_tool(&r.skill_name)).count();
+    let builtin_err_count = records
+        .iter()
+        .filter(|r| is_builtin_tool(&r.skill_name))
+        .count();
     if builtin_err_count > 0 {
         println!();
-        println!("  ℹ️  {} built-in tool error records hidden (/clear-skills to clean up)", builtin_err_count);
+        println!(
+            "  ℹ️  {} built-in tool error records hidden (/clear-skills to clean up)",
+            builtin_err_count
+        );
     }
 
     println!();
@@ -965,9 +1712,10 @@ fn clear_all_skill_records(paths: &Paths) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.extension().is_some_and(|e| e == "json")
-                    && std::fs::remove_file(&path).is_ok() {
-                        count += 1;
-                    }
+                    && std::fs::remove_file(&path).is_ok()
+                {
+                    count += 1;
+                }
             }
         }
     }
@@ -996,9 +1744,10 @@ fn delete_skill_records(paths: &Paths, skill_name: &str) {
                     if let Ok(content) = std::fs::read_to_string(&path) {
                         if let Ok(record) = serde_json::from_str::<EvolutionRecord>(&content) {
                             if record.skill_name == skill_name
-                                && std::fs::remove_file(&path).is_ok() {
-                                    count += 1;
-                                }
+                                && std::fs::remove_file(&path).is_ok()
+                            {
+                                count += 1;
+                            }
                         }
                     }
                 }
@@ -1008,7 +1757,10 @@ fn delete_skill_records(paths: &Paths, skill_name: &str) {
 
     println!();
     if count > 0 {
-        println!("  ✅ Deleted all records for skill `{}` ({} total)", skill_name, count);
+        println!(
+            "  ✅ Deleted all records for skill `{}` ({} total)",
+            skill_name, count
+        );
     } else {
         println!("  ⚠️  No records found for skill `{}`", skill_name);
     }
@@ -1023,7 +1775,11 @@ fn print_tools_status(paths: &Paths) {
     let total_tools: usize = BUILTIN_TOOLS.iter().map(|(_, items)| items.len()).sum();
 
     println!();
-    println!("🔌 Built-in tools ({} total, {} categories)", total_tools, BUILTIN_TOOLS.len());
+    println!(
+        "🔌 Built-in tools ({} total, {} categories)",
+        total_tools,
+        BUILTIN_TOOLS.len()
+    );
 
     for (category, items) in BUILTIN_TOOLS {
         println!();
@@ -1034,14 +1790,21 @@ fn print_tools_status(paths: &Paths) {
     }
 
     // Dynamic evolved tools from evolved_tools.json
-    let cap_file = paths.workspace().join("evolved_tools").join("evolved_tools.json");
+    let cap_file = paths
+        .workspace()
+        .join("evolved_tools")
+        .join("evolved_tools.json");
     if cap_file.exists() {
         if let Ok(content) = std::fs::read_to_string(&cap_file) {
             if let Ok(caps) = serde_json::from_str::<Vec<CapabilityDescriptor>>(&content) {
                 if !caps.is_empty() {
                     let active = caps.iter().filter(|c| c.is_available()).count();
                     println!();
-                    println!("  🧬 Dynamic evolved tools ({}, {} available)", caps.len(), active);
+                    println!(
+                        "  🧬 Dynamic evolved tools ({}, {} available)",
+                        caps.len(),
+                        active
+                    );
                     for cap in &caps {
                         let icon = match format!("{:?}", cap.status).as_str() {
                             "Active" => "✅",
@@ -1049,7 +1812,10 @@ fn print_tools_status(paths: &Paths) {
                             "Loading" | "Evolving" => "⏳",
                             _ => "❌",
                         };
-                        println!("    {} {} v{} — {}", icon, cap.id, cap.version, cap.description);
+                        println!(
+                            "    {} {} v{} — {}",
+                            icon, cap.id, cap.version, cap.description
+                        );
                     }
                 }
             }
@@ -1075,7 +1841,10 @@ fn print_tools_status(paths: &Paths) {
         }
         if evo_count > 0 {
             println!();
-            println!("  🧬 Core evolution: {} records ({} active)", evo_count, active_count);
+            println!(
+                "  🧬 Core evolution: {} records ({} active)",
+                evo_count, active_count
+            );
         }
     }
 
@@ -1084,11 +1853,138 @@ fn print_tools_status(paths: &Paths) {
     println!();
 }
 
+/// A command item for the interactive picker
+#[derive(Clone)]
+struct CommandItem {
+    name: String,
+    description: String,
+    kind: String, // "tool" or "skill"
+}
+
+/// Collect all available tools and skills as command items
+fn collect_command_items(paths: &Paths) -> Vec<CommandItem> {
+    let mut items = Vec::new();
+
+    // Collect built-in tools
+    for (_category, tools) in BUILTIN_TOOLS {
+        for (name, desc) in *tools {
+            items.push(CommandItem {
+                name: name.to_string(),
+                description: desc.to_string(),
+                kind: "tool".to_string(),
+            });
+        }
+    }
+
+    // Collect skills from workspace
+    let skills = scan_skill_dirs(&paths.skills_dir());
+    for (name, desc) in skills {
+        items.push(CommandItem {
+            name,
+            description: if desc.is_empty() {
+                "Skill".to_string()
+            } else {
+                desc
+            },
+            kind: "skill".to_string(),
+        });
+    }
+
+    // Sort by kind (tools first) then by name
+    items.sort_by(|a, b| {
+        if a.kind != b.kind {
+            a.kind.cmp(&b.kind) // tools before skills
+        } else {
+            a.name.cmp(&b.name)
+        }
+    });
+
+    items
+}
+
 /// Format a Unix timestamp to a human-readable string.
 fn format_timestamp(ts: i64) -> String {
-    use chrono::{TimeZone, Local};
+    use chrono::{Local, TimeZone};
     match Local.timestamp_opt(ts, 0) {
         chrono::LocalResult::Single(dt) => dt.format("%m-%d %H:%M").to_string(),
         _ => "unknown".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use blockcell_core::config::AgentProfileConfig;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_resolve_agent_context_defaults_to_default_agent() {
+        let config = Config::default();
+        let paths = Paths::with_base(PathBuf::from("/tmp/blockcell"));
+
+        let resolved = resolve_agent_context(&config, &paths, None, None)
+            .expect("default agent should resolve");
+
+        assert_eq!(resolved.agent_id, "default");
+        assert_eq!(resolved.session, "cli:default");
+        assert_eq!(
+            resolved.paths.workspace(),
+            PathBuf::from("/tmp/blockcell/workspace")
+        );
+    }
+
+    #[test]
+    fn test_resolve_agent_context_uses_named_agent_paths_and_session() {
+        let mut config = Config::default();
+        config.agents.list.push(AgentProfileConfig {
+            id: "ops".to_string(),
+            enabled: true,
+            model: Some("deepseek-chat".to_string()),
+            provider: Some("deepseek".to_string()),
+            ..AgentProfileConfig::default()
+        });
+        let paths = Paths::with_base(PathBuf::from("/tmp/blockcell"));
+
+        let resolved = resolve_agent_context(&config, &paths, Some("ops"), None)
+            .expect("named agent should resolve");
+
+        assert_eq!(resolved.agent_id, "ops");
+        assert_eq!(resolved.session, "cli:ops");
+        assert_eq!(
+            resolved.paths.workspace(),
+            PathBuf::from("/tmp/blockcell/agents/ops/workspace")
+        );
+        assert_eq!(
+            resolved.config.agents.defaults.provider.as_deref(),
+            Some("deepseek")
+        );
+        assert_eq!(resolved.config.agents.defaults.model, "deepseek-chat");
+    }
+
+    #[test]
+    fn test_resolve_agent_context_preserves_explicit_session() {
+        let mut config = Config::default();
+        config.agents.list.push(AgentProfileConfig {
+            id: "ops".to_string(),
+            enabled: true,
+            ..AgentProfileConfig::default()
+        });
+        let paths = Paths::with_base(PathBuf::from("/tmp/blockcell"));
+
+        let resolved = resolve_agent_context(&config, &paths, Some("ops"), Some("custom:thread"))
+            .expect("named agent with explicit session should resolve");
+
+        assert_eq!(resolved.session, "custom:thread");
+    }
+
+    #[test]
+    fn test_resolve_agent_context_rejects_unknown_agent() {
+        let config = Config::default();
+        let paths = Paths::with_base(PathBuf::from("/tmp/blockcell"));
+
+        let err = resolve_agent_context(&config, &paths, Some("ops"), None)
+            .expect_err("unknown agent should fail");
+
+        assert!(err.to_string().contains("Unknown agent 'ops'"));
     }
 }

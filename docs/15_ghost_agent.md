@@ -1,7 +1,6 @@
 # 第15篇：幽灵智能体（Ghost Agent）—— 后台维护与社区同步
 
-> 系列文章：《blockcell 开源项目深度解析》第 15/16 篇
-
+> 系列文章：《blockcell 开源项目深度解析》第 15 篇
 ---
 
 ## 为什么需要“幽灵智能体”
@@ -32,9 +31,27 @@ Ghost Agent 是一个**按计划运行**的后台例行维护服务：
 
 ---
 
-## 配置方式（config.json）
+## 与 SystemEventOrchestrator 的边界
 
-Ghost 的配置位于 `config.json` 的 `agents.ghost`：
+这次架构调整后，Ghost 的职责边界更清晰了：
+
+- Ghost 仍然是**后台维护型 Agent**
+  - 负责记忆整理、文件清理、社区同步
+- `HeartbeatService` 仍然是**定时 Prompt 注入器**
+- 真正负责“系统事件 → 摘要队列 → 主动通知”的，是 `AgentRuntime` tick 中调用的 `SystemEventOrchestrator`
+
+当前 Phase 1 里：
+
+- 已接入 producer：`TaskManager`、`CronService`
+- 尚未接入 producer：`GhostService`
+
+也就是说，Ghost 现在**不是**事件总线，也**不是**统一通知中心；后续如果要让 Ghost 的维护结果进入主会话摘要，应作为一个新的 `system_event producer` 接入，而不是继续扩张 Ghost 本身的职责。
+
+---
+
+## 配置方式（config.json5）
+
+Ghost 的配置位于 `config.json5` 的 `agents.ghost`：
 
 ```json
 {

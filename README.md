@@ -1,8 +1,12 @@
-# BlockCell
+# BlueClaw
 
 <div align="center">
 
-**用 Rust 构建的自进化 AI 智能体框架**
+<img src="screenshot/logo-blueclaw.png" alt="BlueClaw Logo" width="320" />
+
+**BlockCell进化为BlueClaw - 蓝虾**
+
+**用 Rust 构建的自进化 AI 多智能体框架**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
@@ -81,9 +85,10 @@ BlockCell: ✓ 设置监控 → ✓ 每小时检查价格 → ✓ 发送 Telegra
 将 BlockCell 作为守护进程运行，连接到：
 
 - **Telegram**（长轮询）
-- **WhatsApp**（Webhook）
-- **飞书/Lark**（WebSocket / Webhook）
-- **Slack**（Socket Mode）
+- **WhatsApp**（桥接 WebSocket）
+- **飞书**（长连接 WebSocket）
+- **Lark**（Webhook）
+- **Slack**（Socket Mode，缺少 `appToken` 时可轮询回退）
 - **Discord**（Gateway WebSocket）
 - **钉钉**（Stream SDK）
 - **企业微信**（WeCom，轮询/Webhook）
@@ -110,7 +115,7 @@ BlockCell: ✓ 设置监控 → ✓ 每小时检查价格 → ✓ 发送 Telegra
 - 💬 交互方式说明
 - ⚠️ 常见问题排查
 
-### 🏗️ Rust 宿主 + Rhai 技能架构
+### 🏗️ Rust 宿主 + 三种技能形态
 
 ```
 ┌─────────────────────────────────────────────┐
@@ -120,14 +125,16 @@ BlockCell: ✓ 设置监控 → ✓ 每小时检查价格 → ✓ 发送 Telegra
 └─────────────────────────────────────────────┘
                      ↕
 ┌─────────────────────────────────────────────┐
-│       Rhai 技能（可变层）                    │
-│  自定义技能 | AI 生成代码                    │
-│  可进化 | 沙箱隔离 | 热重载                  │
+│         技能层（可变层）                     │
+│  纯 Markdown | Markdown + Rhai              │
+│  Markdown + Python                          │
 └─────────────────────────────────────────────┘
 ```
 
 - **Rust 宿主**：不可变、安全、高性能的基础
-- **Rhai 技能**：灵活、可进化、AI 生成的能力
+- **纯 Markdown 技能**：只用 `SKILL.md` 定义行为说明，适合知识型与流程型技能
+- **Markdown + Rhai 技能**：使用 `SKILL.md` + `SKILL.rhai` 实现结构化编排与工具调用
+- **Markdown + Python 技能**：使用 `SKILL.md` + Python 脚本承载更复杂的数据处理、集成与执行逻辑
 
 ---
 
@@ -159,15 +166,14 @@ cargo build --release
 ### 首次运行
 
 ```bash
-# 初始化配置
-blockcell onboard
-
-# 编辑配置并添加你的 API 密钥
-# ~/.blockcell/config.json
+# 推荐：交互式向导
+blockcell setup
 
 # 启动交互模式
 blockcell agent
 ```
+
+`setup` 会创建 `~/.blockcell/` 目录、写入 provider 配置，并在你启用外部渠道时自动补默认 owner 绑定。
 
 ### 守护进程模式（带 WebUI）
 
@@ -177,6 +183,7 @@ blockcell gateway
 
 - **API 服务器**：`http://localhost:18790`
 - **WebUI**：`http://localhost:18791`
+- **默认路由**：CLI / WebUI / WebSocket 进入 `default` agent；外部渠道优先按 `channelAccountOwners.<channel>.<accountId>` 路由，未命中时回退到 `channelOwners.<channel>`
 
 ---
 
@@ -196,23 +203,118 @@ blockcell gateway
 
 ## ⚙️ 配置说明
 
-最小配置示例（`~/.blockcell/config.json`）：
+最小配置示例（`~/.blockcell/config.json5`）：
 
 ```json
 {
   "providers": {
-    "openrouter": {
+    "deepseek": {
       "apiKey": "YOUR_API_KEY",
-      "apiBase": "https://openrouter.ai/api/v1"
+      "apiBase": "https://api.deepseek.com"
     }
   },
   "agents": {
     "defaults": {
-      "model": "anthropic/claude-sonnet-4-20250514"
+      "model": "deepseek-chat"
     }
   }
 }
 ```
+
+如果要启用多 agent 与外部渠道，建议按代码当前支持的结构补充，例如下面这个“2 个 agent + 2 个 Telegram 账号”的配置：
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "model": "deepseek-chat"
+    },
+    "list": [
+      {
+        "id": "default",
+        "enabled": true,
+        "name": "General Assistant",
+        "intentProfile": "default"
+      },
+      {
+        "id": "ops",
+        "enabled": true,
+        "name": "Operations Assistant",
+        "intentProfile": "ops",
+        "maxToolIterations": 12
+      }
+    ]
+  },
+  "intentRouter": {
+    "enabled": true,
+    "defaultProfile": "default",
+    "agentProfiles": {
+      "default": "default",
+      "ops": "ops"
+    },
+    "profiles": {
+      "default": {
+        "coreTools": ["read_file", "write_file", "list_dir", "web_fetch", "message"],
+        "intentTools": {
+          "Chat": { "inheritBase": false, "tools": [] },
+          "FileOps": ["read_file", "write_file", "list_dir"],
+          "WebSearch": ["web_search", "web_fetch"]
+        }
+      },
+      "ops": {
+        "coreTools": ["http_request", "message", "notification", "alert_rule", "list_tasks"],
+        "intentTools": {
+          "DevOps": ["http_request", "notification", "alert_rule", "list_tasks"],
+          "Communication": ["message", "notification"]
+        },
+        "denyTools": ["write_file", "exec"]
+      }
+    }
+  },
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "accounts": {
+        "main_bot": {
+          "enabled": true,
+          "token": "123456:MAIN_BOT_TOKEN",
+          "allowFrom": ["alice"]
+        },
+        "ops_bot": {
+          "enabled": true,
+          "token": "123456:OPS_BOT_TOKEN",
+          "allowFrom": ["oncall_group"]
+        }
+      },
+      "defaultAccountId": "main_bot"
+    }
+  },
+  "channelOwners": {
+    "telegram": "default"
+  },
+  "channelAccountOwners": {
+    "telegram": {
+      "main_bot": "default",
+      "ops_bot": "ops"
+    }
+  },
+  "gateway": {
+    "apiToken": "YOUR_STABLE_API_TOKEN",
+    "webuiPass": "YOUR_WEBUI_PASSWORD"
+  }
+}
+```
+
+这里要注意：
+
+- `agents.list` 里的字段要使用代码实际支持的字段，例如 `id`、`enabled`、`name`、`intentProfile`、`maxToolIterations`
+- `intentRouter` 当前支持 `enabled`、`defaultProfile`、`agentProfiles`、`profiles`
+- `profiles.<name>` 里可以配置 `coreTools`、`intentTools`、`denyTools`
+- Telegram 多账号要写在 `channels.telegram.accounts` 下，每个账号使用 `enabled`、`token`、`allowFrom`
+- 渠道路由使用 `channelOwners`
+- 账号级覆盖路由使用 `channelAccountOwners`
+- 如果你只需要单 agent，请直接看上面的最小配置，或者阅读 `QUICKSTART.zh-CN.md`
+- 如果你需要完整多 agent 部署说明，请阅读 `QUICKSTART.multi-agent.zh-CN.md`
 
 ### 支持的 LLM 提供商
 
@@ -243,7 +345,8 @@ blockcell gateway
 
 ## 📚 文档
 
-- [快速开始指南](QUICKSTART.zh-CN.md)
+- [快速开始指南（单 agent）](QUICKSTART.zh-CN.md)
+- [多 agent 快速开始](QUICKSTART.multi-agent.zh-CN.md)
 - [架构深度解析](docs/01_what_is_blockcell.md)
 - [工具系统](docs/03_tools_system.md)
 - [技能系统](docs/04_skill_system.md)

@@ -5,6 +5,100 @@ use serde_json::{json, Value};
 
 use crate::{Tool, ToolContext, ToolSchema};
 
+fn parse_string_map(input: &str) -> Option<serde_json::Map<String, Value>> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Some(serde_json::Map::new());
+    }
+
+    if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(trimmed) {
+        return Some(map);
+    }
+
+    let normalized = if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        trimmed.to_string()
+    } else {
+        format!("{{{}}}", trimmed)
+    };
+
+    let mut map = serde_json::Map::new();
+    for pair in normalized.split(',') {
+        let pair = pair
+            .trim()
+            .trim_start_matches('{')
+            .trim_end_matches('}')
+            .trim();
+        if pair.is_empty() {
+            continue;
+        }
+
+        let (raw_key, raw_value) = pair.split_once("=>")?;
+        let key = strip_wrapping_quotes(raw_key.trim());
+        let value = parse_scalar_value(raw_value.trim());
+        map.insert(key, value);
+    }
+
+    Some(map)
+}
+
+fn parse_json_like_value(value: &Value) -> Option<Value> {
+    match value {
+        Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+
+            if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+                return Some(parsed);
+            }
+
+            parse_string_map(trimmed).map(Value::Object)
+        }
+        other => Some(other.clone()),
+    }
+}
+
+fn strip_wrapping_quotes(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.len() >= 2 {
+        let bytes = trimmed.as_bytes();
+        let first = bytes[0];
+        let last = bytes[trimmed.len() - 1];
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return trimmed[1..trimmed.len() - 1].to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+fn parse_scalar_value(input: &str) -> Value {
+    let trimmed = input.trim();
+    let unquoted = strip_wrapping_quotes(trimmed);
+
+    if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+        return parsed;
+    }
+
+    if unquoted.eq_ignore_ascii_case("true") {
+        return Value::Bool(true);
+    }
+    if unquoted.eq_ignore_ascii_case("false") {
+        return Value::Bool(false);
+    }
+    if unquoted.eq_ignore_ascii_case("null") {
+        return Value::Null;
+    }
+    if let Ok(parsed) = unquoted.parse::<i64>() {
+        return json!(parsed);
+    }
+    if let Ok(parsed) = unquoted.parse::<f64>() {
+        return json!(parsed);
+    }
+
+    Value::String(unquoted)
+}
+
 pub struct HttpRequestTool;
 
 #[async_trait]
@@ -107,7 +201,10 @@ impl Tool for HttpRequestTool {
         if let Some(method) = params.get("method").and_then(|v| v.as_str()) {
             let valid = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
             if !valid.contains(&method) {
-                return Err(Error::Validation(format!("Invalid HTTP method: {}", method)));
+                return Err(Error::Validation(format!(
+                    "Invalid HTTP method: {}",
+                    method
+                )));
             }
         }
 
@@ -116,7 +213,10 @@ impl Tool for HttpRequestTool {
 
     async fn execute(&self, ctx: ToolContext, params: Value) -> Result<Value> {
         let url = params["url"].as_str().unwrap();
-        let method = params.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
+        let method = params
+            .get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or("GET");
         let timeout_secs = params
             .get("timeout_seconds")
             .and_then(|v| v.as_u64())
@@ -161,9 +261,13 @@ impl Tool for HttpRequestTool {
         request = request.header("User-Agent", user_agent);
 
         // Custom headers
-        if let Some(headers) = params.get("headers").and_then(|v| v.as_object()) {
-            for (key, value) in headers {
-                if let Some(val_str) = value.as_str() {
+        if let Some(headers) = params.get("headers").and_then(parse_json_like_value) {
+            if let Some(headers) = headers.as_object() {
+                for (key, value) in headers {
+                    let val_str = match value {
+                        Value::String(s) => s.clone(),
+                        _ => value.to_string(),
+                    };
                     request = request.header(key.as_str(), val_str);
                 }
             }
@@ -173,78 +277,113 @@ impl Tool for HttpRequestTool {
         if let Some(auth_type) = params.get("auth_type").and_then(|v| v.as_str()) {
             match auth_type {
                 "bearer" => {
-                    let token = params.get("auth_token").and_then(|v| v.as_str())
-                        .ok_or_else(|| Error::Validation("bearer auth requires 'auth_token'".to_string()))?;
+                    let token = params
+                        .get("auth_token")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            Error::Validation("bearer auth requires 'auth_token'".to_string())
+                        })?;
                     request = request.bearer_auth(token);
                 }
                 "basic" => {
-                    let username = params.get("auth_username").and_then(|v| v.as_str())
-                        .ok_or_else(|| Error::Validation("basic auth requires 'auth_username'".to_string()))?;
-                    let password = params.get("auth_password").and_then(|v| v.as_str()).unwrap_or("");
+                    let username = params
+                        .get("auth_username")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            Error::Validation("basic auth requires 'auth_username'".to_string())
+                        })?;
+                    let password = params
+                        .get("auth_password")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     request = request.basic_auth(username, Some(password));
                 }
                 "api_key" => {
-                    let key_name = params.get("auth_key_name").and_then(|v| v.as_str())
-                        .ok_or_else(|| Error::Validation("api_key auth requires 'auth_key_name'".to_string()))?;
-                    let key_value = params.get("auth_key_value").and_then(|v| v.as_str())
-                        .ok_or_else(|| Error::Validation("api_key auth requires 'auth_key_value'".to_string()))?;
+                    let key_name = params
+                        .get("auth_key_name")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            Error::Validation("api_key auth requires 'auth_key_name'".to_string())
+                        })?;
+                    let key_value = params
+                        .get("auth_key_value")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            Error::Validation("api_key auth requires 'auth_key_value'".to_string())
+                        })?;
                     request = request.header(key_name, key_value);
                 }
-                _ => return Err(Error::Validation(format!("Unknown auth_type: {}", auth_type))),
+                _ => {
+                    return Err(Error::Validation(format!(
+                        "Unknown auth_type: {}",
+                        auth_type
+                    )))
+                }
             }
         }
 
         // Query parameters
-        if let Some(query) = params.get("query_params").and_then(|v| v.as_object()) {
-            let pairs: Vec<(String, String)> = query.iter()
-                .map(|(k, v)| {
-                    let val = match v {
-                        Value::String(s) => s.clone(),
-                        _ => v.to_string(),
-                    };
-                    (k.clone(), val)
-                })
-                .collect();
-            request = request.query(&pairs);
+        if let Some(query) = params.get("query_params").and_then(parse_json_like_value) {
+            if let Some(query) = query.as_object() {
+                let pairs: Vec<(String, String)> = query
+                    .iter()
+                    .map(|(k, v)| {
+                        let val = match v {
+                            Value::String(s) => s.clone(),
+                            _ => v.to_string(),
+                        };
+                        (k.clone(), val)
+                    })
+                    .collect();
+                request = request.query(&pairs);
+            }
         }
 
         // Body
         if let Some(body) = params.get("body") {
-            if body.is_object() || body.is_array() {
-                request = request.json(body);
+            if let Some(parsed_body) = parse_json_like_value(body) {
+                if parsed_body.is_object() || parsed_body.is_array() {
+                    request = request.json(&parsed_body);
+                } else if let Some(body_raw) = parsed_body.as_str() {
+                    request = request.body(body_raw.to_string());
+                }
             }
         } else if let Some(body_raw) = params.get("body_raw").and_then(|v| v.as_str()) {
             request = request.body(body_raw.to_string());
-        } else if let Some(form) = params.get("form").and_then(|v| v.as_object()) {
-            let form_data: Vec<(String, String)> = form.iter()
-                .map(|(k, v)| {
-                    let val = match v {
-                        Value::String(s) => s.clone(),
-                        _ => v.to_string(),
-                    };
-                    (k.clone(), val)
-                })
-                .collect();
-            request = request.form(&form_data);
+        } else if let Some(form) = params.get("form").and_then(parse_json_like_value) {
+            if let Some(form) = form.as_object() {
+                let form_data: Vec<(String, String)> = form
+                    .iter()
+                    .map(|(k, v)| {
+                        let val = match v {
+                            Value::String(s) => s.clone(),
+                            _ => v.to_string(),
+                        };
+                        (k.clone(), val)
+                    })
+                    .collect();
+                request = request.form(&form_data);
+            }
         }
 
         // Send request
-        let response = request
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    Error::Timeout(format!("Request timed out after {} seconds", timeout_secs))
-                } else if e.is_connect() {
-                    Error::Tool(format!("Connection failed: {}", e))
-                } else {
-                    Error::Tool(format!("Request failed: {}", e))
-                }
-            })?;
+        let response = request.send().await.map_err(|e| {
+            if e.is_timeout() {
+                Error::Timeout(format!("Request timed out after {} seconds", timeout_secs))
+            } else if e.is_connect() {
+                Error::Tool(format!("Connection failed: {}", e))
+            } else {
+                Error::Tool(format!("Request failed: {}", e))
+            }
+        })?;
 
         // Collect response metadata
         let status = response.status().as_u16();
-        let status_text = response.status().canonical_reason().unwrap_or("").to_string();
+        let status_text = response
+            .status()
+            .canonical_reason()
+            .unwrap_or("")
+            .to_string();
         let final_url = response.url().to_string();
 
         let response_headers: Value = {
@@ -280,7 +419,9 @@ impl Tool for HttpRequestTool {
                 tokio::fs::create_dir_all(parent).await?;
             }
 
-            let bytes = response.bytes().await
+            let bytes = response
+                .bytes()
+                .await
                 .map_err(|e| Error::Tool(format!("Failed to read response body: {}", e)))?;
             let size = bytes.len();
             tokio::fs::write(&path, &bytes).await?;
@@ -296,17 +437,20 @@ impl Tool for HttpRequestTool {
         }
 
         // Read response body
-        let body_bytes = response.bytes().await
+        let body_bytes = response
+            .bytes()
+            .await
             .map_err(|e| Error::Tool(format!("Failed to read response body: {}", e)))?;
 
         let body_text = String::from_utf8_lossy(&body_bytes).to_string();
 
         // Try to parse as JSON
-        let body_json: Option<Value> = if content_type.contains("application/json") || content_type.contains("+json") {
-            serde_json::from_str(&body_text).ok()
-        } else {
-            None
-        };
+        let body_json: Option<Value> =
+            if content_type.contains("application/json") || content_type.contains("+json") {
+                serde_json::from_str(&body_text).ok()
+            } else {
+                None
+            };
 
         // Truncate if needed
         let truncated = body_text.len() > max_response_chars;
@@ -354,18 +498,81 @@ mod tests {
     #[test]
     fn test_validate() {
         let tool = HttpRequestTool;
-        assert!(tool.validate(&json!({"url": "https://api.example.com"})).is_ok());
+        assert!(tool
+            .validate(&json!({"url": "https://api.example.com"}))
+            .is_ok());
         assert!(tool.validate(&json!({"url": "ftp://bad"})).is_err());
         assert!(tool.validate(&json!({})).is_err());
-        assert!(tool.validate(&json!({"url": "https://api.example.com", "method": "POST"})).is_ok());
-        assert!(tool.validate(&json!({"url": "https://api.example.com", "method": "INVALID"})).is_err());
+        assert!(tool
+            .validate(&json!({"url": "https://api.example.com", "method": "POST"}))
+            .is_ok());
+        assert!(tool
+            .validate(&json!({"url": "https://api.example.com", "method": "INVALID"}))
+            .is_err());
     }
 
     #[test]
     fn test_validate_methods() {
         let tool = HttpRequestTool;
         for method in &["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] {
-            assert!(tool.validate(&json!({"url": "https://x.com", "method": method})).is_ok());
+            assert!(tool
+                .validate(&json!({"url": "https://x.com", "method": method}))
+                .is_ok());
         }
+    }
+
+    #[test]
+    fn test_parse_string_map_json_string() {
+        let parsed =
+            parse_string_map(r#"{"Content-Type":"application/json","X-Test":"1"}"#).unwrap();
+        assert_eq!(
+            parsed.get("Content-Type").and_then(|v| v.as_str()),
+            Some("application/json")
+        );
+        assert_eq!(parsed.get("X-Test").and_then(|v| v.as_str()), Some("1"));
+    }
+
+    #[test]
+    fn test_parse_string_map_arrow_syntax() {
+        let parsed = parse_string_map(r#""code"=>"w001","pageSize"=>30,"page"=>1"#).unwrap();
+        assert_eq!(parsed.get("code").and_then(|v| v.as_str()), Some("w001"));
+        assert_eq!(parsed.get("pageSize").and_then(|v| v.as_i64()), Some(30));
+        assert_eq!(parsed.get("page").and_then(|v| v.as_i64()), Some(1));
+    }
+
+    #[test]
+    fn test_parse_json_like_value_string_object() {
+        let parsed = parse_json_like_value(&json!(r#"{"code":"w001","pageSize":30}"#)).unwrap();
+        assert!(parsed.is_object());
+        assert_eq!(parsed["code"], "w001");
+        assert_eq!(parsed["pageSize"], 30);
+    }
+
+    #[test]
+    fn test_parse_json_like_value_arrow_object() {
+        let parsed =
+            parse_json_like_value(&json!(r#""code"=>"w001","pageSize"=>30,"page"=>1"#)).unwrap();
+        assert!(parsed.is_object());
+        assert_eq!(parsed["code"], "w001");
+        assert_eq!(parsed["pageSize"], 30);
+        assert_eq!(parsed["page"], 1);
+    }
+
+    #[test]
+    fn test_parse_json_like_value_query_params_string() {
+        let parsed =
+            parse_json_like_value(&json!(r#"page=>1,pageSize=>30,keyword=>kimi"#)).unwrap();
+        assert!(parsed.is_object());
+        assert_eq!(parsed["page"], 1);
+        assert_eq!(parsed["pageSize"], 30);
+        assert_eq!(parsed["keyword"], "kimi");
+    }
+
+    #[test]
+    fn test_parse_json_like_value_form_json_string() {
+        let parsed = parse_json_like_value(&json!(r#"{"code":"w001","pageSize":30}"#)).unwrap();
+        assert!(parsed.is_object());
+        assert_eq!(parsed["code"], "w001");
+        assert_eq!(parsed["pageSize"], 30);
     }
 }

@@ -1,4 +1,7 @@
-use blockcell_core::{Config, Paths};
+use blockcell_core::{
+    config::{parse_json5_value, stringify_json5_pretty},
+    Config, Paths,
+};
 use serde_json::Value;
 
 /// Show the current configuration as pretty-printed JSON.
@@ -11,7 +14,7 @@ pub async fn show() -> anyhow::Result<()> {
     println!("📋 Current Configuration");
     println!("  File: {}", paths.config_file().display());
     println!();
-    println!("{}", serde_json::to_string_pretty(&json)?);
+    println!("{}", stringify_json5_pretty(&json)?);
     Ok(())
 }
 
@@ -20,7 +23,7 @@ pub async fn schema() -> anyhow::Result<()> {
     let schema = serde_json::json!({
         "$schema": "http://json-schema.org/draft-07/schema#",
         "title": "BlockcellConfig",
-        "description": "blockcell configuration file (~/.blockcell/config.json)",
+        "description": "blockcell configuration file (~/.blockcell/config.json5)",
         "type": "object",
         "properties": {
             "providers": {
@@ -44,7 +47,73 @@ pub async fn schema() -> anyhow::Result<()> {
                             "provider": { "type": "string", "description": "Explicit provider name override" },
                             "evolutionModel": { "type": "string", "description": "Model for self-evolution pipeline" },
                             "evolutionProvider": { "type": "string", "description": "Provider for self-evolution pipeline" },
-                            "maxContextTokens": { "type": "integer", "default": 32000 }
+                            "maxContextTokens": { "type": "integer", "default": 32000 },
+                            "allowedMcpServers": { "type": "array", "items": { "type": "string" }, "description": "MCP server allowlist for this agent" },
+                            "allowedMcpTools": { "type": "array", "items": { "type": "string" }, "description": "MCP tool allowlist for this agent" }
+                        }
+                    },
+                    "list": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string" },
+                                "enabled": { "type": "boolean", "default": true },
+                                "name": { "type": "string" },
+                                "intentProfile": { "type": "string", "description": "Intent router profile bound to this agent" },
+                                "allowedMcpServers": { "type": "array", "items": { "type": "string" } },
+                                "allowedMcpTools": { "type": "array", "items": { "type": "string" } }
+                            }
+                        }
+                    }
+                }
+            },
+            "intentRouter": {
+                "type": "object",
+                "description": "Config-driven intent to tool routing",
+                "properties": {
+                    "enabled": { "type": "boolean", "default": true },
+                    "defaultProfile": { "type": "string", "default": "default" },
+                    "agentProfiles": {
+                        "type": "object",
+                        "description": "Legacy compatibility map from agent id to profile id",
+                        "additionalProperties": { "type": "string" }
+                    },
+                    "profiles": {
+                        "type": "object",
+                        "additionalProperties": {
+                            "type": "object",
+                            "properties": {
+                                "coreTools": {
+                                    "type": "array",
+                                    "items": { "type": "string" }
+                                },
+                                "intentTools": {
+                                    "type": "object",
+                                    "additionalProperties": {
+                                        "oneOf": [
+                                            {
+                                                "type": "array",
+                                                "items": { "type": "string" }
+                                            },
+                                            {
+                                                "type": "object",
+                                                "properties": {
+                                                    "inheritBase": { "type": "boolean", "default": true },
+                                                    "tools": {
+                                                        "type": "array",
+                                                        "items": { "type": "string" }
+                                                    }
+                                                }
+                                            }
+                                        ]
+                                    }
+                                },
+                                "denyTools": {
+                                    "type": "array",
+                                    "items": { "type": "string" }
+                                }
+                            }
                         }
                     }
                 }
@@ -174,14 +243,18 @@ pub async fn get(key: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn parse_config_cli_value(value: &str) -> Value {
+    parse_json5_value(value).unwrap_or_else(|_| Value::String(value.to_string()))
+}
+
 /// Set a config value by dot-separated key path.
 pub async fn set(key: &str, value: &str) -> anyhow::Result<()> {
     let paths = Paths::new();
     let config = Config::load_or_default(&paths)?;
     let mut json = serde_json::to_value(&config)?;
 
-    // Try to parse value as JSON, fall back to string
-    let parsed: Value = serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_string()));
+    // Try to parse value as JSON5, fall back to plain string.
+    let parsed: Value = parse_config_cli_value(value);
 
     set_json_path(&mut json, key, parsed.clone());
 
@@ -262,7 +335,7 @@ pub async fn providers() -> anyhow::Result<()> {
         let key_display = if has_key {
             let key = &provider.api_key;
             if key.len() > 8 {
-                format!("{}...{}", &key[..4], &key[key.len()-4..])
+                format!("{}...{}", &key[..4], &key[key.len() - 4..])
             } else {
                 "(set)".to_string()
             }
@@ -309,7 +382,10 @@ pub async fn reset(force: bool) -> anyhow::Result<()> {
 
     let config = Config::default();
     config.save(&paths.config_file())?;
-    println!("✓ Config reset to defaults: {}", paths.config_file().display());
+    println!(
+        "✓ Config reset to defaults: {}",
+        paths.config_file().display()
+    );
     Ok(())
 }
 
@@ -370,4 +446,22 @@ fn to_camel_case(s: &str) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_config_cli_value_accepts_json5_objects() {
+        let value = parse_config_cli_value("{ enabled: true, models: ['gpt-4o',], }");
+        assert_eq!(value["enabled"], serde_json::json!(true));
+        assert_eq!(value["models"][0], serde_json::json!("gpt-4o"));
+    }
+
+    #[test]
+    fn test_parse_config_cli_value_falls_back_to_plain_string() {
+        let value = parse_config_cli_value("deepseek-chat");
+        assert_eq!(value, serde_json::json!("deepseek-chat"));
+    }
 }

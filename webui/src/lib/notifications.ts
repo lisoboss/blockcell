@@ -14,7 +14,7 @@ export async function requestNotificationPermission(): Promise<boolean> {
   return permissionGranted;
 }
 
-export function sendNotification(title: string, body: string, options?: { tag?: string; icon?: string }) {
+export function sendNotification(title: string, body: string, options?: { tag?: string; icon?: string; onClick?: () => void }) {
   if (!('Notification' in window)) return;
   if (Notification.permission !== 'granted') return;
   // Don't notify if window is focused
@@ -45,6 +45,15 @@ export function notifyAlertTriggered(alertName: string, value?: number) {
     'Alert Triggered',
     `${alertName}${value !== undefined ? ` — Value: ${value}` : ''}`,
     { tag: `alert-${alertName}` }
+  );
+}
+
+export function notifySystemEvent(title: string, body: string, priority?: string) {
+  const icon = priority === 'Critical' ? '🚨' : priority === 'High' ? '⚠️' : '📋';
+  sendNotification(
+    `${icon} ${title}`,
+    body,
+    { tag: `system-event-${Date.now()}` }
   );
 }
 

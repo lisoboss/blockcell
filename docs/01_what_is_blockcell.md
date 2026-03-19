@@ -1,7 +1,6 @@
 # 第01篇：什么是 blockcell？一个会自我进化的 AI 智能体框架
 
-> 系列文章：《blockcell 开源项目深度解析》第 1/14 篇
-
+> 系列文章：《blockcell 开源项目深度解析》第 1 篇
 ---
 
 ## 先说一个场景
@@ -166,7 +165,7 @@ curl -fsSL https://raw.githubusercontent.com/blockcell-labs/blockcell/refs/heads
 blockcell onboard
 
 # 编辑配置，填入你的 API Key
-# ~/.blockcell/config.json
+# ~/.blockcell/config.json5
 
 # 启动对话
 blockcell agent

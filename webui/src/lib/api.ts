@@ -7,6 +7,18 @@ declare global {
 export const API_BASE =
   (typeof window !== 'undefined' && window.BLOCKCELL_API_BASE) || import.meta.env.VITE_API_BASE || 'http://localhost:18790';
 
+
+function buildQuery(params?: Record<string, string | number | undefined | null>) {
+  const qs = new URLSearchParams();
+  for (const [key, value] of Object.entries(params || {})) {
+    if (value !== undefined && value !== null && value !== '') {
+      qs.set(key, String(value));
+    }
+  }
+  const suffix = qs.toString();
+  return suffix ? `?${suffix}` : '';
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const url = `${API_BASE}/v1${path}`;
   const token = localStorage.getItem('blockcell_token');
@@ -23,6 +35,13 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     throw new Error(`API ${res.status}: ${text}`);
   }
   return res.json();
+}
+
+function ensureStatusOk<T extends { status?: string; message?: string }>(result: T): T {
+  if (result?.status === 'error') {
+    throw new Error(result.message || 'Request failed');
+  }
+  return result;
 }
 
 // Auth
@@ -42,10 +61,10 @@ export function logout() {
 }
 
 // P0: Chat
-export function sendChat(content: string, chatId = 'default', media: string[] = []) {
-  return request<{ status: string; message: string }>('/chat', {
+export function sendChat(content: string, chatId?: string, media: string[] = [], agentId?: string) {
+  return request<{ status: string; message: string; session_id: string }>('/chat', {
     method: 'POST',
-    body: JSON.stringify({ content, chat_id: chatId, channel: 'ws', media }),
+    body: JSON.stringify({ content, chat_id: chatId, channel: 'ws', media, agent_id: agentId }),
   });
 }
 
@@ -55,33 +74,35 @@ export function getHealth() {
 }
 
 // P0: Tasks
-export function getTasks() {
-  return request<{ queued: number; running: number; completed: number; failed: number; tasks: any[] }>('/tasks');
+export function getTasks(agentId?: string) {
+  return request<{ queued: number; running: number; completed: number; failed: number; tasks: any[] }>(`/tasks${buildQuery({ agent: agentId })}`);
 }
 
 // P0: Sessions
-export function getSessions() {
-  return request<{ sessions: SessionInfo[]; next_cursor: number | null; total: number }>('/sessions');
+export function getSessions(agentId?: string) {
+  return request<{ sessions: SessionInfo[]; next_cursor: number | null; total: number }>(`/sessions${buildQuery({ agent: agentId })}`);
 }
 
-export function getSessionsPage(params?: { limit?: number; cursor?: number }) {
-  const qs = new URLSearchParams();
-  if (params?.limit !== undefined) qs.set('limit', String(params.limit));
-  if (params?.cursor !== undefined) qs.set('cursor', String(params.cursor));
-  const suffix = qs.toString();
-  return request<{ sessions: SessionInfo[]; next_cursor: number | null; total: number }>(`/sessions${suffix ? `?${suffix}` : ''}`);
+export function getSessionsPage(params?: { limit?: number; cursor?: number; agent?: string }) {
+  return request<{ sessions: SessionInfo[]; next_cursor: number | null; total: number }>(`/sessions${buildQuery({ limit: params?.limit, cursor: params?.cursor, agent: params?.agent })}`);
 }
 
-export function getSession(id: string) {
-  return request<{ session_id: string; messages: ChatMsg[] }>(`/sessions/${id}`);
+export function getSession(id: string, agentId?: string) {
+  return request<{ session_id: string; messages: ChatMsg[] }>(`/sessions/${id}${buildQuery({ agent: agentId })}`)
+    .catch((error: Error) => {
+      if (error.message.startsWith('API 404:')) {
+        return { session_id: id, messages: [] };
+      }
+      throw error;
+    });
 }
 
-export function deleteSession(id: string) {
-  return request<{ status: string }>(`/sessions/${id}`, { method: 'DELETE' });
+export function deleteSession(id: string, agentId?: string) {
+  return request<{ status: string }>(`/sessions/${id}${buildQuery({ agent: agentId })}`, { method: 'DELETE' });
 }
 
-export function renameSession(id: string, name: string) {
-  return request<{ status: string }>(`/sessions/${id}/rename`, {
+export function renameSession(id: string, name: string, agentId?: string) {
+  return request<{ status: string }>(`/sessions/${id}/rename${buildQuery({ agent: agentId })}`, {
     method: 'PUT',
     body: JSON.stringify({ name }),
   });
@@ -99,39 +120,45 @@ export function updateConfig(config: any) {
   });
 }
 
-export function testProvider(params: { model: string; api_key: string; api_base?: string; proxy?: string }) {
+export function getConfigRaw() {
+  return request<{ status: string; content: string; path: string }>('/config/raw').then(ensureStatusOk);
+}
+
+export function updateConfigRaw(content: string) {
+  return request<{ status: string; message: string }>('/config/raw', {
+    method: 'PUT',
+    body: JSON.stringify({ content }),
+  }).then(ensureStatusOk);
+}
+
+export function testProvider(params: { model?: string; api_key?: string; api_base?: string; proxy?: string; content?: string; provider?: string }) {
   return request<{ status: string; message: string }>('/config/test-provider', {
     method: 'POST',
     body: JSON.stringify(params),
-  });
+  }).then(ensureStatusOk);
 }
 
 export function reloadConfig() {
   return request<{ status: string; message: string }>('/config/reload', {
     method: 'POST',
-  });
+  }).then(ensureStatusOk);
 }
 
 // P1: Memory
-export function getMemories(params?: { q?: string; scope?: string; type?: string; limit?: number }) {
-  const qs = new URLSearchParams();
-  if (params?.q) qs.set('q', params.q);
-  if (params?.scope) qs.set('scope', params.scope);
-  if (params?.type) qs.set('type', params.type);
-  if (params?.limit) qs.set('limit', String(params.limit));
-  return request<any>(`/memory?${qs}`);
+export function getMemories(params?: { q?: string; scope?: string; type?: string; limit?: number; agent?: string }) {
+  return request<any>(`/memory${buildQuery({ q: params?.q, scope: params?.scope, type: params?.type, limit: params?.limit, agent: params?.agent })}`);
 }
 
-export function createMemory(data: any) {
-  return request<any>('/memory', { method: 'POST', body: JSON.stringify(data) });
+export function createMemory(data: any, agentId?: string) {
+  return request<any>(`/memory${buildQuery({ agent: agentId })}`, { method: 'POST', body: JSON.stringify(data) });
 }
 
-export function deleteMemory(id: string) {
-  return request<any>(`/memory/${id}`, { method: 'DELETE' });
+export function deleteMemory(id: string, agentId?: string) {
+  return request<any>(`/memory/${id}${buildQuery({ agent: agentId })}`, { method: 'DELETE' });
 }
 
-export function getMemoryStats() {
-  return request<any>('/memory/stats');
+export function getMemoryStats(agentId?: string) {
+  return request<any>(`/memory/stats${buildQuery({ agent: agentId })}`);
 }
 
 // P1: Tools / Skills / Evolution / Stats
@@ -204,20 +231,20 @@ export function getStats() {
 }
 
 // P1: Cron
-export function getCronJobs() {
-  return request<{ jobs: any[]; count: number }>('/cron');
+export function getCronJobs(agentId?: string) {
+  return request<{ jobs: any[]; count: number }>(`/cron${buildQuery({ agent: agentId })}`);
 }
 
-export function createCronJob(data: any) {
-  return request<any>('/cron', { method: 'POST', body: JSON.stringify(data) });
+export function createCronJob(data: any, agentId?: string) {
+  return request<any>(`/cron${buildQuery({ agent: agentId })}`, { method: 'POST', body: JSON.stringify(data) });
 }
 
-export function deleteCronJob(id: string) {
-  return request<any>(`/cron/${id}`, { method: 'DELETE' });
+export function deleteCronJob(id: string, agentId?: string) {
+  return request<any>(`/cron/${id}${buildQuery({ agent: agentId })}`, { method: 'DELETE' });
 }
 
-export function runCronJob(id: string) {
-  return request<any>(`/cron/${id}/run`, { method: 'POST' });
+export function runCronJob(id: string, agentId?: string) {
+  return request<any>(`/cron/${id}/run${buildQuery({ agent: agentId })}`, { method: 'POST' });
 }
 
 // P2: Alerts
@@ -269,28 +296,28 @@ export function updateToggle(category: 'skills' | 'tools', name: string, enabled
 }
 
 // P2: Files
-export function getFiles(path = '.') {
-  return request<{ path: string; entries: FileEntry[]; count: number }>(`/files?path=${encodeURIComponent(path)}`);
+export function getFiles(path = '.', agentId?: string) {
+  return request<{ path: string; entries: FileEntry[]; count: number }>(`/files${buildQuery({ path, agent: agentId })}`);
 }
 
-export function getFileContent(path: string) {
-  return request<FileContent>(`/files/content?path=${encodeURIComponent(path)}`);
+export function getFileContent(path: string, agentId?: string) {
+  return request<FileContent>(`/files/content${buildQuery({ path, agent: agentId })}`);
 }
 
-export function downloadFileUrl(path: string) {
+export function downloadFileUrl(path: string, agentId?: string) {
   const token = localStorage.getItem('blockcell_token');
-  const base = `${API_BASE}/v1/files/download?path=${encodeURIComponent(path)}`;
+  const base = `${API_BASE}/v1/files/download${buildQuery({ path, agent: agentId })}`;
   return token ? `${base}&token=${token}` : base;
 }
 
-export function mediaFileUrl(path: string) {
+export function mediaFileUrl(path: string, agentId?: string) {
   const token = localStorage.getItem('blockcell_token');
-  const base = `${API_BASE}/v1/files/serve?path=${encodeURIComponent(path)}`;
+  const base = `${API_BASE}/v1/files/serve${buildQuery({ path, agent: agentId })}`;
   return token ? `${base}&token=${token}` : base;
 }
 
-export function uploadFile(path: string, content: string, encoding: 'utf-8' | 'base64' = 'utf-8') {
-  return request<{ status: string; path: string }>('/files/upload', {
+export function uploadFile(path: string, content: string, encoding: 'utf-8' | 'base64' = 'utf-8', agentId?: string) {
+  return request<{ status: string; path: string }>(`/files/upload${buildQuery({ agent: agentId })}`, {
     method: 'POST',
     body: JSON.stringify({ path, content, encoding }),
   });
@@ -450,6 +477,7 @@ export interface PoolEntry {
   provider: string;
   weight: number;
   priority: number;
+  toolCallMode?: 'native' | 'text' | 'none' | 'auto';
 }
 
 export interface PoolStatus {
@@ -543,11 +571,27 @@ export interface ChannelInfo {
   doc: string;
   configured: boolean;
   enabled: boolean;
+  ownerAgent?: string;
+  accountOwners?: Record<string, string>;
+  defaultAccountId?: string;
+  accounts?: string[];
+  listeners?: string[];
+  listenerCount?: number;
   fields: ChannelField[];
+}
+
+export interface ChannelRuntimeStatus {
+  name: string;
+  active: boolean;
+  detail: string;
 }
 
 export function getChannels() {
   return request<{ channels: ChannelInfo[] }>('/channels');
+}
+
+export function getChannelsStatus() {
+  return request<{ channels: ChannelRuntimeStatus[] }>('/channels/status');
 }
 
 export function updateChannel(id: string, fields: Record<string, string>, enabled?: boolean) {
@@ -555,6 +599,38 @@ export function updateChannel(id: string, fields: Record<string, string>, enable
     method: 'PUT',
     body: JSON.stringify({ fields, enabled }),
   });
+}
+
+export function setChannelOwner(channel: string, agent: string) {
+  return request<{ status: string; channel: string; agent: string }>(`/channel-owners/${channel}`, {
+    method: 'PUT',
+    body: JSON.stringify({ agent }),
+  });
+}
+
+export function clearChannelOwner(channel: string) {
+  return request<{ status: string; channel: string }>(`/channel-owners/${channel}`, {
+    method: 'DELETE',
+  });
+}
+
+export function setChannelAccountOwner(channel: string, accountId: string, agent: string) {
+  return request<{ status: string; channel: string; accountId: string; agent: string }>(
+    `/channel-owners/${channel}/accounts/${encodeURIComponent(accountId)}`,
+    {
+      method: 'PUT',
+      body: JSON.stringify({ agent }),
+    }
+  );
+}
+
+export function clearChannelAccountOwner(channel: string, accountId: string) {
+  return request<{ status: string; channel: string; accountId: string }>(
+    `/channel-owners/${channel}/accounts/${encodeURIComponent(accountId)}`,
+    {
+      method: 'DELETE',
+    }
+  );
 }
 
 // Hub (community skills)
@@ -576,7 +652,15 @@ export function deleteSkill(name: string) {
 }
 
 export function installExternalSkill(url: string) {
-  return request<{ status: string; skill: string; message: string; skill_dir?: string }>('/skills/install-external', {
+  return request<{
+    status: string;
+    skill: string;
+    message: string;
+    evolution_id?: string;
+    files_downloaded?: number;
+    size_bytes?: number;
+    skill_dir?: string;
+  }>('/skills/install-external', {
     method: 'POST',
     body: JSON.stringify({ url }),
   });

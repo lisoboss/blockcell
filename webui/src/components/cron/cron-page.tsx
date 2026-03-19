@@ -1,8 +1,9 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { Plus, Trash2, Play, RefreshCw, Clock, Loader2, X, CheckCircle2, AlertCircle } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { getCronJobs, createCronJob, deleteCronJob, runCronJob } from '@/lib/api';
 import { useT } from '@/lib/i18n';
+import { useAgentStore } from '@/lib/store';
 
 // ── Toast notification ──
 interface Toast {
@@ -86,6 +87,7 @@ function ConfirmDialog({
 
 export function CronPage() {
   const t = useT();
+  const selectedAgentId = useAgentStore((s) => s.selectedAgentId);
   const [jobs, setJobs] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [showCreate, setShowCreate] = useState(false);
@@ -105,6 +107,9 @@ export function CronPage() {
     variant: 'danger' | 'primary';
     onConfirm: () => void;
   }>({ open: false, title: '', description: '', confirmLabel: '', variant: 'primary', onConfirm: () => {} });
+  const selectedAgentRef = useRef(selectedAgentId);
+
+  selectedAgentRef.current = selectedAgentId;
 
   const addToast = useCallback((type: 'success' | 'error', message: string) => {
     const id = Date.now();
@@ -122,17 +127,23 @@ export function CronPage() {
 
   useEffect(() => {
     fetchJobs();
-  }, []);
+  }, [selectedAgentId]);
 
   async function fetchJobs() {
+    const agentId = selectedAgentId;
     setLoading(true);
     try {
-      const data = await getCronJobs();
+      const data = await getCronJobs(agentId);
+      if (selectedAgentRef.current !== agentId) {
+        return;
+      }
       setJobs(data.jobs || []);
     } catch {
       // ignore
     } finally {
-      setLoading(false);
+      if (selectedAgentRef.current === agentId) {
+        setLoading(false);
+      }
     }
   }
 
@@ -145,7 +156,7 @@ export function CronPage() {
       if (newJob.every_seconds) payload.every_seconds = parseInt(newJob.every_seconds);
       if (newJob.cron_expr) payload.cron_expr = newJob.cron_expr;
       if (newJob.skill_name) payload.skill_name = newJob.skill_name;
-      await createCronJob(payload);
+      await createCronJob(payload, selectedAgentId);
       setShowCreate(false);
       setNewJob({ name: '', message: '', every_seconds: '', cron_expr: '', skill_name: '' });
       fetchJobs();
@@ -165,7 +176,7 @@ export function CronPage() {
       onConfirm: async () => {
         closeConfirm();
         try {
-          await deleteCronJob(id);
+          await deleteCronJob(id, selectedAgentId);
           setJobs((prev) => prev.filter((j) => j.id !== id));
           addToast('success', t('cron.jobDeleted', { name: job?.name || id }));
         } catch (e: any) {
@@ -186,7 +197,7 @@ export function CronPage() {
       onConfirm: async () => {
         closeConfirm();
         try {
-          await runCronJob(id);
+          await runCronJob(id, selectedAgentId);
           addToast('success', t('cron.jobTriggered', { name: job?.name || id }));
         } catch (e: any) {
           addToast('error', e?.message || t('cron.runFailed'));
@@ -311,7 +322,7 @@ export function CronPage() {
                       <span
                         className={cn(
                           'text-[10px] px-1.5 py-0.5 rounded-full',
-                          job.enabled !== false ? 'bg-cyber/10 text-cyber' : 'bg-muted text-muted-foreground'
+                          job.enabled !== false ? 'bg-[hsl(var(--brand-green)/0.10)] text-[hsl(var(--brand-green))]' : 'bg-muted text-muted-foreground'
                         )}
                       >
                         {job.enabled !== false ? 'enabled' : 'disabled'}
@@ -323,7 +334,7 @@ export function CronPage() {
                     )}
                     {job.state?.last_status && (
                       <p className="text-xs mt-1">
-                        Last: <span className={job.state.last_status === 'ok' ? 'text-cyber' : 'text-red-500'}>
+                        Last: <span className={job.state.last_status === 'ok' ? 'text-[hsl(var(--brand-green))]' : 'text-red-500'}>
                           {job.state.last_status}
                         </span>
                         {job.state.last_error && (

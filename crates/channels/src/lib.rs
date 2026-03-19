@@ -1,3 +1,4 @@
+pub mod account;
 pub mod manager;
 pub mod rate_limit;
 mod utils;
@@ -25,5 +26,8 @@ pub mod wecom;
 
 #[cfg(feature = "lark")]
 pub mod lark;
+
+#[cfg(feature = "qq")]
+pub mod qq;
 
 pub use manager::ChannelManager;

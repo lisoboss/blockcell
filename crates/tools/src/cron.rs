@@ -11,7 +11,7 @@ pub struct CronTool;
 
 fn resolve_skill_payload_kind(paths: &Paths, skill_name: Option<&str>) -> &'static str {
     let Some(skill_name) = skill_name else {
-        return "agent_turn";
+        return "rhai";
     };
 
     let user_dir = paths.skills_dir().join(skill_name);
@@ -21,23 +21,12 @@ fn resolve_skill_payload_kind(paths: &Paths, skill_name: Option<&str>) -> &'stat
     let has_py = user_dir.join("SKILL.py").exists() || builtin_dir.join("SKILL.py").exists();
 
     if has_rhai {
-        "skill_rhai"
+        "rhai"
     } else if has_py {
-        "skill_python"
+        "python"
     } else {
-        // Backward compatibility: keep legacy behavior when skill script type is unknown.
-        "skill_rhai"
+        "rhai"
     }
-}
-
-fn execute_cron_action(
-    action: &str,
-    params: &Value,
-    origin_channel: &str,
-    origin_chat_id: &str,
-) -> Result<Value> {
-    let paths = Paths::new();
-    execute_cron_action_with_paths(&paths, action, params, origin_channel, origin_chat_id)
 }
 
 fn execute_cron_action_with_paths(
@@ -98,8 +87,25 @@ fn execute_cron_action_with_paths(
 
             let job_id = Uuid::new_v4().to_string();
 
+            let mode = params.get("mode").and_then(|v| v.as_str());
             let skill_name = params.get("skill_name").and_then(|v| v.as_str());
-            let payload_kind = resolve_skill_payload_kind(paths, skill_name);
+            let payload_kind = match mode {
+                Some("agent") => "agent",
+                Some("script") => "script",
+                Some("reminder") => "reminder",
+                Some(_) | None => {
+                    if skill_name.is_some() {
+                        "script"
+                    } else {
+                        "reminder"
+                    }
+                }
+            };
+            let script_kind = if payload_kind == "script" {
+                skill_name.map(|sn| resolve_skill_payload_kind(paths, Some(sn)))
+            } else {
+                None
+            };
 
             let deliver = !matches!(origin_channel, "cli" | "cron" | "ghost" | "");
             let mut payload = json!({
@@ -109,6 +115,9 @@ fn execute_cron_action_with_paths(
                 "channel": origin_channel,
                 "to": origin_chat_id
             });
+            if let Some(kind) = script_kind {
+                payload["scriptKind"] = json!(kind);
+            }
             if let Some(sn) = skill_name {
                 payload["skillName"] = json!(sn);
             }
@@ -227,10 +236,7 @@ fn load_store(paths: &Paths) -> Result<JobStore> {
         return Ok(JobStore::default());
     }
     let content = std::fs::read_to_string(&path)?;
-    let store: JobStore = match serde_json::from_str(&content) {
-        Ok(store) => store,
-        Err(_) => JobStore::default(),
-    };
+    let store: JobStore = serde_json::from_str(&content).unwrap_or_default();
     Ok(store)
 }
 
@@ -249,7 +255,7 @@ impl Tool for CronTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "cron",
-            description: "Manage scheduled tasks (cron jobs). Use this to set reminders, schedule recurring tasks, or run one-time delayed tasks. The agent's CronService will pick up changes automatically.",
+            description: "Manage scheduled tasks (cron jobs). You MUST provide `action`. action='add': requires `name` + `message` and exactly one schedule field from `delay_seconds`, `at_ms`, `every_seconds`, or `cron_expr`; optional `delete_after_run`, `mode`, and `skill_name`. action='list': no extra params. action='remove': requires `job_id`.",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -286,18 +292,27 @@ impl Tool for CronTool {
                         "type": "boolean",
                         "description": "(add) If true, the job will be deleted after it runs once. Default false (job is disabled instead)."
                     },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["reminder", "script", "agent"],
+                        "description": "(add) Optional execution mode. `reminder` sends fixed text directly. `script` directly runs a skill script and requires `skill_name`. `agent` sends the message into the normal agent LLM/tool loop so it can call tools like web_search. If omitted, defaults to `script` when `skill_name` is provided, otherwise `reminder`."
+                    },
                     "job_id": {
                         "type": "string",
                         "description": "(remove) The job ID (or prefix) to remove"
                     },
                     "skill_name": {
                         "type": "string",
-                        "description": "(add) If set, the cron job will directly execute the named skill script (SKILL.rhai or SKILL.py) instead of going through the LLM. E.g. 'stock_monitor', 'daily_finance_report'."
+                        "description": "(add) Optional. Used with `mode='script'` to directly execute the named skill script (SKILL.rhai or SKILL.py). E.g. 'stock_monitor', 'daily_finance_report'."
                     }
                 },
                 "required": ["action"]
             }),
         }
+    }
+
+    fn prompt_rule(&self, _ctx: &crate::PromptContext) -> Option<String> {
+        Some("- **定时任务 (cron)**: 用户要求定时执行某项任务时，先判断执行模式。**纯提醒**（如起床提醒、喝水提醒）用 `mode='reminder'`，`message` 直接写最终发给用户的话，不要写成待分析任务；触发时会直接发送，不经过 LLM。若任务需要真正执行某个技能脚本，先调用 `list_skills` 查找技能，再用 `mode='script'` 并设置 `skill_name='...'`。若任务本身就是一段需要模型理解、调用工具、再整理结果的指令（如定时搜索新闻、抓取网页、汇总情报），用 `mode='agent'`，这样触发时会进入正常 agent LLM/tool loop。`mode` 省略时：有 `skill_name` 默认 `script`，否则默认 `reminder`。 [TIMEZONE] `cron_expr` 使用 UTC 时间，中国用户（UTC+8）说每天 9 点应填 `cron_expr='0 0 1 * * *'`（UTC 1:00 = 北京时间 9:00）。一次性任务设 `delete_after_run=true`；周期任务用 `cron_expr` 或 `every_seconds`。".to_string())
     }
 
     fn validate(&self, params: &Value) -> Result<()> {
@@ -328,6 +343,23 @@ impl Tool for CronTool {
                             .to_string(),
                     ));
                 }
+                let mode = params.get("mode").and_then(|v| v.as_str());
+                match mode {
+                    Some("reminder") | Some("script") | Some("agent") | None => {}
+                    Some(other) => {
+                        return Err(Error::Validation(format!(
+                            "Invalid mode for add: {}",
+                            other
+                        )));
+                    }
+                }
+                if matches!(mode, Some("script"))
+                    && params.get("skill_name").and_then(|v| v.as_str()).is_none()
+                {
+                    return Err(Error::Validation(
+                        "mode='script' requires skill_name".to_string(),
+                    ));
+                }
             }
             "list" => {}
             "remove" => {
@@ -349,8 +381,21 @@ impl Tool for CronTool {
         let action = params["action"].as_str().unwrap().to_string();
         let origin_channel = ctx.channel.clone();
         let origin_chat_id = ctx.chat_id.clone();
+        // Derive agent-specific paths from the workspace directory.
+        // ctx.workspace = <base>/workspace, so parent() = <base> (e.g. ~/.blockcell/agents/<id>).
+        let paths = if let Some(base) = ctx.workspace.parent() {
+            Paths::with_base(base.to_path_buf())
+        } else {
+            Paths::new()
+        };
         tokio::task::spawn_blocking(move || {
-            execute_cron_action(&action, &params, &origin_channel, &origin_chat_id)
+            execute_cron_action_with_paths(
+                &paths,
+                &action,
+                &params,
+                &origin_channel,
+                &origin_chat_id,
+            )
         })
         .await
         .map_err(|e| Error::Tool(format!("Cron task failed: {}", e)))?
@@ -369,7 +414,12 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        root.push(format!("blockcell_cron_tool_{}_{}_{}", tag, std::process::id(), now_ns));
+        root.push(format!(
+            "blockcell_cron_tool_{}_{}_{}",
+            tag,
+            std::process::id(),
+            now_ns
+        ));
         std::fs::create_dir_all(&root).expect("create temp cron dir");
         Paths::with_base(root)
     }
@@ -401,6 +451,53 @@ mod tests {
             "12345",
         );
         assert!(r.is_ok(), "unexpected error: {:?}", r.err());
+        let _ = std::fs::remove_dir_all(paths.base);
+    }
+
+    #[test]
+    fn test_cron_validate_add_agent_mode() {
+        let tool = CronTool;
+        assert!(tool
+            .validate(&json!({
+                "action": "add", "name": "test", "message": "search latest news", "delay_seconds": 60, "mode": "agent"
+            }))
+            .is_ok());
+    }
+
+    #[test]
+    fn test_cron_validate_add_script_mode_requires_skill_name() {
+        let tool = CronTool;
+        assert!(tool
+            .validate(&json!({
+                "action": "add", "name": "test", "message": "run job", "delay_seconds": 60, "mode": "script"
+            }))
+            .is_err());
+    }
+
+    #[test]
+    fn test_cron_add_agent_mode_persists_agent_payload() {
+        let paths = temp_paths("agent");
+        let r = execute_cron_action_with_paths(
+            &paths,
+            "add",
+            &json!({
+                "name": "agent-task",
+                "message": "请搜索美国伊朗最新新闻并总结",
+                "delay_seconds": 60,
+                "mode": "agent"
+            }),
+            "telegram",
+            "12345",
+        );
+        assert!(r.is_ok(), "unexpected error: {:?}", r.err());
+
+        let store = load_store(&paths).expect("load cron store");
+        let payload_kind = store.jobs[0]
+            .get("payload")
+            .and_then(|v| v.get("kind"))
+            .and_then(|v| v.as_str());
+        assert_eq!(payload_kind, Some("agent"));
+
         let _ = std::fs::remove_dir_all(paths.base);
     }
 

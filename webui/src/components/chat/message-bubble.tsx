@@ -1,11 +1,11 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, memo } from 'react';
 import { User, Bot, ChevronDown, ChevronRight, Clock, Check, AlertCircle } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import type { UiMessage, ToolCallInfo } from '@/lib/store';
 import { MarkdownContent } from './markdown-content';
 import { MediaList, extractMediaPaths, isMediaPath } from './media-attachment';
 
-export function MessageBubble({ message }: { message: UiMessage }) {
+export const MessageBubble = memo(function MessageBubble({ message }: { message: UiMessage }) {
   const isUser = message.role === 'user';
   const isTool = message.role === 'tool';
 
@@ -17,14 +17,17 @@ export function MessageBubble({ message }: { message: UiMessage }) {
   }, [message.media, message.content]);
 
   return (
-    <div className={cn('flex gap-3', isUser ? 'flex-row-reverse' : 'flex-row')}>
+    <div
+      data-highlighted-message={message.highlight ? 'true' : 'false'}
+      className={cn('flex gap-3 scroll-mt-24', isUser ? 'flex-row-reverse' : 'flex-row')}
+    >
       {/* Avatar */}
       <div
         className={cn(
           'w-8 h-8 rounded-full flex items-center justify-center shrink-0 border',
           isUser
             ? 'bg-rust/10 border-rust/40 text-rust'
-            : 'bg-card border-cyber/30 text-cyber'
+            : 'bg-card border-[hsl(var(--brand-green)/0.28)] text-[hsl(var(--brand-green))]'
         )}
       >
         {isUser ? <User size={16} /> : <Bot size={16} />}
@@ -57,14 +60,17 @@ export function MessageBubble({ message }: { message: UiMessage }) {
         {message.content && (
           <div
             className={cn(
-              'rounded-lg px-4 py-2.5 text-sm',
+              'rounded-lg px-4 py-2.5 text-sm transition-all',
               isUser
                 ? 'bg-rust/10 border border-rust/30 text-rust-light rounded-br-sm'
-                : 'bg-card border border-cyber/20 rounded-bl-sm'
+                : 'bg-card border border-[hsl(var(--brand-green)/0.20)] rounded-bl-sm',
+              message.highlight && !isUser && 'ring-2 ring-amber-400/80 border-amber-400/80 bg-amber-50/10'
             )}
           >
             {isUser ? (
               <p className="whitespace-pre-wrap">{message.content}</p>
+            ) : message.streaming ? (
+              <p className="whitespace-pre-wrap text-sm leading-7">{message.content}</p>
             ) : (
               <MarkdownContent content={message.content} />
             )}
@@ -73,19 +79,19 @@ export function MessageBubble({ message }: { message: UiMessage }) {
 
         {/* Streaming indicator */}
         {message.streaming && (
-          <span className="inline-block w-2 h-4 bg-cyber/60 animate-pulse rounded-sm" />
+          <span className="inline-block w-2 h-4 bg-[hsl(var(--brand-green)/0.60)] animate-pulse rounded-sm" />
         )}
       </div>
     </div>
   );
-}
+});
 
 function ToolCallCard({ toolCall }: { toolCall: ToolCallInfo }) {
   const [isOpen, setIsOpen] = useState(false);
 
   const statusIcon = {
     running: <Clock size={14} className="text-yellow-500 animate-spin" />,
-    done: <Check size={14} className="text-green-500" />,
+    done: <Check size={14} className="text-[hsl(var(--success))]" />,
     error: <AlertCircle size={14} className="text-red-500" />,
   }[toolCall.status];
 

@@ -3,7 +3,9 @@ use blockcell_core::{Config, InboundMessage, Paths};
 use blockcell_skills::evolution::EvolutionRecord;
 use blockcell_skills::is_builtin_tool;
 use blockcell_storage::MemoryStore;
-use blockcell_tools::ToolRegistry;
+use blockcell_tools::build_tool_registry_for_agent_config;
+use blockcell_tools::mcp::manager::McpManager;
+use std::sync::Arc;
 
 /// List all skill evolution records.
 pub async fn list(all: bool, enabled_only: bool) -> anyhow::Result<()> {
@@ -261,13 +263,11 @@ pub async fn set_enabled(name: &str, enable: bool) -> anyhow::Result<()> {
         } else {
             println!("  Skill '{}' is already enabled.", name);
         }
+    } else if !marker.exists() {
+        std::fs::write(&marker, "")?;
+        println!("⏸  Skill '{}' disabled.", name);
     } else {
-        if !marker.exists() {
-            std::fs::write(&marker, "")?;
-            println!("⏸  Skill '{}' disabled.", name);
-        } else {
-            println!("  Skill '{}' is already disabled.", name);
-        }
+        println!("  Skill '{}' is already disabled.", name);
     }
     Ok(())
 }
@@ -388,9 +388,9 @@ pub async fn learn(description: &str) -> anyhow::Result<()> {
     let provider_pool = blockcell_providers::ProviderPool::from_config(&config)?;
 
     // Create runtime
-    let tool_registry = ToolRegistry::with_defaults();
+    let mcp_manager = Arc::new(McpManager::load(&paths).await?);
+    let tool_registry = build_tool_registry_for_agent_config(&config, Some(&mcp_manager)).await?;
     let mut runtime = AgentRuntime::new(config, paths.clone(), provider_pool, tool_registry)?;
-    runtime.mount_mcp_servers().await;
 
     // Optionally wire up memory store
     let memory_db_path = paths.memory_dir().join("memory.db");
@@ -413,6 +413,7 @@ pub async fn learn(description: &str) -> anyhow::Result<()> {
 
     let inbound = InboundMessage {
         channel: "cli".to_string(),
+        account_id: None,
         sender_id: "user".to_string(),
         chat_id: "default".to_string(),
         content: learn_msg,
@@ -572,24 +573,36 @@ pub async fn test(path: &str, input: Option<String>, verbose: bool) -> anyhow::R
         fail += 1;
     } else {
         let meta_str = std::fs::read_to_string(&meta_path)?;
-        // Basic structural check: required keys
-        let required = ["name:", "description:", "triggers:", "capabilities:"];
-        let missing: Vec<&str> = required
-            .iter()
-            .filter(|k| !meta_str.contains(*k))
-            .copied()
-            .collect();
-        if missing.is_empty() {
-            println!("✅ OK");
-            pass += 1;
-            if verbose {
-                for line in meta_str.lines().take(6) {
-                    println!("            {}", line);
+        match serde_yaml::from_str::<serde_json::Value>(&meta_str) {
+            Ok(meta) => {
+                let required = ["name", "description"];
+                let missing: Vec<&str> = required
+                    .iter()
+                    .filter(|key| {
+                        meta.get(**key)
+                            .and_then(|value| value.as_str())
+                            .map(|value| value.trim().is_empty())
+                            .unwrap_or(true)
+                    })
+                    .copied()
+                    .collect();
+                if missing.is_empty() {
+                    println!("✅ OK");
+                    pass += 1;
+                    if verbose {
+                        for line in meta_str.lines().take(8) {
+                            println!("            {}", line);
+                        }
+                    }
+                } else {
+                    println!("❌ Missing required fields: {}", missing.join(", "));
+                    fail += 1;
                 }
             }
-        } else {
-            println!("❌ Missing keys: {}", missing.join(", "));
-            fail += 1;
+            Err(err) => {
+                println!("❌ Invalid YAML: {}", err);
+                fail += 1;
+            }
         }
     }
 
