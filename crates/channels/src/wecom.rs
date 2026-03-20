@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tracing::{debug, error, info, warn};
 
@@ -25,10 +25,20 @@ static SEEN_MSG_IDS: std::sync::LazyLock<Mutex<HashSet<String>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// Outbound message for the long connection WebSocket channel.
-#[derive(Debug)]
 enum LongConnOutbound {
     /// Plain text reply (stream msgtype).
     Text { chat_id: String, content: String },
+    /// Media message: upload file via chunked WS protocol, then send via aibot_send_msg.
+    Media {
+        chat_id: String,
+        file_path: String,
+        /// WeCom media type: image / voice / video / file
+        media_type: String,
+        /// Optional title (for video messages).
+        title: String,
+        /// Oneshot to return the result (Ok media_id or Err) back to the caller.
+        result_tx: tokio::sync::oneshot::Sender<Result<String>>,
+    },
 }
 
 /// Registry of active long connection outbound senders keyed by bot_id.
@@ -412,75 +422,106 @@ impl WeComChannel {
         ));
         ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+        // Media uploads need exclusive access to both write+read, which conflicts
+        // with the tokio::select! borrow rules. We use a LoopAction enum to break out
+        // of the select when a media upload is needed, handle it with full access to
+        // both halves, then re-enter the select loop.
+        enum LoopAction {
+            Continue,
+            Break(Result<()>),
+            MediaUpload {
+                chat_id: String,
+                file_path: String,
+                media_type: String,
+                title: String,
+                result_tx: oneshot::Sender<Result<String>>,
+            },
+        }
+
         let result = loop {
-            tokio::select! {
+            let action: LoopAction = tokio::select! {
                 _ = ping.tick() => {
                     if let Err(e) = write.send(WsMessage::Text("{\"cmd\":\"ping\"}".to_string())).await {
-                        break Err(Error::Channel(format!("WeCom ping failed: {}", e)));
+                        LoopAction::Break(Err(Error::Channel(format!("WeCom ping failed: {}", e))))
+                    } else {
+                        LoopAction::Continue
                     }
                 }
                 outbound = outbound_rx.recv() => {
-                    if let Some(outbound_msg) = outbound {
-                        let chat_id = match &outbound_msg {
-                            LongConnOutbound::Text { chat_id, .. } => chat_id.clone(),
-                        };
-                        // Echo back the original req_id so WeCom routes the reply correctly.
-                        let req_id = {
-                            let reg = CHAT_REQID_REGISTRY.lock().unwrap();
-                            reg.get(&chat_id)
-                                .cloned()
-                                .unwrap_or_else(|| format!("blockcell-out-{}", chrono::Utc::now().timestamp_millis()))
-                        };
-                        let stream_id = format!("blockcell-s-{}", chrono::Utc::now().timestamp_millis());
-                        let msg = match outbound_msg {
-                            LongConnOutbound::Text { content, .. } => {
-                                info!(chat_id = %chat_id, req_id = %req_id, content_len = content.len(), "WeCom longconn: sending text reply");
-                                serde_json::json!({
-                                    "cmd": "aibot_respond_msg",
-                                    "headers": { "req_id": req_id },
-                                    "body": {
-                                        "msgtype": "stream",
-                                        "stream": { "id": stream_id, "finish": true, "content": content }
-                                    }
-                                })
+                    match outbound {
+                        Some(LongConnOutbound::Text { chat_id, content }) => {
+                            let req_id = {
+                                let reg = CHAT_REQID_REGISTRY.lock().unwrap();
+                                reg.get(&chat_id)
+                                    .cloned()
+                                    .unwrap_or_else(|| format!("blockcell-out-{}", chrono::Utc::now().timestamp_millis()))
+                            };
+                            let stream_id = format!("blockcell-s-{}", chrono::Utc::now().timestamp_millis());
+                            info!(chat_id = %chat_id, req_id = %req_id, content_len = content.len(), "WeCom longconn: sending text reply");
+                            let msg = serde_json::json!({
+                                "cmd": "aibot_respond_msg",
+                                "headers": { "req_id": req_id },
+                                "body": {
+                                    "msgtype": "stream",
+                                    "stream": { "id": stream_id, "finish": true, "content": content }
+                                }
+                            });
+                            let msg_str = msg.to_string();
+                            info!(payload = %msg_str, "WeCom longconn: outbound WS payload");
+                            if let Err(e) = write.send(WsMessage::Text(msg_str)).await {
+                                warn!(error = %e, "WeCom longconn: failed to send outbound reply");
                             }
-                        };
-                        let msg_str = msg.to_string();
-                        info!(payload = %msg_str, "WeCom longconn: outbound WS payload");
-                        if let Err(e) = write.send(WsMessage::Text(msg_str)).await {
-                            warn!(error = %e, "WeCom longconn: failed to send outbound reply");
+                            LoopAction::Continue
                         }
+                        Some(LongConnOutbound::Media { chat_id, file_path, media_type, title, result_tx }) => {
+                            LoopAction::MediaUpload { chat_id, file_path, media_type, title, result_tx }
+                        }
+                        None => LoopAction::Continue,
                     }
                 }
                 msg = read.next() => {
                     match msg {
                         Some(Ok(WsMessage::Text(text))) => {
-                            if let Err(e) = self.handle_long_connection_message(&text, &mut write).await {
-                                break Err(e);
+                            match self.handle_long_connection_message(&text, &mut write).await {
+                                Ok(()) => LoopAction::Continue,
+                                Err(e) => LoopAction::Break(Err(e)),
                             }
                         }
                         Some(Ok(WsMessage::Binary(data))) => {
                             let text = String::from_utf8_lossy(&data).to_string();
-                            if let Err(e) = self.handle_long_connection_message(&text, &mut write).await {
-                                break Err(e);
+                            match self.handle_long_connection_message(&text, &mut write).await {
+                                Ok(()) => LoopAction::Continue,
+                                Err(e) => LoopAction::Break(Err(e)),
                             }
                         }
                         Some(Ok(WsMessage::Ping(data))) => {
-                            if let Err(e) = write.send(WsMessage::Pong(data)).await {
-                                break Err(Error::Channel(format!("WeCom pong failed: {}", e)));
+                            match write.send(WsMessage::Pong(data)).await {
+                                Ok(()) => LoopAction::Continue,
+                                Err(e) => LoopAction::Break(Err(Error::Channel(format!("WeCom pong failed: {}", e)))),
                             }
                         }
-                        Some(Ok(WsMessage::Pong(_))) => {}
+                        Some(Ok(WsMessage::Pong(_))) => LoopAction::Continue,
                         Some(Ok(WsMessage::Close(frame))) => {
                             info!(?frame, "WeCom long connection closed by server");
-                            break Ok(());
+                            LoopAction::Break(Ok(()))
                         }
                         Some(Err(e)) => {
-                            break Err(Error::Channel(format!("WeCom WebSocket read failed: {}", e)));
+                            LoopAction::Break(Err(Error::Channel(format!("WeCom WebSocket read failed: {}", e))))
                         }
-                        None => break Ok(()),
-                        _ => {}
+                        None => LoopAction::Break(Ok(())),
+                        _ => LoopAction::Continue,
                     }
+                }
+            };
+
+            match action {
+                LoopAction::Continue => continue,
+                LoopAction::Break(r) => break r,
+                LoopAction::MediaUpload { chat_id, file_path, media_type, title, result_tx } => {
+                    let upload_result = longconn_upload_and_send_media(
+                        &mut write, &mut read, &chat_id, &file_path, &media_type, &title,
+                    ).await;
+                    let _ = result_tx.send(upload_result);
                 }
             }
         };
@@ -1809,6 +1850,278 @@ fn decrypt_wecom_msg(
     Ok(msg.to_string())
 }
 
+// ── Long connection chunked upload ─────────────────────────────────────────
+
+/// Max raw bytes per chunk before base64 encoding (512 KB).
+const LONGCONN_CHUNK_SIZE: usize = 512 * 1024;
+
+/// Upload a file via the WeCom long connection chunked protocol and then send
+/// the resulting media message.  Returns `Ok(media_id)` on success.
+///
+/// Protocol:
+///   1. `aibot_upload_media_init`  -> get `upload_id`
+///   2. `aibot_upload_media_chunk` -> send each chunk (base64-encoded, <=512 KB raw)
+///   3. `aibot_upload_media_finish` -> merge chunks -> get `media_id`
+///   4. `aibot_send_msg`           -> send image/voice/video/file message
+async fn longconn_upload_and_send_media<S, R>(
+    write: &mut S,
+    read: &mut R,
+    chat_id: &str,
+    file_path: &str,
+    media_type: &str,
+    title: &str,
+) -> Result<String>
+where
+    S: futures::Sink<WsMessage> + Unpin,
+    S::Error: std::fmt::Display,
+    R: futures::Stream<Item = std::result::Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
+        + Unpin,
+{
+    use base64::Engine;
+
+    let path = std::path::Path::new(file_path);
+    let file_bytes = tokio::fs::read(path)
+        .await
+        .map_err(|e| Error::Channel(format!("WeCom longconn upload: failed to read {}: {}", file_path, e)))?;
+
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file")
+        .to_string();
+    let total_size = file_bytes.len();
+    let total_chunks = (total_size + LONGCONN_CHUNK_SIZE - 1) / LONGCONN_CHUNK_SIZE;
+    if total_chunks > 100 {
+        return Err(Error::Channel(format!(
+            "WeCom longconn upload: file too large ({} bytes, {} chunks > 100 max)",
+            total_size, total_chunks
+        )));
+    }
+
+    let file_md5 = format!("{:x}", md5::compute(&file_bytes));
+    info!(
+        file_path = %file_path, total_size, total_chunks, md5 = %file_md5,
+        "WeCom longconn: starting chunked media upload"
+    );
+
+    // Step 1: aibot_upload_media_init
+    let init_req_id = format!("upload-init-{}", chrono::Utc::now().timestamp_millis());
+    let init_msg = serde_json::json!({
+        "cmd": "aibot_upload_media_init",
+        "headers": { "req_id": &init_req_id },
+        "body": {
+            "type": media_type,
+            "filename": file_name,
+            "total_size": total_size,
+            "total_chunks": total_chunks,
+            "md5": file_md5,
+        }
+    });
+    longconn_ws_send(write, &init_msg).await?;
+
+    let init_resp = longconn_wait_response(write, read, &init_req_id).await?;
+    let errcode = init_resp["errcode"].as_i64().unwrap_or(-1);
+    if errcode != 0 {
+        return Err(Error::Channel(format!(
+            "WeCom longconn upload init error {}: {}",
+            errcode,
+            init_resp["errmsg"].as_str().unwrap_or("unknown")
+        )));
+    }
+    let upload_id = init_resp["body"]["upload_id"]
+        .as_str()
+        .ok_or_else(|| Error::Channel("WeCom longconn upload init: no upload_id".to_string()))?
+        .to_string();
+    info!(upload_id = %upload_id, "WeCom longconn: upload initialized");
+
+    // Step 2: aibot_upload_media_chunk (send each chunk sequentially)
+    for i in 0..total_chunks {
+        let start = i * LONGCONN_CHUNK_SIZE;
+        let end = ((i + 1) * LONGCONN_CHUNK_SIZE).min(total_size);
+        let chunk_data = &file_bytes[start..end];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(chunk_data);
+
+        let chunk_req_id = format!("upload-chunk-{}-{}", i, chrono::Utc::now().timestamp_millis());
+        let chunk_msg = serde_json::json!({
+            "cmd": "aibot_upload_media_chunk",
+            "headers": { "req_id": &chunk_req_id },
+            "body": {
+                "upload_id": &upload_id,
+                "chunk_index": i,
+                "base64_data": b64,
+            }
+        });
+        longconn_ws_send(write, &chunk_msg).await?;
+
+        let chunk_resp = longconn_wait_response(write, read, &chunk_req_id).await?;
+        let chunk_err = chunk_resp["errcode"].as_i64().unwrap_or(-1);
+        if chunk_err != 0 {
+            return Err(Error::Channel(format!(
+                "WeCom longconn chunk {} upload error {}: {}",
+                i, chunk_err,
+                chunk_resp["errmsg"].as_str().unwrap_or("unknown")
+            )));
+        }
+        debug!(chunk = i, total = total_chunks, "WeCom longconn: chunk uploaded");
+    }
+
+    // Step 3: aibot_upload_media_finish
+    let finish_req_id = format!("upload-finish-{}", chrono::Utc::now().timestamp_millis());
+    let finish_msg = serde_json::json!({
+        "cmd": "aibot_upload_media_finish",
+        "headers": { "req_id": &finish_req_id },
+        "body": { "upload_id": &upload_id }
+    });
+    longconn_ws_send(write, &finish_msg).await?;
+
+    let finish_resp = longconn_wait_response(write, read, &finish_req_id).await?;
+    let finish_err = finish_resp["errcode"].as_i64().unwrap_or(-1);
+    if finish_err != 0 {
+        return Err(Error::Channel(format!(
+            "WeCom longconn upload finish error {}: {}",
+            finish_err,
+            finish_resp["errmsg"].as_str().unwrap_or("unknown")
+        )));
+    }
+    let media_id = finish_resp["body"]["media_id"]
+        .as_str()
+        .ok_or_else(|| Error::Channel("WeCom longconn upload finish: no media_id".to_string()))?
+        .to_string();
+    info!(media_id = %media_id, "WeCom longconn: upload complete");
+
+    // Step 4: aibot_send_msg with media_id
+    let send_req_id = {
+        let reg = CHAT_REQID_REGISTRY.lock().unwrap();
+        reg.get(chat_id)
+            .cloned()
+            .unwrap_or_else(|| format!("blockcell-media-{}", chrono::Utc::now().timestamp_millis()))
+    };
+
+    let media_body = match media_type {
+        "image" => serde_json::json!({ "media_id": &media_id }),
+        "voice" => serde_json::json!({ "media_id": &media_id }),
+        "video" => serde_json::json!({
+            "media_id": &media_id,
+            "title": if title.is_empty() { &file_name } else { title },
+            "description": ""
+        }),
+        _ => serde_json::json!({ "media_id": &media_id }),
+    };
+
+    let send_msg = serde_json::json!({
+        "cmd": "aibot_send_msg",
+        "headers": { "req_id": &send_req_id },
+        "body": {
+            "chatid": chat_id,
+            "chat_type": 1,
+            "msgtype": media_type,
+            media_type: media_body,
+        }
+    });
+    longconn_ws_send(write, &send_msg).await?;
+
+    let send_resp = longconn_wait_response(write, read, &send_req_id).await?;
+    let send_err = send_resp["errcode"].as_i64().unwrap_or(-1);
+    if send_err != 0 {
+        warn!(
+            errcode = send_err,
+            errmsg = %send_resp["errmsg"].as_str().unwrap_or("unknown"),
+            "WeCom longconn: aibot_send_msg error (media may still have been delivered)"
+        );
+    }
+
+    info!(media_id = %media_id, media_type = %media_type, chat_id = %chat_id, "WeCom longconn: media message sent");
+    Ok(media_id)
+}
+
+/// Send a JSON payload over the WebSocket.
+async fn longconn_ws_send<S>(write: &mut S, msg: &serde_json::Value) -> Result<()>
+where
+    S: futures::Sink<WsMessage> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    let text = msg.to_string();
+    write
+        .send(WsMessage::Text(text))
+        .await
+        .map_err(|e| Error::Channel(format!("WeCom longconn WS send failed: {}", e)))
+}
+
+/// Wait for a WS response whose `headers.req_id` matches `expected_req_id`.
+/// While waiting, handle ping/pong and log any unrelated messages.
+/// Times out after 60 seconds.
+async fn longconn_wait_response<S, R>(
+    write: &mut S,
+    read: &mut R,
+    expected_req_id: &str,
+) -> Result<serde_json::Value>
+where
+    S: futures::Sink<WsMessage> + Unpin,
+    S::Error: std::fmt::Display,
+    R: futures::Stream<Item = std::result::Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
+        + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+
+    loop {
+        let msg = tokio::time::timeout_at(deadline, read.next())
+            .await
+            .map_err(|_| {
+                Error::Channel(format!(
+                    "WeCom longconn: timeout waiting for response to {}",
+                    expected_req_id
+                ))
+            })?;
+
+        match msg {
+            Some(Ok(WsMessage::Text(text))) => {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    let rid = v["headers"]["req_id"].as_str().unwrap_or("");
+                    if rid == expected_req_id {
+                        return Ok(v);
+                    }
+                    debug!(
+                        req_id = %rid,
+                        expected = %expected_req_id,
+                        "WeCom longconn: received unrelated message while waiting for upload response"
+                    );
+                }
+            }
+            Some(Ok(WsMessage::Binary(data))) => {
+                let text = String::from_utf8_lossy(&data);
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    let rid = v["headers"]["req_id"].as_str().unwrap_or("");
+                    if rid == expected_req_id {
+                        return Ok(v);
+                    }
+                }
+            }
+            Some(Ok(WsMessage::Ping(data))) => {
+                let _ = write.send(WsMessage::Pong(data)).await;
+            }
+            Some(Ok(WsMessage::Pong(_))) => {}
+            Some(Ok(WsMessage::Close(frame))) => {
+                return Err(Error::Channel(format!(
+                    "WeCom longconn: connection closed while waiting for upload response: {:?}",
+                    frame
+                )));
+            }
+            Some(Err(e)) => {
+                return Err(Error::Channel(format!(
+                    "WeCom longconn: WS read error while waiting for upload response: {}",
+                    e
+                )));
+            }
+            None => {
+                return Err(Error::Channel(
+                    "WeCom longconn: connection ended while waiting for upload response".to_string(),
+                ));
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Upload a local file to WeCom as a temporary media asset.
 /// Returns the `media_id` (valid for 3 days).
 /// `media_type` must be one of: image / voice / video / file
@@ -1912,15 +2225,59 @@ pub async fn send_media_message(
     file_path: &str,
     _caption: &str,
 ) -> Result<()> {
-    // Long connection (AI bot) mode does not support sending any media files.
+    // Long connection mode: upload via WS chunked protocol, then send via aibot_send_msg.
     let mode = config.channels.wecom.mode.trim().to_lowercase();
     if mode == "long_connection" || mode == "long-connection" || mode == "stream" {
-        return send_message(
-            config,
-            chat_id,
-            "企业微信长连接机器人暂不支持发送图片或文件，请使用文字回复。",
-        )
-        .await;
+        let ext = file_path.rsplit('.').next().unwrap_or("").to_lowercase();
+        let (media_type, _msg_type) = media_type_for_ext(&ext);
+
+        let upload_path = if media_type == "voice" {
+            let amr_path = ensure_wecom_voice_amr(file_path).await?;
+            let duration = probe_audio_duration(&amr_path).await.unwrap_or(0.0);
+            if duration > 60.0 {
+                info!(duration = %duration, "WeCom longconn: voice too long (>60s), sending as file");
+                file_path.to_string()
+            } else {
+                amr_path
+            }
+        } else {
+            file_path.to_string()
+        };
+
+        let actual_ext = upload_path.rsplit('.').next().unwrap_or("").to_lowercase();
+        let (actual_media_type, _) = media_type_for_ext(&actual_ext);
+
+        let bot_id = config.channels.wecom.bot_id.trim().to_string();
+        // Clone the sender out of the lock so the MutexGuard is dropped before .await
+        let tx_clone = {
+            let registry = LONGCONN_REGISTRY.lock().unwrap();
+            registry.get(&bot_id).cloned()
+        };
+        if let Some(tx) = tx_clone {
+            let (result_tx, result_rx) = oneshot::channel();
+            let msg = LongConnOutbound::Media {
+                chat_id: chat_id.to_string(),
+                file_path: upload_path,
+                media_type: actual_media_type.to_string(),
+                title: String::new(),
+                result_tx,
+            };
+            if let Err(e) = tx.try_send(msg) {
+                return Err(Error::Channel(format!(
+                    "WeCom longconn: failed to queue media upload: {}", e
+                )));
+            }
+            match result_rx.await {
+                Ok(Ok(_media_id)) => return Ok(()),
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Err(Error::Channel(
+                    "WeCom longconn: media upload channel dropped".to_string(),
+                )),
+            }
+        } else {
+            warn!(bot_id = %bot_id, "WeCom long connection not active; media message dropped");
+            return Ok(());
+        }
     }
 
     crate::rate_limit::wecom_limiter().acquire().await;
