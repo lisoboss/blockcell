@@ -165,7 +165,7 @@ impl Tool for EditFileTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "edit_file",
-            description: "Edit a local file by replacing `old_text` with `new_text`. REQUIRED: always provide `path`, `old_text`, and `new_text`; do not call this tool with `{}`. `old_text` must match existing file content exactly and appear only once.",
+            description: "Edit a local file by replacing `old_text` with `new_text`. REQUIRED: always provide `path`, `old_text`, and `new_text`; do not call this tool with `{}`. IMPORTANT: before calling this tool, read the target file and copy the exact existing text into `old_text` verbatim. `old_text` must match the file content exactly, including whitespace, indentation, and line breaks, and it must appear only once. Prefer a longer unique contiguous snippet rather than a short fragment.",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -188,7 +188,7 @@ impl Tool for EditFileTool {
     }
 
     fn prompt_rule(&self, _ctx: &crate::PromptContext) -> Option<String> {
-        Some("- **edit_file**: Always pass `path`, `old_text`, and `new_text`. Never call `edit_file` with `{}`. `old_text` must be an exact unique match from the existing file.".to_string())
+        Some("- **edit_file**: Always pass `path`, `old_text`, and `new_text`. Never call `edit_file` with `{}`. Before editing, call `read_file` on the target path and copy the exact existing text into `old_text` verbatim. `old_text` must match the file exactly, including spaces, indentation, and line breaks, and it must be unique in the file. If the edit fails with `old_text not found`, read the file again and choose a larger contiguous snippet around the target change.".to_string())
     }
 
     fn validate(&self, params: &Value) -> Result<()> {

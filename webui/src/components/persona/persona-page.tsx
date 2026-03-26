@@ -205,6 +205,15 @@ export function PersonaPage() {
     return () => window.removeEventListener('beforeunload', handler);
   }, [hasAnyDirty]);
 
+  useEffect(() => {
+    return () => {
+      if (aiProgressTimerRef.current) {
+        clearInterval(aiProgressTimerRef.current);
+        aiProgressTimerRef.current = null;
+      }
+    };
+  }, []);
+
   // Handle file switch with unsaved check
   const handleFileSwitch = useCallback((targetFile: string) => {
     if (targetFile === activeFile) return;

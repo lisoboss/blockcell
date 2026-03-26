@@ -2086,7 +2086,7 @@ impl AgentRuntime {
             .agents
             .defaults
             .max_tool_iterations
-            .clamp(1, 4);
+            .clamp(1, 30);
         let mut current_messages = messages;
         let mut final_response = String::new();
         let mut trace_messages = Vec::new();

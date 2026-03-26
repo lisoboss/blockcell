@@ -4,6 +4,8 @@ import { cn } from '@/lib/utils';
 import { getTasks } from '@/lib/api';
 import { useT } from '@/lib/i18n';
 import { useAgentStore } from '@/lib/store';
+import { useConnectionStore } from '@/lib/store';
+import { useRecurringTask } from '@/lib/use-recurring-task';
 
 interface TaskInfo {
   id: string;
@@ -21,6 +23,7 @@ interface TaskInfo {
 export function TasksPage() {
   const t = useT();
   const selectedAgentId = useAgentStore((s) => s.selectedAgentId);
+  const connected = useConnectionStore((s) => s.connected);
   const [tasks, setTasks] = useState<TaskInfo[]>([]);
   const [summary, setSummary] = useState({ queued: 0, running: 0, completed: 0, failed: 0 });
   const [loading, setLoading] = useState(false);
@@ -29,10 +32,14 @@ export function TasksPage() {
   selectedAgentRef.current = selectedAgentId;
 
   useEffect(() => {
-    fetchTasks();
-    const interval = setInterval(fetchTasks, 5000);
-    return () => clearInterval(interval);
+    setLoading(true);
   }, [selectedAgentId]);
+
+  useEffect(() => {
+    void fetchTasks();
+  }, [selectedAgentId]);
+
+  useRecurringTask(fetchTasks, 5000, connected, [selectedAgentId, connected]);
 
   async function fetchTasks() {
     const agentId = selectedAgentId;

@@ -30,4 +30,7 @@ pub mod lark;
 #[cfg(feature = "qq")]
 pub mod qq;
 
+#[cfg(feature = "weixin")]
+pub mod weixin;
+
 pub use manager::ChannelManager;

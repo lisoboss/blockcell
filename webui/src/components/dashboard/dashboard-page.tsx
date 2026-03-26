@@ -3,6 +3,8 @@ import { Activity, Cpu, Brain, Zap, RefreshCw, Shield, GitBranch } from 'lucide-
 import { getHealth, getTools, getSkills, getEvolution, getStats, getToggles, updateToggle, getPoolStatus } from '@/lib/api';
 import { useT } from '@/lib/i18n';
 import { wsManager } from '@/lib/ws';
+import { useConnectionStore } from '@/lib/store';
+import { useRecurringTask } from '@/lib/use-recurring-task';
 
 export function DashboardPage() {
   const t = useT();
@@ -14,18 +16,23 @@ export function DashboardPage() {
   const [stats, setStats] = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [toggles, setToggles] = useState<{ skills: Record<string, boolean>; tools: Record<string, boolean> }>({ skills: {}, tools: {} });
+  const connected = useConnectionStore((s) => s.connected);
   const fetchAllRef = useRef(fetchAll);
   fetchAllRef.current = fetchAll;
 
   useEffect(() => {
-    fetchAll();
-    const interval = setInterval(fetchAll, 15000);
+    void fetchAll();
+  }, []);
+
+  useEffect(() => {
     // Auto-refresh when skills are created/updated via chat
     const offSkills = wsManager.on('skills_updated', () => {
       fetchAllRef.current();
     });
-    return () => { clearInterval(interval); offSkills(); };
+    return () => { offSkills(); };
   }, []);
+
+  useRecurringTask(fetchAll, 15000, connected, [connected]);
 
   async function fetchAll() {
     try {

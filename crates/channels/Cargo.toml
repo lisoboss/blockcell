@@ -26,7 +26,7 @@ hex = "0.4"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 
 [features]
-default = ["telegram", "whatsapp", "feishu", "slack", "discord", "dingtalk", "wecom", "lark"]
+default = ["telegram", "whatsapp", "feishu", "slack", "discord", "dingtalk", "wecom", "lark", "weixin"]
 telegram = []
 whatsapp = []
 feishu = []
@@ -36,6 +36,7 @@ dingtalk = []
 wecom = []
 lark = []
 qq = []
+weixin = []
 
 [dev-dependencies]
 proptest = "1.10.0"

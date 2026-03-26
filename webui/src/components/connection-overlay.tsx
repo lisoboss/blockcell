@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { WifiOff, ShieldAlert, ServerCrash, RefreshCw, LogIn, Loader2, Copy, Check } from 'lucide-react';
 import { useConnectionStore } from '@/lib/store';
 import { wsManager } from '@/lib/ws';
@@ -17,24 +17,26 @@ export function ConnectionOverlay() {
     setDismissed(false);
   }, [reason]);
 
-  // Countdown timer for reconnect
+  // Set countdown target whenever reconnect state changes
+  const countdownTarget = useRef(0);
   useEffect(() => {
     if (connected || reason === 'auth_failed' || reason === 'none' || reason === 'reconnect_exhausted') {
+      countdownTarget.current = 0;
       setCountdown(0);
-      return;
-    }
-
-    if (reconnectAttempt > 0 && !connected) {
+    } else if (reconnectAttempt > 0 && !connected) {
       const secs = Math.ceil(nextRetryMs / 1000);
+      countdownTarget.current = secs;
       setCountdown(secs);
-
-      const interval = setInterval(() => {
-        setCountdown((prev) => (prev > 0 ? prev - 1 : 0));
-      }, 1000);
-
-      return () => clearInterval(interval);
     }
   }, [connected, reason, reconnectAttempt, nextRetryMs]);
+
+  // Single stable interval for countdown — never recreated
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setCountdown((prev) => (prev > 0 ? prev - 1 : 0));
+    }, 1000);
+    return () => clearInterval(interval);
+  }, []);
 
   // Don't show overlay when connected or in initial connecting state (first attempt)
   if (connected || reason === 'none') return null;
@@ -68,7 +70,7 @@ export function ConnectionOverlay() {
   const isReconnectExhausted = reason === 'reconnect_exhausted';
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80">
       <div className="w-full max-w-md mx-4 bg-card border border-border rounded-2xl shadow-2xl overflow-hidden">
         {/* Header with icon */}
         <div className={cn(

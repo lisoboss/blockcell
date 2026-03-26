@@ -271,8 +271,9 @@ fn active_model_and_provider(config: &Config) -> (String, Option<String>, &'stat
     )
 }
 
-const EXTERNAL_CHANNELS: [&str; 9] = [
+const EXTERNAL_CHANNELS: [&str; 10] = [
     "telegram", "whatsapp", "feishu", "slack", "discord", "dingtalk", "wecom", "lark", "qq",
+    "weixin",
 ];
 
 fn known_channel_account_ids(config: &Config, channel: &str) -> Vec<String> {
@@ -329,6 +330,13 @@ fn known_channel_account_ids(config: &Config, channel: &str) -> Vec<String> {
         "lark" => config
             .channels
             .lark
+            .accounts
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        "weixin" => config
+            .channels
+            .weixin
             .accounts
             .keys()
             .cloned()
@@ -403,6 +411,14 @@ fn enabled_channel_account_ids(config: &Config, channel: &str) -> Vec<String> {
             .accounts
             .iter()
             .filter(|(_, account)| account.enabled && !account.app_id.trim().is_empty())
+            .map(|(account_id, _)| account_id.clone())
+            .collect::<Vec<_>>(),
+        "weixin" => config
+            .channels
+            .weixin
+            .accounts
+            .iter()
+            .filter(|(_, account)| account.enabled && !account.token.trim().is_empty())
             .map(|(account_id, _)| account_id.clone())
             .collect::<Vec<_>>(),
         _ => Vec::new(),
@@ -1374,6 +1390,22 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
         ));
     }
 
+    #[cfg(feature = "weixin")]
+    for listener in blockcell_channels::account::weixin_listener_configs(&config) {
+        let listener_name = listener.label.clone();
+        info!(listener = %listener_name, "Starting Weixin listener");
+        let weixin = Arc::new(
+            blockcell_channels::weixin::WeixinChannel::new(listener.config, inbound_tx.clone()),
+        );
+        let shutdown_rx = shutdown_tx.subscribe();
+        channel_handles.push((
+            listener_name,
+            tokio::spawn(async move {
+                weixin.run_loop(shutdown_rx).await;
+            }),
+        ));
+    }
+
     // ── Build HTTP/WebSocket server ──
     // Guarantee api_token is Some and non-empty — defensive fallback in case auto-gen above
     // somehow produced None or empty (e.g. env var was whitespace-only).
@@ -1508,6 +1540,14 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
         .route(
             "/v1/evolution/:id",
             get(handle_evolution_detail).delete(handle_evolution_delete),
+        )
+        .route(
+            "/v1/evolution/:id/stop",
+            post(handle_evolution_stop),
+        )
+        .route(
+            "/v1/evolution/:id/resume",
+            post(handle_evolution_resume),
         )
         .route("/v1/channels/status", get(handle_channels_status))
         .route("/v1/channels", get(handle_channels_list))

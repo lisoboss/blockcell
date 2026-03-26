@@ -19,6 +19,25 @@ function buildQuery(params?: Record<string, string | number | undefined | null>)
   return suffix ? `?${suffix}` : '';
 }
 
+async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}, timeoutMs = 8000): Promise<Response> {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(input, {
+      ...init,
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      throw new Error(`Request timed out after ${Math.ceil(timeoutMs / 1000)}s`);
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const url = `${API_BASE}/v1${path}`;
   const token = localStorage.getItem('blockcell_token');
@@ -29,7 +48,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   if (token) {
     headers['Authorization'] = `Bearer ${token}`;
   }
-  const res = await fetch(url, { ...options, headers });
+  const res = await fetchWithTimeout(url, { ...options, headers });
   if (!res.ok) {
     const text = await res.text();
     throw new Error(`API ${res.status}: ${text}`);
@@ -47,7 +66,7 @@ function ensureStatusOk<T extends { status?: string; message?: string }>(result:
 // Auth
 export async function login(password: string): Promise<{ token?: string; error?: string }> {
   const url = `${API_BASE}/v1/auth/login`;
-  const res = await fetch(url, {
+  const res = await fetchWithTimeout(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ password }),
@@ -198,6 +217,14 @@ export function triggerEvolution(skillName: string, description: string) {
 
 export function deleteEvolution(id: string) {
   return request<{ status: string }>(`/evolution/${id}`, { method: 'DELETE' });
+}
+
+export function stopEvolution(id: string) {
+  return request<{ status: string; message?: string }>(`/evolution/${id}/stop`, { method: 'POST' });
+}
+
+export function resumeEvolution(id: string) {
+  return request<{ status: string; message?: string }>(`/evolution/${id}/resume`, { method: 'POST' });
 }
 
 export function testSkill(skillName: string, input: string) {

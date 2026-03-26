@@ -3,16 +3,18 @@ import {
   GitBranch, RefreshCw, Dna, Zap, CheckCircle, XCircle, Clock,
   Plus, Trash2, ChevronDown, ChevronRight, AlertTriangle, FlaskConical,
   ArrowUpCircle, RotateCcw, Send, Loader2, Eye, EyeOff, Code2,
-  History, Search, ThumbsUp, ThumbsDown, Sparkles,
+  History, Search, ThumbsUp, ThumbsDown, Sparkles, StopCircle,
 } from 'lucide-react';
 import {
   getEvolution, getSkills, getTools,
-  triggerEvolution, deleteEvolution, testSkill, getTestSuggestion, getEvolutionSummary,
+  triggerEvolution, deleteEvolution, stopEvolution, resumeEvolution, testSkill, getTestSuggestion, getEvolutionSummary,
   searchSkills, getEvolutionDetail,
   type EvolutionRecord, type EvolutionSummary,
 } from '@/lib/api';
 import { useT } from '@/lib/i18n';
 import { wsManager } from '@/lib/ws';
+import { useConnectionStore } from '@/lib/store';
+import { useRecurringTask } from '@/lib/use-recurring-task';
 import { MarkdownContent } from '@/components/chat/markdown-content';
 
 type Tab = 'overview' | 'skills' | 'test';
@@ -42,6 +44,8 @@ function statusIcon(status: string) {
   switch (status) {
     case 'Completed': case 'Active': case 'TestPassed': case 'Observing': case 'Deployed':
       return <CheckCircle size={14} className="text-[hsl(var(--brand-green))]" />;
+    case 'Stopped':
+      return <StopCircle size={14} className="text-yellow-500" />;
     case 'Triggered': case 'Requested':
       return <Zap size={14} className="text-blue-400" />;
     case 'Generating': case 'Compiling': case 'Auditing': case 'Validating':
@@ -97,15 +101,19 @@ const CAP_STAGES = [
   'Requested', 'Generating', 'Compiling', 'Validating', 'Active',
 ];
 
-function PipelineStages({ status, stages }: { status: string; stages: string[] }) {
-  const currentIdx = stages.indexOf(status);
+function PipelineStages({ status, stages, stoppedFromStatus }: { status: string; stages: string[]; stoppedFromStatus?: string }) {
+  // If status is Stopped, use the stoppedFromStatus to show where it was stopped
+  const displayStatus = status === 'Stopped' && stoppedFromStatus ? stoppedFromStatus : status;
+  const isStopped = status === 'Stopped';
+  
+  const currentIdx = stages.indexOf(displayStatus);
   const isFailed = ['Failed', 'AuditFailed', 'DryRunFailed', 'TestFailed', 'RolledBack', 'Blocked'].includes(status);
   const completedStageClass = 'bg-[hsl(var(--brand-green))]';
 
   return (
     <div className="flex items-center gap-1">
       {stages.map((stage, i) => {
-        const isActive = stage === status;
+        const isActive = stage === displayStatus;
         const isPast = currentIdx >= 0 && i < currentIdx;
         const isCompleted = status === 'Completed' || status === 'Active' || status === 'Observing' || status === 'Deployed';
 
@@ -114,6 +122,9 @@ function PipelineStages({ status, stages }: { status: string; stages: string[] }
           dotClass += completedStageClass;
         } else if (isActive && isFailed) {
           dotClass += 'bg-red-400';
+        } else if (isActive && isStopped) {
+          // Stopped status shows as yellow (paused)
+          dotClass += 'bg-yellow-500';
         } else if (isActive) {
           dotClass += 'bg-yellow-400 animate-pulse';
         } else if (isPast) {
@@ -167,19 +178,24 @@ export function EvolutionPage() {
 
   // Filter
   const [statusFilter, setStatusFilter] = useState<string>('all');
+  const connected = useConnectionStore((s) => s.connected);
 
   const fetchAllRef = useRef(fetchAll);
   fetchAllRef.current = fetchAll;
 
   useEffect(() => {
-    fetchAll();
-    const interval = setInterval(fetchAll, 10000);
     const offSkills = wsManager.on('skills_updated', () => fetchAllRef.current());
     // Real-time refresh when evolution is triggered or deleted via API
     const offTriggered = wsManager.on('evolution_triggered', () => fetchAllRef.current());
     const offDeleted = wsManager.on('evolution_deleted', () => fetchAllRef.current());
-    return () => { clearInterval(interval); offSkills(); offTriggered(); offDeleted(); };
+    return () => { offSkills(); offTriggered(); offDeleted(); };
   }, []);
+
+  useEffect(() => {
+    void fetchAll();
+  }, []);
+
+  useRecurringTask(fetchAll, 10000, connected, [connected]);
 
   async function fetchAll() {
     try {
@@ -254,9 +270,33 @@ export function EvolutionPage() {
     }).catch(() => {}).finally(() => setLoadingSuggestion(false));
   }, []);
 
-  const handleDelete = useCallback(async (id: string) => {
+  const handleDelete = useCallback(async (id: string, status: string) => {
+    // Check if evolution is in progress
+    const inProgressStates = ['Triggered', 'Generating', 'Generated', 'Auditing', 'AuditPassed', 'CompilePassed', 'RollingOut'];
+    if (inProgressStates.includes(status)) {
+      alert(t('evolution.mustStopFirst'));
+      return;
+    }
     await deleteEvolution(id);
     fetchAll();
+  }, [t]);
+
+  const handleResume = useCallback(async (id: string) => {
+    try {
+      await resumeEvolution(id);
+      fetchAll();
+    } catch (e: any) {
+      alert(e.message || 'Failed to resume evolution');
+    }
+  }, []);
+
+  const handleStop = useCallback(async (id: string) => {
+    try {
+      await stopEvolution(id);
+      fetchAll();
+    } catch (e: any) {
+      alert(e.message || 'Failed to stop evolution');
+    }
   }, []);
 
   const handleSkillSelect = useCallback(async (name: string) => {
@@ -313,15 +353,15 @@ export function EvolutionPage() {
   const filteredSkillRecords = statusFilter === 'all'
     ? skillRecords
     : statusFilter === 'active'
-      ? skillRecords.filter(r => !['Completed', 'Observing', 'Deployed', 'Failed', 'RolledBack', 'AuditFailed', 'DryRunFailed', 'TestFailed'].includes(r.status))
+      ? skillRecords.filter(r => !['Completed', 'Observing', 'Deployed', 'Failed', 'RolledBack', 'AuditFailed', 'DryRunFailed', 'TestFailed', 'Stopped'].includes(r.status))
       : statusFilter === 'completed'
         ? skillRecords.filter(r => ['Completed', 'Observing', 'Deployed'].includes(r.status))
-        : skillRecords.filter(r => ['Failed', 'RolledBack', 'AuditFailed', 'DryRunFailed', 'TestFailed'].includes(r.status));
+        : skillRecords.filter(r => ['Failed', 'RolledBack', 'AuditFailed', 'DryRunFailed', 'TestFailed', 'Stopped'].includes(r.status));
 
   // Stats
   const activeSkills = skillRecords.filter(r => !['Completed', 'Observing', 'Deployed', 'Failed', 'RolledBack', 'AuditFailed', 'DryRunFailed', 'TestFailed'].includes(r.status)).length;
   const completedSkills = skillRecords.filter(r => ['Completed', 'Observing', 'Deployed'].includes(r.status)).length;
-  const failedSkills = skillRecords.filter(r => ['Failed', 'RolledBack', 'AuditFailed', 'DryRunFailed', 'TestFailed'].includes(r.status)).length;
+  const failedSkills = skillRecords.filter(r => ['Failed', 'RolledBack', 'AuditFailed', 'DryRunFailed', 'TestFailed', 'Stopped'].includes(r.status)).length;
 
   // All skills for test dropdown
   const allSkillNames = [
@@ -548,7 +588,9 @@ export function EvolutionPage() {
                   record={rec}
                   expanded={expandedId === rec.id}
                   onToggle={() => setExpandedId(expandedId === rec.id ? null : rec.id)}
-                  onDelete={() => handleDelete(rec.id)}
+                  onDelete={() => handleDelete(rec.id, rec.status)}
+                  onStop={() => handleStop(rec.id)}
+                  onResume={() => handleResume(rec.id)}
                   t={t}
                 />
               ))
@@ -941,19 +983,29 @@ function EmptyState({ message }: { message: string }) {
 }
 
 function SkillRecordCard({
-  record, expanded, onToggle, onDelete, t,
+  record, expanded, onToggle, onDelete, onStop, onResume, t,
 }: {
   record: EvolutionRecord;
   expanded: boolean;
   onToggle: () => void;
   onDelete: () => void;
+  onStop: () => void;
+  onResume: () => void;
   t: (key: string, params?: Record<string, string | number>) => string;
 }) {
   const [showCode, setShowCode] = useState(false);
   const [deleteConfirm, setDeleteConfirm] = useState(false);
+  const [stopConfirm, setStopConfirm] = useState(false);
+  const [resumeConfirm, setResumeConfirm] = useState(false);
   const [detail, setDetail] = useState<EvolutionRecord | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const detailFetched = useRef(false);
+
+  // Check if evolution is in progress or stopped
+  const inProgressStates = ['Triggered', 'Generating', 'Generated', 'Auditing', 'AuditPassed', 'CompilePassed', 'RollingOut'];
+  const isInProgress = inProgressStates.includes(record.status);
+  const isStopped = record.status === 'Stopped';
+  const canDelete = !isInProgress;
 
   useEffect(() => {
     if (expanded && !detailFetched.current) {
@@ -970,7 +1022,7 @@ function SkillRecordCard({
   const shouldShowDetailLoading = expanded && (!detailFetched.current || detailLoading);
 
   return (
-    <div className="border border-border rounded-xl bg-card overflow-hidden transition-all">
+    <div className="border border-border rounded-xl bg-card overflow-hidden transition-all group">
       {/* Header row */}
       <div
         className="flex items-center gap-3 px-4 py-3 cursor-pointer hover:bg-accent/30 transition-colors"
@@ -997,15 +1049,40 @@ function SkillRecordCard({
             <span className="text-[10px] text-muted-foreground">
               {formatTime(record.updated_at)}
             </span>
-            <PipelineStages status={record.status} stages={SKILL_STAGES} />
+            <PipelineStages 
+              status={record.status} 
+              stages={SKILL_STAGES} 
+              stoppedFromStatus={(record.context as any)?.stopped_from_status}
+            />
           </div>
         </div>
-        <button
-          onClick={e => { e.stopPropagation(); setDeleteConfirm(true); }}
-          className="p-1.5 rounded-md hover:bg-destructive/20 text-muted-foreground hover:text-destructive opacity-0 group-hover:opacity-100 transition-opacity shrink-0"
-        >
-          <Trash2 size={12} />
-        </button>
+        <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
+          {isInProgress && (
+            <button
+              onClick={e => { e.stopPropagation(); setStopConfirm(true); }}
+              className="p-1.5 rounded-md hover:bg-yellow-500/20 text-muted-foreground hover:text-yellow-500 transition-colors"
+              title={t('evolution.stopEvolution')}
+            >
+              <StopCircle size={12} />
+            </button>
+          )}
+          {isStopped && (
+            <button
+              onClick={e => { e.stopPropagation(); setResumeConfirm(true); }}
+              className="p-1.5 rounded-md hover:bg-[hsl(var(--brand-green)/0.20)] text-muted-foreground hover:text-[hsl(var(--brand-green))] transition-colors"
+              title={t('evolution.resumeEvolution')}
+            >
+              <ArrowUpCircle size={12} />
+            </button>
+          )}
+          <button
+            onClick={e => { e.stopPropagation(); canDelete ? setDeleteConfirm(true) : alert(t('evolution.mustStopFirst')); }}
+            className="p-1.5 rounded-md hover:bg-destructive/20 text-muted-foreground hover:text-destructive transition-colors"
+            title={canDelete ? t('evolution.deleteRecord') : t('evolution.mustStopFirst')}
+          >
+            <Trash2 size={12} />
+          </button>
+        </div>
       </div>
 
       {/* Expanded detail */}
@@ -1156,6 +1233,60 @@ function SkillRecordCard({
           )}
             </>
           )}
+        </div>
+      )}
+
+      {/* Resume confirmation */}
+      {resumeConfirm && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={() => setResumeConfirm(false)}>
+          <div className="bg-card border border-border rounded-xl p-6 max-w-sm w-full mx-4 shadow-xl" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center gap-3 mb-4">
+              <div className="p-2 rounded-full bg-[hsl(var(--brand-green)/0.10)]">
+                <ArrowUpCircle size={20} className="text-[hsl(var(--brand-green))]" />
+              </div>
+              <h3 className="font-semibold">{t('evolution.resumeEvolution')}</h3>
+            </div>
+            <p className="text-sm text-muted-foreground mb-1">{t('evolution.resumeConfirm')}</p>
+            <p className="text-sm font-medium mb-6 truncate">{record.skill_name} — {record.id}</p>
+            <div className="flex justify-end gap-2">
+              <button onClick={() => setResumeConfirm(false)} className="px-4 py-1.5 text-sm rounded-lg border border-border hover:bg-accent">
+                {t('common.cancel')}
+              </button>
+              <button
+                onClick={() => { setResumeConfirm(false); onResume(); }}
+                className="px-4 py-1.5 text-sm rounded-lg bg-[hsl(var(--brand-green))] text-white hover:bg-[hsl(var(--brand-green)/0.90)]"
+              >
+                {t('evolution.resume')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Stop confirmation */}
+      {stopConfirm && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={() => setStopConfirm(false)}>
+          <div className="bg-card border border-border rounded-xl p-6 max-w-sm w-full mx-4 shadow-xl" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center gap-3 mb-4">
+              <div className="p-2 rounded-full bg-yellow-500/10">
+                <StopCircle size={20} className="text-yellow-500" />
+              </div>
+              <h3 className="font-semibold">{t('evolution.stopEvolution')}</h3>
+            </div>
+            <p className="text-sm text-muted-foreground mb-1">{t('evolution.stopConfirm')}</p>
+            <p className="text-sm font-medium mb-6 truncate">{record.skill_name} — {record.id}</p>
+            <div className="flex justify-end gap-2">
+              <button onClick={() => setStopConfirm(false)} className="px-4 py-1.5 text-sm rounded-lg border border-border hover:bg-accent">
+                {t('common.cancel')}
+              </button>
+              <button
+                onClick={() => { setStopConfirm(false); onStop(); }}
+                className="px-4 py-1.5 text-sm rounded-lg bg-yellow-500 text-white hover:bg-yellow-600"
+              >
+                {t('evolution.stop')}
+              </button>
+            </div>
+          </div>
         </div>
       )}
 

@@ -6,6 +6,8 @@ import {
 import { cn } from '@/lib/utils';
 import { getStreams, getStreamData, type StreamInfo } from '@/lib/api';
 import { useT } from '@/lib/i18n';
+import { useConnectionStore } from '@/lib/store';
+import { useRecurringTask } from '@/lib/use-recurring-task';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
 } from 'recharts';
@@ -17,20 +19,23 @@ export function StreamsPage() {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [streamData, setStreamData] = useState<Record<string, any[]>>({});
   const [chartData, setChartData] = useState<Record<string, any[]>>({});
+  const connected = useConnectionStore((s) => s.connected);
 
   useEffect(() => {
-    fetchStreams();
-    const interval = setInterval(fetchStreams, 5000);
-    return () => clearInterval(interval);
+    setLoading(true);
   }, []);
 
-  // Auto-refresh data for expanded stream
   useEffect(() => {
+    void fetchStreams();
+  }, []);
+
+  useRecurringTask(fetchStreams, 5000, connected, [connected]);
+
+  // Auto-refresh data for expanded stream
+  useRecurringTask(() => {
     if (!expandedId) return;
-    fetchStreamData(expandedId);
-    const interval = setInterval(() => fetchStreamData(expandedId), 3000);
-    return () => clearInterval(interval);
-  }, [expandedId]);
+    return fetchStreamData(expandedId);
+  }, 3000, !!expandedId && connected, [expandedId, connected]);
 
   async function fetchStreams() {
     try {

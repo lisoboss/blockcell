@@ -92,13 +92,16 @@ class WebSocketManager {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectDelay = 1000;
   private maxReconnectDelay = 30000;
-  private maxReconnectAttempts = 60;
+  private maxReconnectAttempts = 20;
   private url: string;
   private shouldReconnect = true;
   private _reconnectAttempt = 0;
   private _reason: DisconnectReason = 'none';
   private _wasConnected = false;
   private _generation = 0;
+  private _healthProbed = false;
+  private _emitTimer: ReturnType<typeof setTimeout> | null = null;
+  private _emitScheduled = false;
 
   constructor() {
     this.url = resolveWsUrl();
@@ -159,9 +162,10 @@ class WebSocketManager {
         // If the browser had a stored token, and the WS failed before ever being connected,
         // this is often caused by the gateway restarting and invalidating the token.
         // Probe /v1/health to distinguish auth failure from server down.
-        if (this._reason === 'server_down') {
+        if (this._reason === 'server_down' && !this._healthProbed) {
           const token = localStorage.getItem('blockcell_token');
           if (token && !this._wasConnected) {
+            this._healthProbed = true;
             const gen = this._generation;
             void this.probeHealthAndSetReason(gen);
           }
@@ -215,6 +219,7 @@ class WebSocketManager {
     this._reconnectAttempt = 0;
     this._reason = 'connecting';
     this._wasConnected = false;
+    this._healthProbed = false;
     this.emitConnectionState();
     this.connect();
   }
@@ -313,8 +318,15 @@ class WebSocketManager {
   }
 
   private emitConnectionState() {
-    const state = this.connectionState;
-    this.connectionListeners.forEach((fn) => fn(state));
+    if (this._emitScheduled) return;
+    this._emitScheduled = true;
+    if (this._emitTimer) clearTimeout(this._emitTimer);
+    this._emitTimer = setTimeout(() => {
+      this._emitTimer = null;
+      this._emitScheduled = false;
+      const state = this.connectionState;
+      this.connectionListeners.forEach((fn) => fn(state));
+    }, 100);
   }
 
   get connected() {
