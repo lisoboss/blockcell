@@ -7,10 +7,10 @@ release:
 reload:
 	cp -r skills/* ~/.blockcell/workspace/skills/ || true
 	cargo run -p blockcell -- skills reload && \
-	blockcell --versionREGISTRY ?= docker.io/blockcell-labs
-
+	blockcell --version
 
 # docker
+REGISTRY ?= docker.io/blockcell-labs
 IMAGE ?= blockcell
 BUILDER ?= blockcell
 
