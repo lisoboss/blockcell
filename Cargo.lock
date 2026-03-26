@@ -498,9 +498,9 @@ dependencies = [
  "dirs",
  "ed25519-dalek",
  "futures",
- "proptest",
  "hex",
  "md5",
+ "proptest",
  "prost",
  "reqwest",
  "serde",
@@ -2256,7 +2256,7 @@ dependencies = [
 
 [[package]]
 name = "ollama-tap"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "bytes",

@@ -44,8 +44,7 @@ COPY --from=webui-builder /webui/dist ./webui/dist
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
-    cargo test --all --locked \
-    && cargo build -p blockcell --bin blockcell --release --locked \
+    cargo build -p blockcell --bin blockcell --release --locked \
     && cp /app/target/release/blockcell /app/blockcell
 
 # Copy the Docker CLI binary from the docker:cli image

@@ -732,13 +732,6 @@ fn check_any(cmds: &[(&str, &[&str])]) -> bool {
         .any(|(cmd, args)| std::process::Command::new(cmd).args(args).output().is_ok())
 }
 
-#[cfg(target_os = "linux")]
-fn check_any(cmds: &[(&str, &[&str])]) -> bool {
-    cmds.iter()
-        .copied()
-        .any(|(cmd, args)| std::process::Command::new(cmd).args(args).output().is_ok())
-}
-
 fn check_command(
     cmd: &str,
     args: &[&str],
